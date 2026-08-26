@@ -981,6 +981,16 @@ def render_session_row(item: dict, provider: str, selected: bool) -> str:
     )
 
 
+def session_tool(summary: dict, provider: str) -> str:
+    """Return the product surface that produced the stored session."""
+    kind = summary.get("_kind")
+    if kind == "copilot-db" or provider == "codex":
+        return "CLI"
+    if provider == "claude" and "local-agent-mode-sessions" in str(summary.get("_source", "")):
+        return "Desktop"
+    return "Extension"
+
+
 def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot") -> str:
     sessions = load_session_index(root, provider)
     chosen_summary = next((item for item in sessions if item["id"] == selected), sessions[0] if sessions else None)
@@ -1006,18 +1016,23 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     detail = ""
     if chosen:
         turn_note = " · input/cache/reasoning values estimated from session totals" if len(chosen["turns"]) > 1 else ""
+        refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "session": chosen["id"]}), quote=True)
         explorer_title, explorer_text, explorer_raw = explorer_content(
             chosen["turns"][selected_turn - 1], selected_metric
         ) if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else explorer_content({}, None)
-        detail = f'''<section class="detail"><div class="eyebrow">{esc(PROVIDERS.get(provider, provider).upper())} · SESSION</div><h1>{esc(chosen["name"])}</h1>
-            <div class="id">{esc(chosen["id"])}{f' <span>·</span> {esc(chosen["project"])}' if chosen.get("project") else ''} <span>·</span> {esc(chosen["model"] or "model unavailable")}</div>
-            <div class="source-location"><span>Information source:</span> {esc(chosen.get("source") or "unknown")}</div>
+        detail = f'''<section class="detail"><div class="eyebrow">{esc(PROVIDERS.get(provider, provider).upper())} · SESSION</div><div class="detail-heading"><div><h1>{esc(chosen["name"])}</h1>
+            <div class="session-header-metadata"><span>Session:</span> {esc(chosen["id"])} <span>·</span> <span>Tool:</span> {esc(session_tool(chosen_summary, provider))} <span>·</span> <span>Timestamp:</span> {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))} <span>·</span> <span>Model:</span> {esc(chosen["model"] or "unavailable")}</div>
+            <div class="session-header-project"><span>Project Source:</span> {esc(chosen.get("project") or "unavailable")}</div>
+            </div><div class="detail-actions"><a class="detail-refresh clickable" href="{refresh_conversation_url}">Refresh conversation</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
+            <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
+            <button type="submit">Delete conversation</button></form></div></div>
+            <div class="source-location"><span>Information Source:</span> {esc(chosen.get("source") or "unknown")}</div>
             <h2>Session token totals</h2><div class="metrics">{token_cards(chosen["tokens"])}</div>
             <h2>Turns <span class="muted">{len(chosen["turns"])}{esc(turn_note)}</span></h2>
             <div class="content-layout"><div class="turns">{turns or '<div class="empty">No turn events found.</div>'}</div>
             <aside class="explorer"><div class="eyebrow">CONTENT EXPLORER</div><h2>{esc(explorer_title)}</h2><p>{esc(explorer_text)}</p>{f'<details><summary>Raw event data</summary><pre>{esc(explorer_raw)}</pre></details>' if explorer_raw else ''}</aside></div></section>'''
     else:
-        detail = '<section class="detail empty"><h1>No sessions found</h1><p>Choose a folder containing session subfolders with events.jsonl files.</p></section>'
+        detail = '<section class="detail no-sessions"><h1>No sessions found</h1><p>Choose a folder containing session subfolders with events.jsonl files.</p></section>'
 
     refresh_url = esc("/?" + urlencode({"provider": provider}), quote=True)
     return PAGE.replace("__PROVIDER_MENU__", provider_menu).replace("__SESSION_ROWS__", session_rows).replace("__DETAIL__", detail).replace("__REFRESH_URL__", refresh_url).replace("__ROOT__", esc(provider_path(root, provider)))
@@ -1113,11 +1128,22 @@ PAGE = PAGE.replace("</style></head>", r'''<style>
 .session b,.session small,.session .session-meta{max-width:100%;overflow:hidden;text-overflow:ellipsis}
 .session-row{min-width:0;width:100%;overflow:hidden}
 .id{overflow-wrap:anywhere;word-break:break-word}
+.detail-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px}
+.detail-actions{display:flex;align-items:center;gap:8px;flex:none;margin-top:8px}
+.detail-refresh{border:1px solid #315a82;background:#182e47;color:#a9d5ff;border-radius:7px;padding:8px 12px;font:inherit;font-size:12px;text-decoration:none;white-space:nowrap}
+.detail-refresh:hover{background:#24558a;color:#fff}
+.detail-delete{flex:none}
+.detail-delete button{border:1px solid #7b3547;background:#3b1d2a;color:#ffbdc8;border-radius:7px;padding:8px 12px;font:inherit;font-size:12px;cursor:pointer}
+.detail-delete button:hover{background:#5b2534;color:#fff}
+.session-header-metadata{font:12px ui-monospace,monospace;color:#8094b2;overflow-wrap:anywhere;word-break:break-word}
+.session-header-metadata span,.source-location span{color:#91a8c7;font-family:Inter,ui-sans-serif,system-ui,sans-serif}
+.session-header-project{margin-top:6px;font:12px ui-monospace,monospace;color:#8094b2;overflow-wrap:anywhere;word-break:break-word}
+.session-header-project span{color:#91a8c7;font-family:Inter,ui-sans-serif,system-ui,sans-serif}
 .source-location{margin-top:8px;color:#7188a6;font:11px ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-word}
-.source-location span{color:#91a8c7;font-family:Inter,ui-sans-serif,system-ui,sans-serif}
 
 /* Long GUIDs and raw payloads must never escape the content columns. */
 .content-layout,.turns,.turn,.message,.explorer{min-width:0}
+.turns > .empty{margin-top:12px}
 .turn{overflow:hidden}
 .message p,.explorer p{overflow-wrap:anywhere;word-break:break-word}
 .explorer{overflow:hidden}
