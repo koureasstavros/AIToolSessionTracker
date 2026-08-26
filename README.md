@@ -22,6 +22,8 @@ Each conversation also has a delete button. Deletion requires browser confirmati
 
 Deletion cannot be undone by this application.
 
+When available, the session detail header shows the associated project directory between the session GUID and model information.
+
 Optional arguments:
 
 ```text
@@ -34,6 +36,8 @@ Stop the server with `Ctrl+C`.
 ## Supported providers
 
 ### GitHub Copilot
+
+The VS Code session actions are archive and delete, which are two different things
 
 The VS Code non-project-related workspace storage directory:
 
@@ -75,6 +79,8 @@ This source includes per-turn `cache_read_tokens`, `cache_write_tokens`, and `re
 
 ### OpenAI Codex
 
+The VS Code session actions are archive, which is a delete operation
+
 Reads Codex JSONL rollout files from:
 
 ```text
@@ -89,6 +95,8 @@ The adapter understands Codex records such as:
 - Nested `turn_id` metadata
 
 ### Anthropic Claude Code
+
+The VS Code session actions are delete, which is a delete operation
 
 Reads Codex JSONL files from:
 
@@ -107,6 +115,15 @@ Metadata-only session files are ignored. Desktop transcripts are identified by t
 ## What the app displays
 
 The left-hand provider menu selects the data source. The session list then shows sessions for that provider.
+
+### Interface
+
+- The left sidebar stays fixed while the main session details scroll independently.
+- The sidebar session list has its own styled vertical scrollbar and does not scroll horizontally.
+- Use the refresh button above the session list to rescan provider data.
+- The selected session header shows its GUID, associated project directory when available, model, and the exact transcript or database source path used to load it.
+- The main content area shows token totals, turn cards, and the **Content Explorer** side panel.
+- The layout adapts to smaller screens by returning to normal page scrolling.
 
 Each session contains one or more interactions. An interaction is grouped into a turn containing:
 

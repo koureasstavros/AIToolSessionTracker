@@ -6,7 +6,6 @@ Then open http://127.0.0.1:8765 in a browser.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import html
 import json
 import logging
@@ -16,9 +15,10 @@ import shutil
 import sqlite3
 import threading
 import webbrowser
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 TOKEN_KEYS = (
     "inputTokens",
@@ -79,8 +79,8 @@ def blank_tokens() -> dict[str, int | None]:
     return {key: None for key in TOKEN_KEYS}
 
 
-def new_session(session_id: str, name: str, updated: float, model: str | None = None) -> dict:
-    return {"id": session_id, "name": name, "updated": updated, "turns": [], "tokens": blank_tokens(), "model": model}
+def new_session(session_id: str, name: str, updated: float, model: str | None = None, project: str | None = None) -> dict:
+    return {"id": session_id, "name": name, "updated": updated, "turns": [], "tokens": blank_tokens(), "model": model, "project": project}
 
 
 def new_turn(turn_id: str) -> dict:
@@ -153,6 +153,62 @@ def safe_json_lines(path: Path) -> list[dict]:
     return records
 
 
+def project_path(value: object) -> str | None:
+    """Normalize a local path or VS Code file URI for display."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if value.startswith("file://"):
+        parsed = urlparse(value)
+        value = unquote(parsed.path)
+        if re.match(r"^/[A-Za-z]:/", value):
+            value = value[1:]
+        if parsed.netloc and parsed.netloc != "localhost":
+            value = f"//{parsed.netloc}{value}"
+        if os.name == "nt":
+            value = value.replace("/", "\\")
+    return os.path.normpath(value)
+
+
+def project_from_records(records: list[dict]) -> str | None:
+    """Find common working-directory fields without exposing unrelated metadata."""
+    keys = {
+        "cwd", "workingDirectory", "working_directory", "projectPath", "project_path",
+        "projectDirectory", "project_dir", "workspaceFolder", "workspace_path",
+        "directory", "folder",
+    }
+
+    def visit(value: object) -> str | None:
+        if isinstance(value, dict):
+            for key in keys:
+                result = project_path(value.get(key))
+                if result:
+                    return result
+            for child in value.values():
+                result = visit(child)
+                if result:
+                    return result
+        elif isinstance(value, list):
+            for child in value:
+                result = visit(child)
+                if result:
+                    return result
+        return None
+
+    return visit(records)
+
+
+def workspace_project_path(folder: Path) -> str | None:
+    metadata_path = folder / "workspace.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(metadata, dict):
+        return project_path(metadata.get("folder") or metadata.get("workspaceFolder") or metadata.get("path"))
+    return None
+
+
 def read_session(folder: Path) -> dict:
     try:
         updated = folder.stat().st_mtime
@@ -165,6 +221,7 @@ def read_session(folder: Path) -> dict:
         "turns": [],
         "tokens": blank_tokens(),
         "model": None,
+        "project": None,
     }
     workspace = folder / "workspace.yaml"
     if workspace.exists():
@@ -175,18 +232,22 @@ def read_session(folder: Path) -> dict:
         for line in workspace_lines:
             if line.startswith("name:"):
                 session["name"] = line.partition(":")[2].strip().strip('"\'') or folder.name
+            elif line.startswith(("path:", "folder:", "workspace:")):
+                session["project"] = project_path(line.partition(":")[2].strip().strip('"\''))
 
     events = folder / "events.jsonl"
     if not events.exists():
         return session
 
+    records = safe_json_lines(events)
+    session["project"] = project_from_records(records)
     turns: dict[str, dict] = {}
     turn_interactions: dict[str, str] = {}
     message_output_total = 0
 
     def get_turn(key: str) -> dict:
         return turns.setdefault(key, new_turn(key))
-    for event in safe_json_lines(events):
+    for event in records:
         if not isinstance(event, dict):
             continue
         event_type = event.get("type", "")
@@ -305,6 +366,9 @@ def read_copilot_chat_session(path: Path) -> dict:
         metadata = {}
     session["id"] = str(metadata.get("sessionId") or session["id"])
     session["name"] = str(metadata.get("customTitle") or session["id"])
+    session["project"] = project_path(metadata.get("folder") or metadata.get("workspaceFolder") or metadata.get("projectPath"))
+    if not session["project"]:
+        session["project"] = workspace_project_path(path.parent.parent)
     requests = reconstruct_copilot_requests(records, metadata.get("requests", []))
     for record in records:
         if record.get("k") == ["customTitle"]:
@@ -389,11 +453,25 @@ def read_copilot_db_session(session_id: str, db_path: Path) -> dict:
     session = new_session(session_id, session_id, db_path.stat().st_mtime, "GitHub Copilot")
     try:
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
-            row = db.execute(
-                "SELECT summary, updated_at FROM sessions WHERE id = ?", (session_id,)
+            columns = {row[1] for row in db.execute('PRAGMA table_info("sessions")')}
+            project_column = next((column for column in ("cwd", "working_directory", "project_path") if column in columns), None)
+            session_row = db.execute(
+                f'SELECT summary, updated_at{", " + project_column if project_column else ""} FROM sessions WHERE id = ?',
+                (session_id,),
             ).fetchone()
-            if row:
-                session["name"] = row[0] or session_id
+            if session_row:
+                session["name"] = session_row[0] or session_id
+                if project_column:
+                    candidate = project_path(session_row[2])
+                    # Copilot CLI uses its own chat-storage directory as cwd
+                    # for sessions that were not opened in a project.
+                    internal_chat_root = (Path.home() / ".copilot" / "chats").resolve()
+                    if candidate:
+                        try:
+                            is_internal = Path(candidate).resolve().is_relative_to(internal_chat_root)
+                        except (OSError, ValueError):
+                            is_internal = False
+                        session["project"] = None if is_internal else candidate
                 turns = db.execute(
                     "SELECT turn_index, user_message, assistant_response FROM turns WHERE session_id = ? ORDER BY turn_index",
                     (session_id,),
@@ -503,6 +581,9 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
         if isinstance(metadata, dict):
             summary["id"] = str(metadata.get("sessionId") or path.stem)
             summary["name"] = str(metadata.get("customTitle") or summary["id"])
+            summary["project"] = project_path(metadata.get("folder") or metadata.get("workspaceFolder") or metadata.get("projectPath"))
+            if not summary["project"]:
+                summary["project"] = workspace_project_path(path.parent.parent)
             updated_title = latest_chat_field(path, "customTitle")
             if updated_title:
                 summary["name"] = str(updated_title)
@@ -535,7 +616,8 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
             for line in workspace.read_text(encoding="utf-8", errors="replace").splitlines():
                 if line.startswith("name:"):
                     summary["name"] = line.partition(":")[2].strip().strip('"\'') or path.name
-                    break
+                elif line.startswith(("path:", "folder:", "workspace:")):
+                    summary["project"] = project_path(line.partition(":")[2].strip().strip('"\''))
         except OSError:
             pass
     elif kind == "external":
@@ -547,6 +629,7 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
             summary["name"] = codex_name(first, summary["id"]) if provider == "codex" else str(
                 first.get("title") or first.get("name") or first.get("summary") or summary["id"]
             )
+        summary["project"] = project_from_records([first])
     return summary
 
 
@@ -634,6 +717,9 @@ def load_session_details(summary: dict, provider: str) -> dict:
         if not details.get("model") or details["model"] == "model unavailable":
             details["model"] = database_metadata.get("model") or details.get("model")
         details["updated"] = max(details.get("updated", 0), database_metadata.get("updated") or 0)
+    if not details.get("project"):
+        details["project"] = summary.get("project")
+    details["source"] = str(summary.get("_source", ""))
     return details
 
 
@@ -670,6 +756,16 @@ def read_external_session(path: Path, provider: str) -> dict:
     session = new_session(path.stem, path.stem, updated)
     turns: dict[str, dict] = {}
     records = safe_json_lines(path)
+    session["project"] = project_from_records(records)
+    if provider == "claude" and session.get("project"):
+        normalized_project = session["project"].replace("/", "\\").lower()
+        if "\\local-agent-mode-sessions\\" in normalized_project:
+            # Claude Desktop's cwd is its private per-session output folder,
+            # not a user project directory.
+            session["project"] = None
+    if not session["project"] and provider == "claude" and path.parent.name.startswith(("c--", "d--")):
+        encoded = path.parent.name
+        session["project"] = encoded.replace("--", ":\\", 1).replace("-", "\\")
     if records and isinstance(records[0], dict):
         first = records[0]
         session["id"] = normalize_codex_id(first.get("sessionId") or first.get("session_id") or session["id"]) if provider == "codex" else str(first.get("sessionId") or first.get("session_id") or session["id"])
@@ -726,7 +822,20 @@ def read_external_session(path: Path, provider: str) -> dict:
                 if value is not None:
                     turn["tokens"][key] = (turn["tokens"][key] or 0) + value
     session["turns"] = list(turns.values())
-    session["model"] = provider
+    model = next(
+        (
+            candidate
+            for record in records
+            for candidate in (
+                record.get("model"),
+                (record.get("message") or {}).get("model") if isinstance(record.get("message"), dict) else None,
+                (record.get("payload") or {}).get("model") if isinstance(record.get("payload"), dict) else None,
+            )
+            if isinstance(candidate, str) and candidate
+        ),
+        None,
+    )
+    session["model"] = model or provider
     for key in TOKEN_KEYS:
         values = [turn["tokens"][key] for turn in session["turns"] if turn["tokens"][key] is not None]
         if values:
@@ -858,13 +967,14 @@ def explorer_content(turn: dict, metric: str | None) -> tuple[str, str, str]:
 def render_session_row(item: dict, provider: str, selected: bool) -> str:
     query = esc(urlencode({"provider": provider, "session": item["id"]}), quote=True)
     label = conversation_name(item.get("name"), item["id"])
+    id_detail = "" if str(item["id"]).lower() in str(label).lower() else f'<small>{esc(item["id"])}</small>'
     metadata = (
         f'<small class="session-meta">{esc(item.get("_source_label", PROVIDERS.get(provider, provider)))} · '
         f'{esc(format_timestamp(item["updated"]))}</small>'
     )
     return (
         f'<div class="session-row"><a class="session session-link {"selected" if selected else ""}" href="/?{query}">'
-        f'<span class="dot"></span><span><b>{esc(label)}</b><small>{esc(item["id"])}</small>{metadata}</span></a>'
+        f'<span class="dot"></span><span><b>{esc(label)}</b>{id_detail}{metadata}</span></a>'
         f'<form method="post" action="/delete" onsubmit="return confirm(\'Delete this conversation and its stored data?\');">'
         f'<input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="session" value="{esc(item["id"])}">'
         f'<button class="delete-session" type="submit" title="Delete conversation" aria-label="Delete conversation">×</button></form></div>'
@@ -900,7 +1010,8 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             chosen["turns"][selected_turn - 1], selected_metric
         ) if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else explorer_content({}, None)
         detail = f'''<section class="detail"><div class="eyebrow">{esc(PROVIDERS.get(provider, provider).upper())} · SESSION</div><h1>{esc(chosen["name"])}</h1>
-            <div class="id">{esc(chosen["id"])} <span>·</span> {esc(chosen["model"] or "model unavailable")}</div>
+            <div class="id">{esc(chosen["id"])}{f' <span>·</span> {esc(chosen["project"])}' if chosen.get("project") else ''} <span>·</span> {esc(chosen["model"] or "model unavailable")}</div>
+            <div class="source-location"><span>Information source:</span> {esc(chosen.get("source") or "unknown")}</div>
             <h2>Session token totals</h2><div class="metrics">{token_cards(chosen["tokens"])}</div>
             <h2>Turns <span class="muted">{len(chosen["turns"])}{esc(turn_note)}</span></h2>
             <div class="content-layout"><div class="turns">{turns or '<div class="empty">No turn events found.</div>'}</div>
@@ -1000,7 +1111,10 @@ PAGE = PAGE.replace("</style></head>", r'''<style>
 /* Keep long provider/session identifiers inside their cards. */
 .session > span:last-child{min-width:0;flex:1;overflow:hidden}
 .session b,.session small,.session .session-meta{max-width:100%;overflow:hidden;text-overflow:ellipsis}
-.session-row{min-width:0}
+.session-row{min-width:0;width:100%;overflow:hidden}
+.id{overflow-wrap:anywhere;word-break:break-word}
+.source-location{margin-top:8px;color:#7188a6;font:11px ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-word}
+.source-location span{color:#91a8c7;font-family:Inter,ui-sans-serif,system-ui,sans-serif}
 
 /* Long GUIDs and raw payloads must never escape the content columns. */
 .content-layout,.turns,.turn,.message,.explorer{min-width:0}
@@ -1010,13 +1124,19 @@ PAGE = PAGE.replace("</style></head>", r'''<style>
 .explorer pre{max-width:100%;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
 
 /* Slightly cleaner sidebar treatment. */
-.sidebar{padding:24px 14px;background:linear-gradient(180deg,#121f35 0%,#0f192b 100%)}
+.app{height:100vh;min-height:100vh}
+.sidebar{padding:24px 14px;background:linear-gradient(180deg,#121f35 0%,#0f192b 100%);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;min-height:100vh;max-height:100vh;overflow:hidden}
 .brand{font-size:18px;letter-spacing:.2px}
 .provider-menu{padding:4px;background:#0c1627;border:1px solid #223451;border-radius:11px}
 .provider{padding:10px 12px;border-radius:8px}
 .provider.selected{background:#2c6aa5;box-shadow:0 4px 12px rgba(24,91,151,.25)}
 .count{margin-top:22px;font-weight:700;color:#91a8c7}
-.session{padding:11px 9px;border:1px solid transparent}
+.sessions-area{flex:1;min-height:0;min-width:0;overflow-y:auto;overflow-x:hidden;padding-right:4px;margin-right:-4px;scrollbar-width:thin;scrollbar-color:#416b98 #0c1627}
+.sessions-area::-webkit-scrollbar{width:9px;height:0}
+.sessions-area::-webkit-scrollbar-track{background:#0c1627;border-radius:8px}
+.sessions-area::-webkit-scrollbar-thumb{background:#416b98;border:2px solid #0c1627;border-radius:8px}
+.sessions-area::-webkit-scrollbar-thumb:hover{background:#68a4d8}
+.session{padding:11px 9px;border:1px solid transparent;flex:1 1 auto;overflow:hidden}
 .session:hover{border-color:#2e527a;background:#1a2b45}
 .session.selected{border-color:#3b6b9d;background:#203653}
 .session-row form{width:26px;flex-basis:26px}
@@ -1025,9 +1145,15 @@ PAGE = PAGE.replace("</style></head>", r'''<style>
 .sessions-heading .count{margin:0}
 .refresh-sessions{display:inline-flex;align-items:center;justify-content:center;width:27px;height:27px;border:1px solid #2b4668;border-radius:7px;background:#172943;color:#a9c2df;text-decoration:none;font-size:16px;line-height:1;transition:background .15s,border-color .15s,color .15s}
 .refresh-sessions:hover{background:#24558a;border-color:#4d8bc4;color:#fff}
+/* Keep the sidebar outside the document scroll area on desktop. */
+.app{display:block;height:auto;min-height:100vh}
+.sidebar{position:fixed;left:0;top:0;width:340px;height:100vh;z-index:5}
+.detail{margin-left:340px;width:calc(100% - 340px)}
+@media(max-width:1000px){.sidebar{width:270px}.detail{margin-left:270px;width:calc(100% - 270px)}}
+@media(max-width:700px){.app{display:block}.sidebar{position:static;width:auto;height:auto;min-height:auto;max-height:none}.detail{margin-left:0;width:100%}.sessions-area{overflow:visible;padding-right:0;margin-right:0}}
 </style></head>''')
 
-PAGE = PAGE.replace('<div class="count">Sessions</div>__SESSION_ROWS__', '<div class="sessions-heading"><div class="count">Sessions</div><a class="refresh-sessions" href="__REFRESH_URL__" title="Refresh sessions" aria-label="Refresh sessions">↻</a></div>__SESSION_ROWS__')
+PAGE = PAGE.replace('<div class="count">Sessions</div>__SESSION_ROWS__', '<div class="sessions-area"><div class="sessions-heading"><div class="count">Sessions</div><a class="refresh-sessions" href="__REFRESH_URL__" title="Refresh sessions" aria-label="Refresh sessions">↻</a></div>__SESSION_ROWS__</div>')
 
 
 if __name__ == "__main__":
