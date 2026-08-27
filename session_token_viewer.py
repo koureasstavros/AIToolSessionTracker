@@ -42,7 +42,7 @@ TOKEN_LABELS = {
 PROVIDERS = {
     "copilot": "GitHub Copilot",
     "codex": "OpenAI Codex",
-    "claude": "Claude Code",
+    "claude": "Anthropic Claude Code",
     "m365_copilot": "Microsoft 365 Copilot",
 }
 PROVIDER_ADAPTERS = {
@@ -101,15 +101,21 @@ def normalize_session_data(value: dict) -> SessionData:
 
 
 def session_has_content(session: dict) -> bool:
-    """Return whether a parsed conversation contains usable interaction data."""
+    """Return whether a parsed conversation contains a meaningful turn."""
     for turn in session.get("turns", []):
         if turn.get("user") or turn.get("assistant"):
             return True
         tokens = turn.get("tokens", {})
-        if any(value is not None and value > 0 for value in tokens.values() if isinstance(value, int)):
+        if any(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in tokens.values()
+        ):
             return True
     tokens = session.get("tokens", {})
-    return any(value is not None and value > 0 for value in tokens.values() if isinstance(value, int))
+    return any(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in tokens.values()
+    )
 
 
 def number(value: object) -> int | None:
@@ -121,6 +127,31 @@ def conversation_name(name: object, session_id: str) -> str:
     if not value or value.lstrip("# ").startswith("rollout-"):
         return session_id
     return value
+
+
+def derived_conversation_name(records: list[dict], fallback: str) -> str:
+    """Use the first real user message when a provider stores no title."""
+    for record in records:
+        payload = record.get("payload", record)
+        if not isinstance(payload, dict):
+            continue
+        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        role = payload.get("role") or message.get("role") or record.get("role")
+        content = payload.get("content") or message.get("content") or record.get("message")
+        if role != "user" or not content:
+            continue
+        parts = content if isinstance(content, list) else [content]
+        text = "\n".join(
+            str(part.get("text", ""))
+            for part in parts
+            if isinstance(part, dict) and part.get("type") != "tool_result" and part.get("text")
+        ) if isinstance(content, list) else str(content)
+        text = " ".join(text.split())
+        if text.lower().startswith(("<environment_context>", "<system>", "<developer>")):
+            continue
+        if text:
+            return text[:77].rstrip() + "..." if len(text) > 80 else text
+    return fallback
 
 
 def blank_tokens() -> dict[str, int | None]:
@@ -483,6 +514,8 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
         if session_id:
             summary["id"] = str(session_id)
             summary["name"] = display_name
+            if summary["name"] == summary["id"]:
+                summary["name"] = derived_conversation_name(safe_json_lines(path), summary["id"])
         summary["project"] = project_from_records([first])
     return summary
 
@@ -508,6 +541,8 @@ def parse_export_session(path: Path, provider: str) -> dict:
     if records and isinstance(records[0], dict):
         first = records[0]
         session["id"], session["name"] = PROVIDER_ADAPTERS[provider].identity(first, session["id"])
+        if session["name"] == session["id"]:
+            session["name"] = derived_conversation_name(records, session["id"])
 
     def get_turn(key: str) -> dict:
         return turns.setdefault(key, new_turn(key))
@@ -611,15 +646,15 @@ def load_session_index(root: Path, provider: str, show_empty: bool = False) -> l
     for item in adapter.index(root):
         item["provider"] = provider
         normalized.append(normalize_session_data(item))
+    normalized.sort(key=lambda item: item.get("updated", 0), reverse=True)
     if show_empty:
         return normalized
     visible = []
     for item in normalized:
-        if item.get("_has_data") is False:
-            continue
-        # Some providers cannot determine emptiness from their cheap metadata
-        # scan. Parse those summaries lazily so the toggle has consistent
-        # behavior across every provider.
+        # A provider's cheap scan may only know that usage statistics are
+        # absent. Parse such summaries before hiding them so conversations
+        # containing prompts or responses but no token statistics remain
+        # visible.
         if item.get("_has_data") is not True:
             if not session_has_content(adapter.details(item)):
                 continue
@@ -671,10 +706,10 @@ def turn_token_cards(tokens: dict[str, int | None], session_id: str, provider: s
         active = selected_turn == turn_index and selected_metric == key
         href = "/?" + esc(urlencode({
             "provider": provider,
+            "show_empty": int(show_empty),
             "session": session_id,
             "turn": turn_index,
             "metric": key,
-            "show_empty": int(show_empty),
         }), quote=True)
         cards.append(
             f'<a class="metric compact clickable {"active" if active else ""}" href="{href}">'
@@ -695,7 +730,7 @@ def explorer_content(turn: dict, metric: str | None) -> tuple[str, str, str]:
 
 
 def render_session_row(item: dict, provider: str, selected: bool, show_empty: bool = False) -> str:
-    query = esc(urlencode({"provider": provider, "session": item["id"], "show_empty": int(show_empty)}), quote=True)
+    query = esc(urlencode({"provider": provider, "show_empty": int(show_empty), "session": item["id"]}), quote=True)
     label = conversation_name(item.get("name"), item["id"])
     id_detail = "" if str(item["id"]).lower() in str(label).lower() else f'<small>{esc(item["id"])}</small>'
     metadata = (
@@ -706,7 +741,8 @@ def render_session_row(item: dict, provider: str, selected: bool, show_empty: bo
         f'<div class="session-row"><a class="session session-link {"selected" if selected else ""}" href="/?{query}">'
         f'<span class="dot"></span><span><b>{esc(label)}</b>{id_detail}{metadata}</span></a>'
         f'<form method="post" action="/delete" onsubmit="return confirm(\'Delete this conversation and its stored data?\');">'
-        f'<input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="session" value="{esc(item["id"])}">'
+        f'<input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}">'
+        f'<input type="hidden" name="session" value="{esc(item["id"])}">'
         f'<button class="delete-session" type="submit" title="Delete conversation" aria-label="Delete conversation">×</button></form></div>'
     )
 
@@ -716,9 +752,9 @@ def session_tool(summary: dict, provider: str) -> str:
     return PROVIDER_ADAPTERS[provider].tool(summary)
 
 
-def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False) -> str:
+def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False, selected_raw: bool = False) -> str:
     sessions = load_session_index(root, provider, show_empty)
-    chosen_summary = next((item for item in sessions if item["id"] == selected), sessions[0] if sessions else None)
+    chosen_summary = next((item for item in sessions if item["id"] == selected), None) if selected else None
     chosen = load_session_details(chosen_summary, provider) if chosen_summary else None
     provider_menu = "".join(
         f'<a class="provider {"selected" if provider == key else ""}" href="/?{esc(urlencode({"provider": key, "show_empty": int(show_empty)}), quote=True)}">{esc(label)}</a>'
@@ -733,31 +769,39 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         for index, turn in enumerate(chosen["turns"], start=1):
             assistant = "\n\n".join(turn["assistant"]) or "(no assistant text)"
             step_label = f' · Step {turn["step"]} of {turn["step_count"]}' if turn.get("step") else ""
+            kind_label = '<span class="turn-kind">Tool turn</span>' if turn.get("kind") == "tool" else ""
             turn_label = turn.get("turn_index", index)
-            turns += f'''<article class="turn"><header><b>Turn {esc(turn_label)}{esc(step_label)}</b></header>
+            raw_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"], "turn": index, "raw": 1}), quote=True)
+            turns += f'''<article class="turn"><header><b>Turn {esc(turn_label)}{esc(step_label)}</b>{kind_label}</header>
                 <div class="message user"><label>User</label><p>{esc(turn["user"] or "(no user message)")}</p></div>
                 <div class="message assistant"><label>Assistant</label><p>{esc(assistant)}</p></div>
-                <div class="turn-metrics">{turn_token_cards(turn["tokens"], chosen["id"], provider, index, selected_turn, selected_metric, show_empty)}</div></article>'''
+                <div class="turn-metrics">{turn_token_cards(turn["tokens"], chosen["id"], provider, index, selected_turn, selected_metric, show_empty)}</div>
+                <a class="show-raw clickable" href="{raw_url}">Show Raw</a></article>'''
     detail = ""
     if chosen:
         turn_note = " · input/cache/reasoning values estimated from session totals" if len(chosen["turns"]) > 1 else ""
-        refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "session": chosen["id"], "show_empty": int(show_empty)}), quote=True)
-        explorer_title, explorer_text, explorer_raw = explorer_content(
-            chosen["turns"][selected_turn - 1], selected_metric
-        ) if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else explorer_content({}, None)
-        detail = f'''<section class="detail"><div class="eyebrow">{esc(PROVIDERS.get(provider, provider).upper())} · SESSION</div><div class="detail-heading"><div><h1>{esc(chosen["name"])}</h1>
+        refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"]}), quote=True)
+        selected_content_turn = chosen["turns"][selected_turn - 1] if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else {}
+        if selected_raw:
+            explorer_title, explorer_text, explorer_raw = "Raw event data", "", "\n\n".join(selected_content_turn.get("raw", []))
+        else:
+            explorer_title, explorer_text, explorer_raw = explorer_content(selected_content_turn, selected_metric)
+        detail = f'''<section class="detail"><div class="eyebrow">{esc(PROVIDERS.get(provider, provider).upper())}</div><div class="detail-heading"><div><h1>{esc(chosen["name"])}</h1>
             <div class="session-header-metadata"><span>Session:</span> {esc(chosen["id"])} <span>·</span> <span>Tool:</span> {esc(session_tool(chosen_summary, provider))} <span>·</span> <span>Timestamp:</span> {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))} <span>·</span> <span>Model:</span> {esc(chosen["model"] or "unavailable")}</div>
             <div class="session-header-project"><span>Project Source:</span> {esc(chosen.get("project") or "unavailable")}</div>
             </div><div class="detail-actions"><a class="detail-refresh clickable" href="{refresh_conversation_url}">Refresh conversation</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
-            <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
+            <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
             <button type="submit">Delete conversation</button></form></div></div>
             <div class="source-location"><span>Information Source:</span> {esc(chosen.get("source") or "unknown")}</div>
             <h2>Session token totals</h2><div class="metrics">{token_cards(chosen["tokens"])}</div>
             <h2>Turns <span class="muted">{len(chosen["turns"])}{esc(turn_note)}</span></h2>
             <div class="content-layout"><div class="turns">{turns or '<div class="empty">No turn events found.</div>'}</div>
-            <aside class="explorer"><div class="eyebrow">CONTENT EXPLORER</div><h2>{esc(explorer_title)}</h2><p>{esc(explorer_text)}</p>{f'<details><summary>Raw event data</summary><pre>{esc(explorer_raw)}</pre></details>' if explorer_raw else ''}</aside></div></section>'''
+            <aside class="explorer"><div class="explorer-header"><div class="eyebrow">CONTENT EXPLORER</div><h2>{esc(explorer_title)}</h2></div><div class="explorer-body">{f'<p>{esc(explorer_text)}</p>' if explorer_text else ''}{f'<pre>{esc(explorer_raw)}</pre>' if explorer_raw and selected_raw else ''}</div></aside></div></section>'''
     else:
-        detail = '<section class="detail no-sessions"><h1>No sessions found</h1><p>Choose a folder containing session subfolders with events.jsonl files.</p></section>'
+        if sessions:
+            detail = '<section class="detail no-sessions"><h1>Select a session</h1><p>Choose a conversation from the sidebar to view its turns, tokens, and content.</p></section>'
+        else:
+            detail = '<section class="detail no-sessions"><h1>No sessions found</h1><p>Choose a folder containing session subfolders with events.jsonl files.</p></section>'
 
     refresh_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty)}), quote=True)
     toggle_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(not show_empty)}), quote=True)
@@ -776,6 +820,7 @@ class Handler(BaseHTTPRequestHandler):
         form = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
         provider = form.get("provider", ["copilot"])[0]
         session_id = form.get("session", [""])[0]
+        show_empty = form.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
         if provider not in PROVIDERS or not session_id:
             self.send_error(400, "Invalid delete request")
             return
@@ -791,7 +836,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(500, "Unable to delete session")
             return
         self.send_response(303)
-        self.send_header("Location", f"/?{urlencode({'provider': provider})}")
+        self.send_header("Location", f"/?{urlencode({'provider': provider, 'show_empty': int(show_empty)})}")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
@@ -804,9 +849,10 @@ class Handler(BaseHTTPRequestHandler):
         turn_value = query.get("turn", [None])[0]
         selected_turn = int(turn_value) if turn_value and turn_value.isdigit() else None
         selected_metric = query.get("metric", [None])[0]
+        selected_raw = query.get("raw", ["0"])[0] in {"1", "true", "yes"}
         show_empty = query.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
         try:
-            body = render(self.root, selected, selected_turn, selected_metric, provider, show_empty).encode("utf-8")
+            body = render(self.root, selected, selected_turn, selected_metric, provider, show_empty, selected_raw).encode("utf-8")
         except OSError:
             self.send_error(500, "Unable to read session files")
             return
@@ -912,6 +958,24 @@ PAGE = PAGE.replace("</style></head>", r'''<style>
 </style></head>''')
 
 PAGE = PAGE.replace('<div class="count">Sessions</div>__SESSION_ROWS__', '<div class="sessions-area"><div class="sessions-heading"><div class="count">Sessions</div><div class="sessions-heading-actions">__EMPTY_TOGGLE__<a class="refresh-sessions" href="__REFRESH_URL__" title="Refresh sessions" aria-label="Refresh sessions">↻</a></div></div>__SESSION_ROWS__</div>')
+
+PAGE = PAGE.replace('</head>', '<style>.turn header{display:flex;align-items:center;justify-content:space-between;gap:12px}.turn-kind{color:#9ed1ff;background:#1b4268;border:1px solid #326b9e;border-radius:999px;padding:3px 9px;font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;white-space:nowrap}.show-raw{display:block;margin:10px 16px 14px;padding:7px 12px;border:1px solid #315479;border-radius:6px;background:#142a43;color:#9ed1ff;text-align:center;text-decoration:none;font-size:11px}.show-raw:hover{background:#1b4268;color:#fff}.content-layout{align-items:stretch}.explorer{height:calc(100vh - 84px);max-height:calc(100vh - 84px);position:sticky;top:42px;overflow:hidden;display:flex;flex-direction:column}.explorer-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex:none;overflow:hidden;background:transparent;padding:10px 12px;border-bottom:1px solid #223753;z-index:1}.explorer-header h2{margin:0}.explorer-body{display:flex;flex:1;min-height:0;flex-direction:column;overflow-y:auto;overflow-x:hidden;padding-top:12px;scrollbar-width:thin;scrollbar-color:#416b98 #0c1627}.explorer-body>p{flex:none}.explorer-body>pre{flex:none;max-height:none;overflow:visible}.explorer details{display:block;flex:none}.explorer details pre{max-height:none;overflow:visible}@media(max-width:700px){.explorer{height:auto;max-height:none;position:static;overflow:visible}.explorer-header{position:static;border-bottom:0}.explorer-body{display:block;overflow:visible}.explorer-body>pre{max-height:60vh;overflow:auto}.explorer details{display:block}.explorer details pre{max-height:60vh;overflow:auto}}</style></head>')
+
+PAGE = PAGE.replace('</body></html>', r'''<script>
+(function(){
+    var area=document.querySelector('.sessions-area');
+    if(!area) return;
+    var params=new URLSearchParams(window.location.search);
+    var key='session-sidebar-scroll:'+ (params.get('provider') || 'copilot') + ':' + (params.get('show_empty') || '0');
+    var saved=sessionStorage.getItem(key);
+    if(saved !== null) area.scrollTop=Number(saved);
+    function remember(){sessionStorage.setItem(key,String(area.scrollTop));}
+    area.addEventListener('scroll',remember,{passive:true});
+    document.querySelectorAll('.session-link,.provider,.refresh-sessions,.empty-toggle').forEach(function(link){
+        link.addEventListener('click',remember);
+    });
+})();
+</script><script>(function(){var params=new URLSearchParams(window.location.search);var key='session-detail-scroll:'+ (params.get('provider') || 'copilot') + ':' + (params.get('session') || '');var detail=document.querySelector('.detail');var saved=sessionStorage.getItem(key);if(saved !== null){requestAnimationFrame(function(){try{var position=JSON.parse(saved);if(detail){detail.scrollTop=Number(position.detail || 0);}window.scrollTo(0,Number(position.window || 0));}catch(error){if(detail){detail.scrollTop=Number(saved);}}});}document.querySelectorAll('.metric.clickable,.show-raw').forEach(function(link){link.addEventListener('click',function(){var current=document.querySelector('.detail');sessionStorage.setItem(key,JSON.stringify({detail:current ? current.scrollTop : 0,window:window.scrollY}));});});})();</script><script>document.querySelectorAll('form[action="/delete"]').forEach(function(form){form.addEventListener('submit',function(event){if(!event.defaultPrevented){return;}var overlay=document.querySelector('.loading');if(overlay){overlay.remove();}document.body.classList.remove('is-loading');var button=form.querySelector('button');if(button){button.disabled=false;}});});</script></body></html>''')
 
 
 if __name__ == "__main__":

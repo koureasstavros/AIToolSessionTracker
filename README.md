@@ -199,7 +199,7 @@ The left-hand provider menu selects the data source. The session list then shows
 - The left sidebar stays fixed while the main session details scroll independently.
 - The sidebar session list has its own styled vertical scrollbar and does not scroll horizontally.
 - Use the refresh button above the session list to rescan provider data.
-- Use **Show empty** or **Hide empty** beside refresh to control whether incomplete sessions without persisted response data appear. The preference is preserved while switching providers and inspecting token content.
+- Use **Show empty** or **Hide empty** beside refresh to control whether sessions without a meaningful turn appear. A session is non-empty when at least one turn has user input, assistant output, or a numeric token value (including zero). The preference is preserved while switching providers and inspecting token content.
 - The selected session header shows its GUID, associated project directory when available, model, and the exact transcript or database source path used to load it.
 - The main content area shows token totals, turn cards, and the **Content Explorer** side panel.
 - The layout adapts to smaller screens by returning to normal page scrolling.
@@ -219,7 +219,7 @@ The supported token categories are:
 - Output
 - Output reasoning
 
-Click a token card inside a turn to open the right-side **Content Explorer**. The explorer displays the relevant readable content and provides expandable raw event JSON.
+Click a token card inside a turn to open the right-side **Content Explorer**. The explorer displays only the relevant readable content. Use the horizontal **Show Raw** button below the token cards to display that turn's raw event data. Navigating with either a token card or **Show Raw** preserves the current detail scroll position.
 
 ## Token calculation
 

@@ -62,7 +62,16 @@ def index(root: Path) -> list[dict]:
     entries = [viewer.session_summary(path, "claude", "external") for path in _files()]
     for entry in entries:
         entry["_has_data"] = _has_data(entry["_source"])
-    return sorted(entries, key=lambda item: item["updated"], reverse=True)
+    # A conversation can be discovered through more than one local Claude
+    # source while it is being written. Keep one sidebar item per session ID.
+    unique: dict[str, dict] = {}
+    for entry in entries:
+        existing = unique.get(entry["id"])
+        if existing is None or (
+            entry.get("_has_data") and not existing.get("_has_data")
+        ) or entry["updated"] > existing["updated"]:
+            unique[entry["id"]] = entry
+    return sorted(unique.values(), key=lambda item: item["updated"], reverse=True)
 
 
 def details(summary: dict) -> dict:
@@ -88,24 +97,67 @@ def details(summary: dict) -> dict:
         metadata = payload.get("internal_chat_message_metadata_passthrough") or item.get("internal_chat_message_metadata_passthrough") or {}
         if not isinstance(metadata, dict):
             metadata = {}
+        author = payload.get("author") or message.get("author") or item.get("author") or {}
+        role = payload.get("role") or message.get("role") or item.get("role")
+        if isinstance(author, dict):
+            role = role or author.get("role")
+        raw_content = (payload.get("content") or message.get("content") or item.get("content")
+                       or payload.get("text") or item.get("text") or payload.get("last_agent_message"))
+        content_parts = raw_content if isinstance(raw_content, list) else ([] if raw_content is None else [raw_content])
+        is_tool_result = bool(content_parts) and all(
+            isinstance(part, dict) and part.get("type") == "tool_result"
+            for part in content_parts
+        )
+        is_tool_use = any(
+            isinstance(part, dict) and part.get("type") == "tool_use"
+            for part in content_parts
+        )
+        if is_tool_result and role == "user":
+            # Claude serializes tool results as user-role messages. They are
+            # not new user prompts and should not appear as JSON input.
+            role = None
         turn_id = payload.get("turn_id") or payload.get("turnId") or metadata.get("turn_id") or item.get("turn_id") or record.get("promptId")
         if not turn_id and record.get("type") == "user":
             turn_id = record.get("uuid")
         if not turn_id and not current and (payload.get("type") or record.get("type")) in {"session_meta", "world_state", "turn_context", "queue-operation", "attachment"}:
             continue
-        current = str(turn_id or current or record.get("timestamp") or len(turns))
+        next_turn = str(turn_id or current or record.get("timestamp") or len(turns))
+        if (role == "user" or is_tool_use) and current in turns:
+            previous = turns[current]
+            has_previous_data = bool(
+                previous["user"]
+                or previous["assistant"]
+                or any(value is not None for value in previous["tokens"].values())
+            )
+            if has_previous_data:
+                suffix = "tool" if is_tool_use else "user"
+                next_turn = f"{next_turn}:{suffix}:{len(turns)}"
+        current = next_turn
         turn = turns.setdefault(current, viewer.new_turn(current))
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
-        author = payload.get("author") or message.get("author") or item.get("author") or {}
-        role = payload.get("role") or message.get("role") or item.get("role")
-        if isinstance(author, dict):
-            role = role or author.get("role")
-        content = payload.get("content") or message.get("content") or item.get("content") or payload.get("text") or item.get("text") or payload.get("last_agent_message")
-        if isinstance(content, list):
-            content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
+        content = "\n".join(
+            (
+                f"Tool: {part.get('name', 'unknown')}\nInput: "
+                f"{json.dumps(part.get('input', {}), ensure_ascii=False)}"
+                if isinstance(part, dict) and part.get("type") == "tool_use"
+                else str(part.get("content", ""))
+                if isinstance(part, dict) and part.get("type") == "tool_result"
+                else str(part.get("text", ""))
+                if isinstance(part, dict)
+                else str(part)
+            )
+            for part in content_parts
+            if not isinstance(part, dict) or part.get("type") != "tool_result" or is_tool_result
+        )
+        if is_tool_use:
+            turn["kind"] = "tool"
+        if is_tool_result:
+            turn["kind"] = "tool"
         if content and role == "user":
             turn["user"] = str(content)
         elif content and role in {"assistant", "model"}:
+            turn["assistant"].append(str(content))
+        elif content and is_tool_result:
             turn["assistant"].append(str(content))
         info = payload.get("info") or {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or (info.get("last_token_usage") if isinstance(info, dict) else {})
@@ -119,6 +171,8 @@ def details(summary: dict) -> dict:
         first = records[0]
         result["id"] = str(first.get("sessionId") or first.get("session_id") or first.get("conversationId") or first.get("conversation_id") or result["id"])
         result["name"] = str(first.get("title") or first.get("name") or first.get("summary") or first.get("conversationTitle") or result["id"])
+        if result["name"] == result["id"]:
+            result["name"] = viewer.derived_conversation_name(records, result["id"])
     result["turns"] = list(turns.values())
     result["model"] = result["model"] or "claude"
     for key in viewer.TOKEN_KEYS:

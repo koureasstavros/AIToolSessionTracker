@@ -71,6 +71,7 @@ def details(summary: dict) -> dict:
     records = viewer.safe_json_lines(path)
     result["project"] = viewer.project_from_records(records)
     turns: dict[str, dict] = {}
+    tool_turns: dict[str, str] = {}
     current = ""
     for record in records:
         payload = record.get("payload", record)
@@ -83,9 +84,31 @@ def details(summary: dict) -> dict:
             turn_id = record.get("uuid")
         if not turn_id and not current and record.get("type") in {"queue-operation", "attachment"}:
             continue
-        current = str(turn_id or current or record.get("timestamp") or len(turns))
+        payload_type = payload.get("type")
+        call_id = str(payload.get("call_id") or payload.get("callId") or "")
+        if payload_type == "function_call":
+            current = f"{call_id or turn_id or len(turns)}:tool:{len(turns)}"
+            tool_turns[call_id] = current
+        elif payload_type == "function_call_output" and call_id in tool_turns:
+            current = tool_turns[call_id]
+        else:
+            current = str(turn_id or current or record.get("timestamp") or len(turns))
         turn = turns.setdefault(current, viewer.new_turn(current))
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
+        if payload_type in {"function_call", "function_call_output"}:
+            turn["kind"] = "tool"
+            if payload_type == "function_call":
+                arguments = payload.get("arguments", payload.get("input", {}))
+                turn["assistant"].append(
+                    f"Tool: {payload.get('name', 'unknown')}\nInput: "
+                    f"{arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)}"
+                )
+            else:
+                output = payload.get("output", payload.get("result", ""))
+                if isinstance(output, (dict, list)):
+                    output = json.dumps(output, ensure_ascii=False)
+                if output:
+                    turn["assistant"].append(f"Tool output:\n{output}")
         role = payload.get("role") or message.get("role") or item.get("role")
         content = payload.get("content") or message.get("content") or item.get("content") or payload.get("text") or item.get("text")
         if isinstance(content, list):
@@ -105,6 +128,8 @@ def details(summary: dict) -> dict:
     if records and isinstance(records[0], dict):
         first = records[0]
         result["id"], result["name"] = identity(first, result["id"])
+        if result["name"] == result["id"]:
+            result["name"] = viewer.derived_conversation_name(records, result["id"])
     result["turns"] = list(turns.values())
     result["model"] = result["model"] or "codex"
     for key in viewer.TOKEN_KEYS:

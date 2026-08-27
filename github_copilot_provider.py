@@ -160,6 +160,31 @@ def _read_chat(path: Path) -> dict:
         session["turns"].append(turn)
         for key in ("inputTokens", "outputTokens"):
             session["tokens"][key] = (session["tokens"][key] or 0) + (turn["tokens"][key] or 0)
+        tool_index = 0
+        for response_item in response:
+            if not isinstance(response_item, dict) or response_item.get("kind") != "toolInvocationSerialized":
+                continue
+            tool_index += 1
+            tool_turn = viewer.new_turn(f"{request.get('requestId') or index}:tool:{tool_index}")
+            tool_turn["kind"] = "tool"
+            tool_turn["raw"].append(json.dumps(response_item, indent=2, ensure_ascii=False))
+            tool_id = response_item.get("toolId") or response_item.get("toolCallId") or "unknown"
+            invocation = response_item.get("invocationMessage") or response_item.get("pastTenseMessage") or ""
+            if isinstance(invocation, dict):
+                invocation = invocation.get("value") or ""
+            tool_turn["assistant"].append(f"Tool: {tool_id}\n{invocation}".strip())
+            details = response_item.get("resultDetails")
+            if isinstance(details, dict):
+                output = details.get("output")
+                if output:
+                    rendered = []
+                    for item in output if isinstance(output, list) else [output]:
+                        if isinstance(item, dict):
+                            rendered.append(str(item.get("value") or item.get("text") or json.dumps(item, ensure_ascii=False)))
+                        else:
+                            rendered.append(str(item))
+                    tool_turn["assistant"].append("Tool output:\n" + "\n".join(rendered))
+            session["turns"].append(tool_turn)
     session["model"] = str(next((request.get("modelId") for request in requests if request.get("modelId")), "model unavailable"))
     return session
 
