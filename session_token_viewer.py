@@ -94,7 +94,7 @@ def normalize_session_data(value: dict) -> SessionData:
         "model": value.get("model") if isinstance(value.get("model"), str) else None,
         "project": value.get("project") if isinstance(value.get("project"), str) else None,
     }
-    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_session_id", "_db_metadata", "_has_data", "provider"):
+    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_session_id", "_db_metadata", "_db_issue", "_has_data", "provider"):
         if key in value:
             result[key] = value[key]
     return result
@@ -768,13 +768,36 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     if chosen:
         for index, turn in enumerate(chosen["turns"], start=1):
             assistant = "\n\n".join(turn["assistant"]) or "(no assistant text)"
-            step_label = f' · Step {turn["step"]} of {turn["step_count"]}' if turn.get("step") else ""
+            tools = turn.get("tools") if isinstance(turn.get("tools"), list) else []
+            tool_markup_parts = []
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                details = ""
+                if tool.get("arguments") is not None:
+                    details += f'<br><code>{esc(json.dumps(tool["arguments"], ensure_ascii=False))}</code>'
+                if tool.get("result") is not None:
+                    details += f'<br>{esc(json.dumps(tool["result"], ensure_ascii=False))}'
+                tool_markup_parts.append(
+                    f'<div class="message tool"><label>Tool</label><p><b>{esc(tool.get("name") or "unknown")}</b> · '
+                    f'{esc(tool.get("status") or "unknown")}{details}</p></div>'
+                )
+            tool_markup = "".join(tool_markup_parts)
             kind_label = '<span class="turn-kind">Tool turn</span>' if turn.get("kind") == "tool" else ""
             turn_label = turn.get("turn_index", index)
             raw_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"], "turn": index, "raw": 1}), quote=True)
-            turns += f'''<article class="turn"><header><b>Turn {esc(turn_label)}{esc(step_label)}</b>{kind_label}</header>
+            step_markup = ""
+            steps = turn.get("steps") if isinstance(turn.get("steps"), list) else []
+            if len(steps) > 1:
+                step_markup = '<div class="turn-steps"><div class="steps-label">Steps in this turn</div>' + "".join(
+                    f'<div class="turn-step"><span>Step {esc(step.get("index", step_index))}</span><div class="step-metrics">{token_cards(step.get("tokens", {}), "compact")}</div></div>'
+                    for step_index, step in enumerate(steps, 1) if isinstance(step, dict)
+                ) + '</div>'
+            turns += f'''<article class="turn"><header><b>Turn {esc(turn_label)}</b>{f'<span class="step-count">{len(steps)} steps</span>' if len(steps) > 1 else ""}{kind_label}</header>
                 <div class="message user"><label>User</label><p>{esc(turn["user"] or "(no user message)")}</p></div>
                 <div class="message assistant"><label>Assistant</label><p>{esc(assistant)}</p></div>
+                {tool_markup}
+                {step_markup}
                 <div class="turn-metrics">{turn_token_cards(turn["tokens"], chosen["id"], provider, index, selected_turn, selected_metric, show_empty)}</div>
                 <a class="show-raw clickable" href="{raw_url}">Show Raw</a></article>'''
     detail = ""
@@ -792,7 +815,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             </div><div class="detail-actions"><a class="detail-refresh clickable" href="{refresh_conversation_url}">Refresh conversation</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
             <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
             <button type="submit">Delete conversation</button></form></div></div>
-            <div class="source-location"><span>Information Source:</span> {esc(chosen.get("source") or "unknown")}</div>
+            <div class="source-location"><span>Information Source:</span> {esc(chosen.get("source") or "unknown")}{f'<br><span>Provider note:</span> {esc(chosen["_db_issue"])}' if chosen.get("_db_issue") else ""}</div>
             <h2>Session token totals</h2><div class="metrics">{token_cards(chosen["tokens"])}</div>
             <h2>Turns <span class="muted">{len(chosen["turns"])}{esc(turn_note)}</span></h2>
             <div class="content-layout"><div class="turns">{turns or '<div class="empty">No turn events found.</div>'}</div>
@@ -960,6 +983,8 @@ PAGE = PAGE.replace("</style></head>", r'''<style>
 PAGE = PAGE.replace('<div class="count">Sessions</div>__SESSION_ROWS__', '<div class="sessions-area"><div class="sessions-heading"><div class="count">Sessions</div><div class="sessions-heading-actions">__EMPTY_TOGGLE__<a class="refresh-sessions" href="__REFRESH_URL__" title="Refresh sessions" aria-label="Refresh sessions">↻</a></div></div>__SESSION_ROWS__</div>')
 
 PAGE = PAGE.replace('</head>', '<style>.turn header{display:flex;align-items:center;justify-content:space-between;gap:12px}.turn-kind{color:#9ed1ff;background:#1b4268;border:1px solid #326b9e;border-radius:999px;padding:3px 9px;font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;white-space:nowrap}.show-raw{display:block;margin:10px 16px 14px;padding:7px 12px;border:1px solid #315479;border-radius:6px;background:#142a43;color:#9ed1ff;text-align:center;text-decoration:none;font-size:11px}.show-raw:hover{background:#1b4268;color:#fff}.content-layout{align-items:stretch}.explorer{height:calc(100vh - 84px);max-height:calc(100vh - 84px);position:sticky;top:42px;overflow:hidden;display:flex;flex-direction:column}.explorer-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex:none;overflow:hidden;background:transparent;padding:10px 12px;border-bottom:1px solid #223753;z-index:1}.explorer-header h2{margin:0}.explorer-body{display:flex;flex:1;min-height:0;flex-direction:column;overflow-y:auto;overflow-x:hidden;padding-top:12px;scrollbar-width:thin;scrollbar-color:#416b98 #0c1627}.explorer-body>p{flex:none}.explorer-body>pre{flex:none;max-height:none;overflow:visible}.explorer details{display:block;flex:none}.explorer details pre{max-height:none;overflow:visible}@media(max-width:700px){.explorer{height:auto;max-height:none;position:static;overflow:visible}.explorer-header{position:static;border-bottom:0}.explorer-body{display:block;overflow:visible}.explorer-body>pre{max-height:60vh;overflow:auto}.explorer details{display:block}.explorer details pre{max-height:60vh;overflow:auto}}</style></head>')
+
+PAGE = PAGE.replace('</head>', '<style>.turn-steps{margin:12px 16px 4px;padding:10px 12px;border:1px solid #263e5d;border-radius:8px;background:#101f34}.steps-label{margin-bottom:7px;color:#89a6c7;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase}.turn-step{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid #203653}.turn-step>span{color:#c8dbf2;font-size:11px;white-space:nowrap}.step-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;flex:1}.step-metrics .metric{padding:5px 6px}.step-metrics .metric span{font-size:8px}.step-metrics .metric strong{font-size:11px}.step-count{margin-left:auto;color:#9ed1ff;background:#1b4268;border:1px solid #326b9e;border-radius:999px;padding:3px 9px;font-size:10px;font-weight:700;white-space:nowrap}@media(max-width:700px){.turn-step{display:block}.step-metrics{margin-top:6px}.turn-step .step-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head>')
 
 PAGE = PAGE.replace('</body></html>', r'''<script>
 (function(){

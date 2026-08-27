@@ -38,6 +38,8 @@ def _read_session_state(folder: Path) -> dict:
     session["project"] = viewer.project_from_records(records)
     turns: dict[str, dict] = {}
     links: dict[str, str] = {}
+    interaction_links: dict[str, str] = {}
+    pending_users: dict[str, tuple[str, str]] = {}
     output_total = 0
 
     for event in records:
@@ -45,20 +47,34 @@ def _read_session_state(folder: Path) -> dict:
         if not isinstance(data, dict):
             continue
         event_type = event.get("type", "")
-        turn_id = str(data.get("turnId", ""))
-        interaction = str(data.get("interactionId") or links.get(turn_id, ""))
-        if not interaction and event_type in {"assistant.turn_start", "user.message", "assistant.message"}:
-            interaction = turn_id or f"turn-{len(turns) + 1}"
+        turn_id = str(data.get("turnId", "")).strip()
+        interaction_id = str(data.get("interactionId") or "").strip()
+        if event_type == "assistant.turn_start":
+            interaction = turn_id or interaction_id or f"turn-{len(turns) + 1}"
+            links[turn_id] = interaction
+            if interaction_id:
+                interaction_links.setdefault(interaction_id, interaction)
+        elif turn_id and turn_id in links:
+            interaction = links[turn_id]
+        elif event_type == "user.message":
+            interaction = interaction_links.get(interaction_id, "")
+            if not interaction:
+                pending_users[interaction_id] = (str(data.get("content", "")), json.dumps(event, indent=2, ensure_ascii=False))
+                continue
+        else:
+            interaction = interaction_links.get(interaction_id, "")
         if interaction:
             turn = turns.setdefault(interaction, viewer.new_turn(interaction))
             turn["raw"].append(json.dumps(event, indent=2, ensure_ascii=False))
         if event_type == "session.start":
             session["model"] = data.get("selectedModel")
         elif event_type == "assistant.turn_start":
-            links[turn_id] = interaction or turn_id
-            turns.setdefault(links[turn_id], viewer.new_turn(links[turn_id]))
+            if interaction_id in pending_users:
+                content, raw = pending_users.pop(interaction_id)
+                turn["user"] = content
+                turn["raw"].insert(0, raw)
         elif event_type == "user.message":
-            turns.setdefault(interaction, viewer.new_turn(interaction))["user"] = str(data.get("content", ""))
+            turn["user"] = str(data.get("content", ""))
         elif event_type == "assistant.message":
             turn = turns.setdefault(interaction, viewer.new_turn(interaction))
             if data.get("content"):
@@ -67,6 +83,23 @@ def _read_session_state(folder: Path) -> dict:
             value = viewer.number(data.get("outputTokens"))
             if value is not None:
                 output_total += value
+        elif event_type == "tool.execution_start":
+            turn.setdefault("tools", []).append({
+                "id": data.get("toolCallId"),
+                "name": data.get("toolName") or "unknown",
+                "arguments": data.get("arguments"),
+                "status": "started",
+            })
+        elif event_type == "tool.execution_complete":
+            tool_id = data.get("toolCallId")
+            tools = turn.setdefault("tools", [])
+            tool = next((item for item in tools if item.get("id") == tool_id), None)
+            if tool is None:
+                tool = {"id": tool_id, "name": data.get("toolName") or "unknown"}
+                tools.append(tool)
+            tool["status"] = "completed" if data.get("success", True) else "failed"
+            if data.get("result"):
+                tool["result"] = data["result"]
         elif event_type == "session.shutdown":
             metrics = data.get("modelMetrics") or {}
             if isinstance(metrics, dict):
@@ -216,14 +249,24 @@ def _read_db(session_id: str, db_path: Path) -> dict:
         by_turn.setdefault(index or 0, []).append(dict(zip(viewer.TOKEN_KEYS, values)))
     for index, user, assistant in turns:
         steps = by_turn.get(index) or [{key: 0 for key in viewer.TOKEN_KEYS}]
+        # Several assistant_usage_events rows can belong to one logical turn.
+        # Keep one UI turn card and retain the individual usage rows as steps
+        # inside it instead of presenting every row as a separate conversation.
+        turn = viewer.new_turn(str(index))
+        turn["user"] = user or ""
+        turn["assistant"] = [assistant] if assistant else []
+        turn["turn_index"], turn["step_count"] = index, len(steps)
+        turn["steps"] = []
         for step, tokens in enumerate(steps, 1):
-            turn = viewer.new_turn(f"{index}.{step}" if len(steps) > 1 else str(index))
-            turn["user"] = user or "" if step == 1 else ""
-            turn["assistant"] = [assistant] if assistant and step == 1 else []
-            turn["tokens"].update({key: value if isinstance(value, int) else 0 for key, value in tokens.items()})
-            turn["turn_index"], turn["step"], turn["step_count"] = index, step if len(steps) > 1 else None, len(steps)
-            turn["raw"].append(json.dumps({"user": user, "assistant": assistant, "step": step}, ensure_ascii=False))
-            session["turns"].append(turn)
+            normalized_tokens = {
+                key: value if isinstance(value, int) else 0
+                for key, value in tokens.items()
+            }
+            turn["steps"].append({"index": step, "tokens": normalized_tokens})
+            for key, value in normalized_tokens.items():
+                turn["tokens"][key] = (turn["tokens"][key] or 0) + value
+            turn["raw"].append(json.dumps({"user": user, "assistant": assistant, "step": step, "tokens": normalized_tokens}, ensure_ascii=False))
+        session["turns"].append(turn)
     # Usage can be persisted even when the database has no corresponding row
     # in `turns` (for example, a session whose transcript is in session-state).
     # Keep those records as synthetic turns so they can supplement the content
@@ -232,12 +275,19 @@ def _read_db(session_id: str, db_path: Path) -> dict:
     for index, steps in by_turn.items():
         if index in known_indices:
             continue
+        turn = viewer.new_turn(str(index))
+        turn["turn_index"], turn["step_count"] = index, len(steps)
+        turn["steps"] = []
         for step, tokens in enumerate(steps, 1):
-            turn = viewer.new_turn(f"{index}.{step}" if len(steps) > 1 else str(index))
-            turn["turn_index"], turn["step"], turn["step_count"] = index, step if len(steps) > 1 else None, len(steps)
-            turn["tokens"].update({key: value if isinstance(value, int) else 0 for key, value in tokens.items()})
-            turn["raw"].append(json.dumps({"source": "assistant_usage_events", "turn_index": index, "step": step, "tokens": tokens}, ensure_ascii=False))
-            session["turns"].append(turn)
+            normalized_tokens = {
+                key: value if isinstance(value, int) else 0
+                for key, value in tokens.items()
+            }
+            turn["steps"].append({"index": step, "tokens": normalized_tokens})
+            for key, value in normalized_tokens.items():
+                turn["tokens"][key] = (turn["tokens"][key] or 0) + value
+            turn["raw"].append(json.dumps({"source": "assistant_usage_events", "turn_index": index, "step": step, "tokens": normalized_tokens}, ensure_ascii=False))
+        session["turns"].append(turn)
     for key in viewer.TOKEN_KEYS:
         values = [turn["tokens"][key] for turn in session["turns"]]
         session["tokens"][key] = sum(values) if any(values) else None
@@ -366,6 +416,34 @@ def details(summary: dict) -> dict:
         result["model"] = result.get("model") if result.get("model") not in {None, "", "model unavailable"} else supplement.get("model")
         result["project"] = result.get("project") or supplement.get("project")
         result["updated"] = max(result.get("updated", 0), supplement.get("updated", 0))
+        if database_usage:
+            # The database currently records both API calls under turn_index 0,
+            # while events.jsonl records the actual turn IDs as 0 and 1. Use
+            # the event stream's turn boundaries and assign database usage by
+            # ordinal position instead of displaying the duplicate DB index.
+            database_steps = [
+                step
+                for database_turn in supplement.get("turns", [])
+                for step in (database_turn.get("steps") or [])
+                if isinstance(step, dict)
+            ]
+            if len(database_steps) == len(result["turns"]):
+                issue = (
+                    "Copilot session-store.db uses duplicate turn_index 0 for "
+                    f"{len(database_steps)} usage records; turn boundaries were "
+                    "taken from events.jsonl."
+                )
+                result["_db_issue"] = issue
+                viewer.LOGGER.warning("%s Session %s", issue, result["id"])
+                for index, step in enumerate(database_steps):
+                    turn = result["turns"][index]
+                    turn["tokens"] = dict(step.get("tokens") or viewer.blank_tokens())
+                    if str(turn.get("id", "")).isdigit():
+                        turn["turn_index"] = int(turn["id"])
+                for key in viewer.TOKEN_KEYS:
+                    if supplement.get("tokens", {}).get(key) is not None:
+                        result["tokens"][key] = supplement["tokens"][key]
+                continue
         by_id = {str(turn.get("id")): turn for turn in result["turns"]}
         for index, other in enumerate(supplement.get("turns", [])):
             turn = by_id.get(str(other.get("id")))
@@ -387,6 +465,8 @@ def details(summary: dict) -> dict:
             for key in ("turn_index", "step", "step_count"):
                 if other.get(key) is not None:
                     turn[key] = other[key]
+            if database_usage and isinstance(other.get("steps"), list):
+                turn["steps"] = other["steps"]
             for key in viewer.TOKEN_KEYS:
                 if database_usage and other.get("tokens", {}).get(key) is not None:
                     turn["tokens"][key] = other["tokens"][key]

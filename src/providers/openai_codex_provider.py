@@ -86,30 +86,40 @@ def details(summary: dict) -> dict:
             continue
         payload_type = payload.get("type")
         call_id = str(payload.get("call_id") or payload.get("callId") or "")
+        role = payload.get("role") or message.get("role") or item.get("role")
         if payload_type == "function_call":
             current = f"{call_id or turn_id or len(turns)}:tool:{len(turns)}"
             tool_turns[call_id] = current
         elif payload_type == "function_call_output" and call_id in tool_turns:
             current = tool_turns[call_id]
         else:
-            current = str(turn_id or current or record.get("timestamp") or len(turns))
+            # Session metadata, world state, and other header records do not
+            # represent a conversation turn. Do not create an empty turn for
+            # them before the first user/assistant event establishes current.
+            if not turn_id and not current and role not in {"user", "assistant", "model"}:
+                continue
+            current = str(turn_id or current or len(turns))
         turn = turns.setdefault(current, viewer.new_turn(current))
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
         if payload_type in {"function_call", "function_call_output"}:
             turn["kind"] = "tool"
             if payload_type == "function_call":
                 arguments = payload.get("arguments", payload.get("input", {}))
-                turn["assistant"].append(
-                    f"Tool: {payload.get('name', 'unknown')}\nInput: "
-                    f"{arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)}"
-                )
+                turn.setdefault("tools", []).append({
+                    "id": call_id,
+                    "name": payload.get("name", "unknown"),
+                    "arguments": arguments,
+                    "status": "started",
+                })
             else:
                 output = payload.get("output", payload.get("result", ""))
-                if isinstance(output, (dict, list)):
-                    output = json.dumps(output, ensure_ascii=False)
-                if output:
-                    turn["assistant"].append(f"Tool output:\n{output}")
-        role = payload.get("role") or message.get("role") or item.get("role")
+                tools = turn.setdefault("tools", [])
+                tool = next((entry for entry in tools if entry.get("id") == call_id), None)
+                if tool is None:
+                    tool = {"id": call_id, "name": "unknown"}
+                    tools.append(tool)
+                tool["status"] = "completed"
+                tool["result"] = output
         content = payload.get("content") or message.get("content") or item.get("content") or payload.get("text") or item.get("text")
         if isinstance(content, list):
             content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)

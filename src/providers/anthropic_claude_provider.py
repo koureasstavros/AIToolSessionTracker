@@ -144,22 +144,34 @@ def details(summary: dict) -> dict:
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
         content = "\n".join(
             (
-                f"Tool: {part.get('name', 'unknown')}\nInput: "
-                f"{json.dumps(part.get('input', {}), ensure_ascii=False)}"
-                if isinstance(part, dict) and part.get("type") == "tool_use"
-                else str(part.get("content", ""))
-                if isinstance(part, dict) and part.get("type") == "tool_result"
-                else str(part.get("text", ""))
+                str(part.get("text", ""))
                 if isinstance(part, dict)
                 else str(part)
             )
             for part in content_parts
-            if not isinstance(part, dict) or part.get("type") != "tool_result" or is_tool_result
+            if not (isinstance(part, dict) and part.get("type") in {"tool_use", "tool_result"})
         )
         if is_tool_use:
             turn["kind"] = "tool"
+            for part in content_parts:
+                if isinstance(part, dict) and part.get("type") == "tool_use":
+                    turn.setdefault("tools", []).append({
+                        "id": part.get("id"),
+                        "name": part.get("name", "unknown"),
+                        "arguments": part.get("input", {}),
+                        "status": "started",
+                    })
         if is_tool_result:
             turn["kind"] = "tool"
+            for part in content_parts:
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    tools = turn.setdefault("tools", [])
+                    tool = next((entry for entry in tools if entry.get("id") == part.get("tool_use_id")), None)
+                    if tool is None:
+                        tool = {"id": part.get("tool_use_id"), "name": "unknown"}
+                        tools.append(tool)
+                    tool["status"] = "completed"
+                    tool["result"] = part.get("content", "")
         if content and role == "user":
             turn["user"] = str(content)
         elif content and role in {"assistant", "model"}:
