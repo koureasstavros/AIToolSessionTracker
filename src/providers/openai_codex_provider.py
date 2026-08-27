@@ -72,6 +72,7 @@ def details(summary: dict) -> dict:
     result["project"] = viewer.project_from_records(records)
     turns: dict[str, dict] = {}
     tool_turns: dict[str, str] = {}
+    usage_turn_id = "__codex_usage_summary__"
     current = ""
     for record in records:
         payload = record.get("payload", record)
@@ -79,7 +80,11 @@ def details(summary: dict) -> dict:
             continue
         item = payload.get("item") if isinstance(payload.get("item"), dict) else {}
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
-        turn_id = payload.get("turn_id") or payload.get("turnId") or item.get("turn_id") or record.get("promptId")
+        metadata = payload.get("internal_chat_message_metadata_passthrough")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        turn_id = (payload.get("turn_id") or payload.get("turnId") or item.get("turn_id")
+                   or metadata.get("turn_id") or record.get("promptId"))
         if not turn_id and record.get("type") == "user":
             turn_id = record.get("uuid")
         if not turn_id and not current and record.get("type") in {"queue-operation", "attachment"}:
@@ -87,7 +92,11 @@ def details(summary: dict) -> dict:
         payload_type = payload.get("type")
         call_id = str(payload.get("call_id") or payload.get("callId") or "")
         role = payload.get("role") or message.get("role") or item.get("role")
-        if payload_type == "function_call":
+        if payload_type == "token_count":
+            # Codex reports usage in a separate event after a model response.
+            # It is not attributable to the last function call in a batch.
+            current = usage_turn_id
+        elif payload_type == "function_call":
             current = f"{call_id or turn_id or len(turns)}:tool:{len(turns)}"
             tool_turns[call_id] = current
         elif payload_type == "function_call_output" and call_id in tool_turns:
@@ -101,6 +110,10 @@ def details(summary: dict) -> dict:
             current = str(turn_id or current or len(turns))
         turn = turns.setdefault(current, viewer.new_turn(current))
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
+        if payload_type == "token_count":
+            turn["kind"] = "usage_summary"
+            if not turn["assistant"]:
+                turn["assistant"].append("Codex usage reported for the preceding model response; it is not attributable to an individual tool call.")
         if payload_type in {"function_call", "function_call_output"}:
             turn["kind"] = "tool"
             if payload_type == "function_call":

@@ -94,6 +94,9 @@ def details(summary: dict) -> dict:
     if result["project"] and "local-agent-mode-sessions" in result["project"].replace("/", "\\").lower():
         result["project"] = None
     turns: dict[str, dict] = {}
+    tool_turns: dict[str, str] = {}
+    message_turns: dict[str, str] = {}
+    seen_usage_records: set[str] = set()
     current = ""
     for record in records:
         payload = record.get("payload", record)
@@ -128,17 +131,24 @@ def details(summary: dict) -> dict:
             turn_id = record.get("uuid")
         if not turn_id and not current and (payload.get("type") or record.get("type")) in {"session_meta", "world_state", "turn_context", "queue-operation", "attachment"}:
             continue
-        next_turn = str(turn_id or current or record.get("timestamp") or len(turns))
-        if (role == "user" or is_tool_use) and current in turns:
+        tool_id = next(
+            (part.get("tool_use_id") for part in content_parts
+             if isinstance(part, dict) and part.get("type") == "tool_result" and part.get("tool_use_id")),
+            None,
+        )
+        mapped_tool_turn = tool_turns.get(str(tool_id)) if tool_id else None
+        message_id = message.get("id") if isinstance(message, dict) else None
+        mapped_message_turn = message_turns.get(str(message_id)) if message_id else None
+        next_turn = str(mapped_tool_turn or mapped_message_turn or turn_id or current or record.get("timestamp") or len(turns))
+        if not mapped_tool_turn and not mapped_message_turn and role in {"assistant", "model"} and current in turns:
             previous = turns[current]
-            has_previous_data = bool(
-                previous["user"]
-                or previous["assistant"]
-                or any(value is not None for value in previous["tokens"].values())
-            )
-            if has_previous_data:
-                suffix = "tool" if is_tool_use else "user"
-                next_turn = f"{next_turn}:{suffix}:{len(turns)}"
+            # Text and tool_use records with the same message ID are one API
+            # response. A new assistant message starts the next turn so its
+            # usage stays with the content represented by that usage.
+            if previous["assistant"] or previous.get("tools"):
+                next_turn = f"{next_turn}:assistant:{len(turns)}"
+        if message_id and not mapped_tool_turn:
+            message_turns[str(message_id)] = next_turn
         current = next_turn
         turn = turns.setdefault(current, viewer.new_turn(current))
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
@@ -161,6 +171,8 @@ def details(summary: dict) -> dict:
                         "arguments": part.get("input", {}),
                         "status": "started",
                     })
+                    if part.get("id"):
+                        tool_turns[str(part["id"])] = next_turn
         if is_tool_result:
             turn["kind"] = "tool"
             for part in content_parts:
@@ -181,9 +193,19 @@ def details(summary: dict) -> dict:
         info = payload.get("info") or {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or (info.get("last_token_usage") if isinstance(info, dict) else {})
         if isinstance(usage, dict):
-            for key, value in viewer.usage_from(usage).items():
-                if value is not None:
-                    turn["tokens"][key] = (turn["tokens"][key] or 0) + value
+            # Claude Code can persist one assistant API response as multiple
+            # records: for example, a text record followed by a tool_use
+            # record. Both records carry the same message ID and usage. Count
+            # that usage once, otherwise tool calls inflate the totals.
+            usage_id = message_id or record.get("requestId")
+            if usage_id is None:
+                usage_id = record.get("uuid")
+            if usage_id is None or str(usage_id) not in seen_usage_records:
+                if usage_id is not None:
+                    seen_usage_records.add(str(usage_id))
+                for key, value in viewer.usage_from(usage).items():
+                    if value is not None:
+                        turn["tokens"][key] = (turn["tokens"][key] or 0) + value
         if not result["model"] and payload.get("model"):
             result["model"] = payload["model"]
     if records and isinstance(records[0], dict):

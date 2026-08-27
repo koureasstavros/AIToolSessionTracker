@@ -549,6 +549,7 @@ def parse_export_session(path: Path, provider: str) -> dict:
 
     current_turn = ""
     parse_records: list[dict] = []
+    seen_usage_records: set[str] = set()
     for record in records:
         messages = record.get("messages")
         if isinstance(messages, list):
@@ -604,9 +605,19 @@ def parse_export_session(path: Path, provider: str) -> dict:
             info = {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or info.get("last_token_usage") or {}
         if isinstance(usage, dict):
-            for key, value in usage_from(usage).items():
-                if value is not None:
-                    turn["tokens"][key] = (turn["tokens"][key] or 0) + value
+            # Claude Code may persist one assistant API response as separate
+            # text and tool_use records. They share a message ID and usage,
+            # so count the usage only once.
+            message_id = message.get("id") if isinstance(message, dict) else None
+            usage_id = message_id or record.get("requestId")
+            if usage_id is None:
+                usage_id = record.get("uuid")
+            if usage_id is None or str(usage_id) not in seen_usage_records:
+                if usage_id is not None:
+                    seen_usage_records.add(str(usage_id))
+                for key, value in usage_from(usage).items():
+                    if value is not None:
+                        turn["tokens"][key] = (turn["tokens"][key] or 0) + value
     session["turns"] = list(turns.values())
     model = next(
         (
@@ -720,10 +731,24 @@ def turn_token_cards(tokens: dict[str, int | None], session_id: str, provider: s
 
 def explorer_content(turn: dict, metric: str | None) -> tuple[str, str, str]:
     raw = "\n\n".join(turn.get("raw", []))
+    tools = turn.get("tools") if isinstance(turn.get("tools"), list) else []
+
+    def tool_content(field: str) -> str:
+        parts = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            value = tool.get(field)
+            if value is None:
+                continue
+            rendered = value if isinstance(value, str) else json.dumps(value, indent=2, ensure_ascii=False)
+            parts.append(f'{tool.get("name") or "unknown"}:\n{rendered}')
+        return "\n\n".join(parts)
+
     if metric == "inputTokens":
-        return "Input", turn["user"] or "(no user input)", raw
+        return "Input", turn["user"] or tool_content("arguments") or "(no user input)", raw
     if metric == "outputTokens":
-        return "Output", "\n\n".join(turn["assistant"]) or "(no assistant output)", raw
+        return "Output", "\n\n".join(turn["assistant"]) or tool_content("result") or "(no assistant output)", raw
     if metric in {"cacheReadTokens", "cacheWriteTokens", "reasoningTokens"}:
         return TOKEN_LABELS[metric], "Readable content is not stored for this token category in events.jsonl. Only the token count is available (the per-turn value is estimated when necessary).", raw
     return "Token content", "Click a token card in a turn to inspect its associated content.", ""
@@ -783,7 +808,11 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                     f'{esc(tool.get("status") or "unknown")}{details}</p></div>'
                 )
             tool_markup = "".join(tool_markup_parts)
-            kind_label = '<span class="turn-kind">Tool turn</span>' if turn.get("kind") == "tool" else ""
+            kind_label = (
+                '<span class="turn-kind">Tool turn</span>' if turn.get("kind") == "tool" else
+                '<span class="turn-kind">Usage summary</span>' if turn.get("kind") == "usage_summary" else
+                ""
+            )
             turn_label = turn.get("turn_index", index)
             raw_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"], "turn": index, "raw": 1}), quote=True)
             step_markup = ""
