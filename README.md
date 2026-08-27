@@ -112,6 +112,84 @@ Claude Code Desktop local-agent transcripts:
 
 Metadata-only session files are ignored. Desktop transcripts are identified by their `session_id` values.
 
+### Microsoft 365 Copilot
+
+Microsoft 365 Copilot conversation history is normally cloud-backed; its
+Office/WebView local cache is not a stable, supported transcript interface.
+The viewer therefore supports local JSON/JSONL transcript exports using the
+same turn, token, raw-event, and delete behavior as the other file-backed
+providers.
+
+Set the export directory before starting the viewer:
+
+```text
+set M365_COPILOT_ROOT=C:\path\to\m365-copilot\sessions
+python session_token_viewer.py
+```
+
+The default directory is `%USERPROFILE%\m365-copilot\sessions`. Files are
+identified from `sessionId`/`conversationId` and common `title` fields; message
+roles, nested content, and common usage fields are parsed when present.
+
+## Provider architecture
+
+The application separates the provider-neutral viewer from provider-specific
+storage and transcript formats.
+
+### Main application
+
+`session_token_viewer.py` owns the common application behavior:
+
+- The normalized conversation, turn, and token structure.
+- Provider registration and adapter dispatch.
+- HTML rendering and the Content Explorer.
+- HTTP request handling and command-line startup.
+- Shared token fields and display labels.
+
+Every provider returns conversations using the same normalized fields:
+
+- `id`, `name`, `updated`, and `model`
+- `project` and `source`
+- `provider`, source label, source kind, and provider storage metadata
+- `turns`, including user content, assistant content, and raw records
+- `tokens`, containing:
+	- `inputTokens`
+	- `cacheReadTokens`
+	- `cacheWriteTokens`
+	- `outputTokens`
+	- `reasoningTokens`
+
+The main application normalizes provider results before passing them to the
+interface. Rendering therefore does not need to understand each provider's
+native file or database format.
+
+### Provider adapters
+
+Provider-specific behavior is implemented in:
+
+- `github_copilot_provider.py`
+- `openai_codex_provider.py`
+- `anthropic_claude_provider.py`
+- `m365_copilot_provider.py`
+
+Each provider adapter exposes the same operations:
+
+- `index(root)` discovers conversations and returns inexpensive sidebar summaries.
+- `details(summary)` loads and parses one complete conversation.
+- `delete(summary)` removes the provider's local conversation data.
+- `display_root(root)` returns the source location displayed in the sidebar.
+- `identity(record, fallback)` resolves the provider's conversation ID and name.
+- `tool(summary)` identifies the originating surface, such as CLI, Extension, or Desktop.
+
+Adapters are registered in `PROVIDER_ADAPTERS`. The main application selects an
+adapter by provider ID and calls these common operations without implementing
+provider-specific parsing or deletion rules.
+
+Deletion remains abstract in the main application: it validates the selected
+conversation and delegates the actual operation to the owning adapter. For
+example, file-backed providers unlink transcript files, legacy Copilot removes
+the session directory, and Copilot CLI removes related database rows.
+
 ## What the app displays
 
 The left-hand provider menu selects the data source. The session list then shows sessions for that provider.
@@ -121,6 +199,7 @@ The left-hand provider menu selects the data source. The session list then shows
 - The left sidebar stays fixed while the main session details scroll independently.
 - The sidebar session list has its own styled vertical scrollbar and does not scroll horizontally.
 - Use the refresh button above the session list to rescan provider data.
+- Use **Show empty** or **Hide empty** beside refresh to control whether incomplete sessions without persisted response data appear. The preference is preserved while switching providers and inspecting token content.
 - The selected session header shows its GUID, associated project directory when available, model, and the exact transcript or database source path used to load it.
 - The main content area shows token totals, turn cards, and the **Content Explorer** side panel.
 - The layout adapts to smaller screens by returning to normal page scrolling.

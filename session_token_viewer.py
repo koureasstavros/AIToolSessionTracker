@@ -11,14 +11,19 @@ import json
 import logging
 import os
 import re
-import shutil
 import sqlite3
 import threading
 import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TypedDict
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
+
+import anthropic_claude_provider
+import github_copilot_provider
+import m365_copilot_provider
+import openai_codex_provider
 
 TOKEN_KEYS = (
     "inputTokens",
@@ -38,6 +43,13 @@ PROVIDERS = {
     "copilot": "GitHub Copilot",
     "codex": "OpenAI Codex",
     "claude": "Claude Code",
+    "m365_copilot": "Microsoft 365 Copilot",
+}
+PROVIDER_ADAPTERS = {
+    "copilot": github_copilot_provider,
+    "codex": openai_codex_provider,
+    "claude": anthropic_claude_provider,
+    "m365_copilot": m365_copilot_provider,
 }
 LOGGER = logging.getLogger(__name__)
 TOKEN_ALIASES = {
@@ -47,25 +59,61 @@ TOKEN_ALIASES = {
     "outputTokens": ("output_tokens", "completion_tokens", "outputTokens"),
     "reasoningTokens": ("reasoning_output_tokens", "reasoning_tokens", "reasoningTokens"),
 }
-UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+class SessionData(TypedDict, total=False):
+    """Provider-neutral conversation contract returned to the UI layer."""
+
+    id: str
+    name: str
+    updated: float
+    turns: list[dict]
+    tokens: dict[str, int | None]
+    model: str | None
+    project: str | None
+    source: str
+    _source: Path
+    _kind: str
+    _source_label: str
+    provider: str
+
+
+def normalize_session_data(value: dict) -> SessionData:
+    """Ensure every provider returns the same conversation shape."""
+    tokens = blank_tokens()
+    supplied_tokens = value.get("tokens")
+    if isinstance(supplied_tokens, dict):
+        for key in TOKEN_KEYS:
+            candidate = supplied_tokens.get(key)
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                tokens[key] = candidate
+    result: SessionData = {
+        "id": str(value.get("id", "")),
+        "name": str(value.get("name") or value.get("id", "")),
+        "updated": float(value.get("updated") or 0),
+        "turns": value.get("turns") if isinstance(value.get("turns"), list) else [],
+        "tokens": tokens,
+        "model": value.get("model") if isinstance(value.get("model"), str) else None,
+        "project": value.get("project") if isinstance(value.get("project"), str) else None,
+    }
+    for key in ("source", "_source", "_kind", "_source_label", "_session_id", "_db_metadata", "_has_data", "provider"):
+        if key in value:
+            result[key] = value[key]
+    return result
+
+
+def session_has_content(session: dict) -> bool:
+    """Return whether a parsed conversation contains usable interaction data."""
+    for turn in session.get("turns", []):
+        if turn.get("user") or turn.get("assistant"):
+            return True
+        tokens = turn.get("tokens", {})
+        if any(value is not None and value > 0 for value in tokens.values() if isinstance(value, int)):
+            return True
+    tokens = session.get("tokens", {})
+    return any(value is not None and value > 0 for value in tokens.values() if isinstance(value, int))
 
 
 def number(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def normalize_codex_id(value: object) -> str:
-    text = str(value)
-    match = UUID_PATTERN.search(text)
-    return match.group(0) if match else text
-
-
-def codex_name(record: dict, session_id: str) -> str:
-    for key in ("title", "name", "summary", "session_name"):
-        value = record.get(key)
-        if value and not str(value).startswith("rollout-"):
-            return str(value)
-    return session_id
 
 
 def conversation_name(name: object, session_id: str) -> str:
@@ -129,25 +177,33 @@ def usage_from(source: object) -> dict[str, int | None]:
 def safe_json_lines(path: Path) -> list[dict]:
     records: list[dict] = []
     try:
-        with path.open(encoding="utf-8", errors="replace") as file:
-            for line_number, line in enumerate(file, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    LOGGER.warning("Skipping malformed JSON in %s at line %d", path, line_number)
-                    continue
-                if isinstance(record, dict):
-                    records.append(record)
-                else:
-                    LOGGER.warning("Skipping non-object JSON in %s at line %d", path, line_number)
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                LOGGER.warning("Skipping malformed JSON in %s at line %d", path, line_number)
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+            else:
+                LOGGER.warning("Skipping non-object JSON in %s at line %d", path, line_number)
+        # Some exports contain one JSON array rather than newline-delimited
+        # records. Only try this fallback when JSONL parsing produced nothing.
+        if not records and text.strip():
+            document = json.loads(text)
+            if isinstance(document, list):
+                records = [record for record in document if isinstance(record, dict)]
     except FileNotFoundError:
         # Session files can be removed by VS Code while the directory is
         # being scanned (for example when a chat session is closed). Treat a
         # disappeared file as an empty session instead of printing a noisy
         # traceback for an expected filesystem race.
         LOGGER.debug("Session file disappeared before it could be read: %s", path)
+    except json.JSONDecodeError:
+        LOGGER.warning("Unable to parse JSON export %s", path)
     except OSError as error:
         LOGGER.warning("Unable to read %s: %s", path, error)
     return records
@@ -209,7 +265,7 @@ def workspace_project_path(folder: Path) -> str | None:
     return None
 
 
-def read_session(folder: Path) -> dict:
+def parse_session(folder: Path) -> dict:
     try:
         updated = folder.stat().st_mtime
     except OSError:
@@ -329,213 +385,6 @@ def read_session(folder: Path) -> dict:
     return session
 
 
-def reconstruct_copilot_requests(records: list[dict], initial: object) -> list[dict]:
-    requests = [dict(item) for item in initial if isinstance(item, dict)] if isinstance(initial, list) else []
-    positions = {request.get("requestId"): index for index, request in enumerate(requests) if request.get("requestId")}
-    for record in records:
-        key = record.get("k")
-        value = record.get("v")
-        if key == ["requests"] and isinstance(value, list):
-            for item in value:
-                if not isinstance(item, dict):
-                    continue
-                request_id = item.get("requestId")
-                if request_id in positions:
-                    requests[positions[request_id]].update(item)
-                else:
-                    positions[request_id] = len(requests)
-                    requests.append(dict(item))
-        elif isinstance(key, list) and len(key) == 3 and key[0] == "requests" and isinstance(key[1], int):
-            index = key[1]
-            while len(requests) <= index:
-                requests.append({})
-            requests[index][str(key[2])] = value
-    return requests
-
-
-def read_copilot_chat_session(path: Path) -> dict:
-    """Read the VS Code chatSessions JSONL format used by current Copilot builds."""
-    try:
-        updated = path.stat().st_mtime
-    except OSError:
-        updated = 0
-    session = new_session(path.stem, path.stem, updated)
-    records = safe_json_lines(path)
-    metadata = records[0].get("v", {}) if records else {}
-    if not isinstance(metadata, dict):
-        metadata = {}
-    session["id"] = str(metadata.get("sessionId") or session["id"])
-    session["name"] = str(metadata.get("customTitle") or session["id"])
-    session["project"] = project_path(metadata.get("folder") or metadata.get("workspaceFolder") or metadata.get("projectPath"))
-    if not session["project"]:
-        session["project"] = workspace_project_path(path.parent.parent)
-    requests = reconstruct_copilot_requests(records, metadata.get("requests", []))
-    for record in records:
-        if record.get("k") == ["customTitle"]:
-            session["name"] = str(record.get("v") or session["name"])
-    if not isinstance(requests, list):
-        return session
-
-    for index, request in enumerate(requests, start=1):
-        if not isinstance(request, dict):
-            continue
-        turn = new_turn(str(request.get("requestId") or index))
-        message = request.get("message") or {}
-        if isinstance(message, dict):
-            turn["user"] = str(message.get("text") or "")
-        response = request.get("response") or []
-        if isinstance(response, list):
-            turn["assistant"] = [
-                str(item["value"])
-                for item in response
-                if isinstance(item, dict) and item.get("value")
-            ]
-        turn["tokens"]["inputTokens"] = number(request.get("promptTokens"))
-        turn["tokens"]["outputTokens"] = number(request.get("completionTokens"))
-        for key, value in usage_from(request).items():
-            if value is not None:
-                turn["tokens"][key] = value
-        # VS Code persists cancelled or still-running requests as session
-        # records containing only the user message and metadata. They are not
-        # useful conversation entries until assistant content or output usage
-        # has been written.
-        if not turn["assistant"] and turn["tokens"]["outputTokens"] is None:
-            continue
-        turn["raw"].append(json.dumps(request, indent=2, ensure_ascii=False))
-        session["turns"].append(turn)
-        session["tokens"]["inputTokens"] = (session["tokens"]["inputTokens"] or 0) + (turn["tokens"]["inputTokens"] or 0)
-        session["tokens"]["outputTokens"] = (session["tokens"]["outputTokens"] or 0) + (turn["tokens"]["outputTokens"] or 0)
-
-    session["model"] = str(next((request.get("modelId") for request in requests if isinstance(request, dict) and request.get("modelId")), "model unavailable"))
-    return session
-
-
-def default_copilot_root() -> Path:
-    app_data = os.environ.get("APPDATA")
-    if app_data:
-        return Path(app_data) / "Code" / "User" / "workspaceStorage"
-    return Path.home() / ".config" / "Code" / "User" / "workspaceStorage"
-
-
-def default_copilot_global_root() -> Path:
-    app_data = os.environ.get("APPDATA")
-    if app_data:
-        return Path(app_data) / "Code" / "User" / "globalStorage" / "emptyWindowChatSessions"
-    return Path.home() / ".config" / "Code" / "User" / "globalStorage" / "emptyWindowChatSessions"
-
-
-def copilot_roots(root: Path) -> list[Path]:
-    """Return VS Code, empty-window, and Copilot CLI roots without duplicates."""
-    roots = [root, Path.home() / ".copilot" / "session-state"]
-    default_root = default_copilot_root()
-    if default_root not in roots:
-        roots.append(default_root)
-    global_root = default_copilot_global_root()
-    if global_root not in roots:
-        roots.append(global_root)
-    return list(dict.fromkeys(path for path in roots if path.is_dir()))
-
-
-def copilot_session_store() -> Path:
-    return Path.home() / ".copilot" / "session-store.db"
-
-
-def parse_storage_timestamp(value: str | None, fallback: float) -> float:
-    if value:
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            pass
-    return fallback
-
-
-def read_copilot_db_session(session_id: str, db_path: Path) -> dict:
-    session = new_session(session_id, session_id, db_path.stat().st_mtime, "GitHub Copilot")
-    try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
-            columns = {row[1] for row in db.execute('PRAGMA table_info("sessions")')}
-            project_column = next((column for column in ("cwd", "working_directory", "project_path") if column in columns), None)
-            session_row = db.execute(
-                f'SELECT summary, updated_at{", " + project_column if project_column else ""} FROM sessions WHERE id = ?',
-                (session_id,),
-            ).fetchone()
-            if session_row:
-                session["name"] = session_row[0] or session_id
-                if project_column:
-                    candidate = project_path(session_row[2])
-                    # Copilot CLI uses its own chat-storage directory as cwd
-                    # for sessions that were not opened in a project.
-                    internal_chat_root = (Path.home() / ".copilot" / "chats").resolve()
-                    if candidate:
-                        try:
-                            is_internal = Path(candidate).resolve().is_relative_to(internal_chat_root)
-                        except (OSError, ValueError):
-                            is_internal = False
-                        session["project"] = None if is_internal else candidate
-                turns = db.execute(
-                    "SELECT turn_index, user_message, assistant_response FROM turns WHERE session_id = ? ORDER BY turn_index",
-                    (session_id,),
-                ).fetchall()
-                usage = db.execute(
-                    "SELECT turn_index, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens "
-                    "FROM assistant_usage_events WHERE session_id = ? ORDER BY id",
-                    (session_id,),
-                ).fetchall()
-    except (OSError, sqlite3.Error):
-        return session
-
-    usage_by_turn: dict[int, list[dict[str, int]]] = {}
-    for turn_index, input_tokens, output_tokens, cache_read, cache_write, reasoning in usage:
-        values = {key: 0 for key in TOKEN_KEYS}
-        for key, value in {
-            "inputTokens": input_tokens,
-            "outputTokens": output_tokens,
-            "cacheReadTokens": cache_read,
-            "cacheWriteTokens": cache_write,
-            "reasoningTokens": reasoning,
-        }.items():
-            if isinstance(value, int):
-                values[key] = value
-        usage_by_turn.setdefault(turn_index or 0, []).append(values)
-    for turn_index, user, assistant in turns:
-        steps = usage_by_turn.get(turn_index) or [{key: 0 for key in TOKEN_KEYS}]
-        for step_index, step_tokens in enumerate(steps, start=1):
-            turn = new_turn(f"{turn_index}.{step_index}" if len(steps) > 1 else str(turn_index))
-            turn["user"] = user or "" if step_index == 1 else ""
-            turn["assistant"] = [assistant] if assistant and step_index == 1 else []
-            turn["tokens"].update(step_tokens)
-            turn["turn_index"] = turn_index
-            turn["step"] = step_index if len(steps) > 1 else None
-            turn["step_count"] = len(steps)
-            turn["raw"].append(json.dumps({"user": user, "assistant": assistant, "step": step_index}, ensure_ascii=False))
-            session["turns"].append(turn)
-    for key in TOKEN_KEYS:
-        values = [turn["tokens"][key] for turn in session["turns"]]
-        session["tokens"][key] = sum(values) if any(values) else None
-    return session
-
-
-def load_copilot_db_index() -> list[dict]:
-    path = copilot_session_store()
-    if not path.exists():
-        return []
-    try:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
-            rows = db.execute(
-                "SELECT id, COALESCE(summary, id), updated_at FROM sessions "
-                "WHERE id IN (SELECT DISTINCT session_id FROM turns) ORDER BY updated_at DESC"
-            ).fetchall()
-    except (OSError, sqlite3.Error):
-        return []
-    fallback = path.stat().st_mtime
-    return [
-        {"id": session_id, "name": name, "updated": parse_storage_timestamp(updated_at, fallback), "turns": [],
-         "tokens": blank_tokens(), "model": "GitHub Copilot", "_source": path,
-         "_session_id": session_id, "_source_label": "Copilot CLI", "_kind": "copilot-db"}
-        for session_id, name, updated_at in rows
-    ]
-
-
 def first_json_record(path: Path) -> dict:
     try:
         with path.open(encoding="utf-8", errors="replace") as file:
@@ -589,11 +438,13 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
                 summary["name"] = str(updated_title)
             requests = metadata.get("requests", [])
             if not requests:
-                summary["_has_data"] = True
+                summary["_has_data"] = False
             elif isinstance(requests, list):
                 summary["_has_data"] = any(
                     isinstance(request, dict)
-                    and (request.get("completionTokens") is not None
+                    and (isinstance(request.get("message"), dict) and request["message"].get("text")
+                        or request.get("promptTokens") is not None
+                        or request.get("completionTokens") is not None
                          or any(isinstance(item, dict) and item.get("value") for item in (request.get("response") or [])))
                     for request in requests
                 )
@@ -604,10 +455,16 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
                 if not summary["_has_data"]:
                     for record in safe_json_lines(path):
                         key = record.get("k")
+                        value = record.get("v")
+                        has_completion = key[2] == "completionTokens" and number(value) is not None if isinstance(key, list) and len(key) >= 3 else False
+                        has_message = (key[2] == "message" and isinstance(value, dict) and value.get("text")
+                                       if isinstance(key, list) and len(key) >= 3 else False)
+                        has_response = (key[2] == "response" and isinstance(value, list)
+                                        and any(isinstance(item, dict) and item.get("value") for item in value)
+                                        if isinstance(key, list) and len(key) >= 3 else False)
                         if (isinstance(key, list) and len(key) >= 3
                                 and key[0] == "requests"
-                                and key[2] in {"completionTokens", "response"}
-                                and record.get("v")):
+                                and (has_completion or has_message or has_response)):
                             summary["_has_data"] = True
                             break
     elif kind == "copilot-legacy":
@@ -622,133 +479,15 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
             pass
     elif kind == "external":
         first = first_json_record(path)
-        raw_id = first.get("sessionId") or first.get("session_id") or path.stem
-        session_id = normalize_codex_id(raw_id) if provider == "codex" else str(raw_id)
+        session_id, display_name = PROVIDER_ADAPTERS[provider].identity(first, path.stem)
         if session_id:
             summary["id"] = str(session_id)
-            summary["name"] = codex_name(first, summary["id"]) if provider == "codex" else str(
-                first.get("title") or first.get("name") or first.get("summary") or summary["id"]
-            )
+            summary["name"] = display_name
         summary["project"] = project_from_records([first])
     return summary
 
 
-def load_session_index(root: Path, provider: str) -> list[dict]:
-    """Return cheap sidebar entries; transcript parsing happens on selection."""
-    entries: list[dict] = []
-    if provider == "copilot":
-        for scan_root in copilot_roots(root):
-            try:
-                if scan_root.name == "emptyWindowChatSessions":
-                    chat_files = scan_root.glob("*.jsonl")
-                else:
-                    chat_files = scan_root.rglob("chatSessions/*.jsonl")
-                entries.extend(session_summary(path, provider, "copilot-chat") for path in chat_files)
-                candidate_paths = [scan_root] if (scan_root / "events.jsonl").is_file() else list(scan_root.iterdir())
-                for path in candidate_paths:
-                    if path.is_dir() and path.name != "__pycache__":
-                        try:
-                            if (path / "events.jsonl").exists():
-                                entries.append(session_summary(path, provider, "copilot-legacy"))
-                        except OSError:
-                            continue
-            except OSError:
-                continue
-        entries.extend(load_copilot_db_index())
-        # Copilot CLI can persist the same session both as events.jsonl and
-        # in session-store.db. Prefer the file-backed transcript because it
-        # contains the full event stream and raw content explorer data.
-        unique: dict[str, dict] = {}
-        for entry in entries:
-            if not entry.get("_has_data", True):
-                continue
-            existing = unique.get(entry["id"])
-            if existing is None or existing.get("_kind") == "copilot-db":
-                unique[entry["id"]] = entry
-            elif entry.get("_kind") == "copilot-db":
-                # Keep the events.jsonl entry as the primary source, but
-                # retain useful database metadata for the detail view.
-                existing["_db_metadata"] = {
-                    "name": entry.get("name"),
-                    "updated": entry.get("updated"),
-                    "model": entry.get("model"),
-                }
-                if existing.get("name") in {None, "", existing["id"]} and entry.get("name"):
-                    existing["name"] = entry["name"]
-                existing["updated"] = max(existing["updated"], entry["updated"])
-        return sorted(unique.values(), key=lambda entry: entry["updated"], reverse=True)
-    if provider == "codex":
-        location = Path.home() / ".codex" / "sessions"
-        try:
-            files = list(location.rglob("*.jsonl")) if location.exists() else []
-        except OSError:
-            files = []
-    else:
-        locations = (
-            (Path.home() / ".claude" / "sessions", "*.json"),
-            (Path.home() / ".claude" / "projects", "*.jsonl"),
-            (Path.home() / "AppData" / "Local" / "Claude-3p" / "local-agent-mode-sessions", "audit.jsonl"),
-        )
-        files = []
-        for location, pattern in locations:
-            try:
-                if location.exists():
-                    files.extend(location.glob(pattern) if pattern == "*.json" else location.rglob(pattern))
-            except OSError:
-                continue
-    return sorted((session_summary(path, provider, "external") for path in files), key=lambda entry: entry["updated"], reverse=True)
-
-
-def load_session_details(summary: dict, provider: str) -> dict:
-    if summary["_kind"] == "copilot-db":
-        details = read_copilot_db_session(summary["_session_id"], summary["_source"])
-    elif summary["_kind"] == "copilot-chat":
-        details = read_copilot_chat_session(summary["_source"])
-    elif summary["_kind"] == "copilot-legacy":
-        details = read_session(summary["_source"])
-    else:
-        details = read_external_session(summary["_source"], provider)
-    if provider in {"copilot", "codex"}:
-        subtract_cached_input(details)
-    database_metadata = summary.get("_db_metadata")
-    if isinstance(database_metadata, dict):
-        if not details.get("name") or details["name"] == details["id"]:
-            details["name"] = database_metadata.get("name") or details["name"]
-        if not details.get("model") or details["model"] == "model unavailable":
-            details["model"] = database_metadata.get("model") or details.get("model")
-        details["updated"] = max(details.get("updated", 0), database_metadata.get("updated") or 0)
-    if not details.get("project"):
-        details["project"] = summary.get("project")
-    details["source"] = str(summary.get("_source", ""))
-    return details
-
-
-def delete_copilot_db_session(session_id: str, db_path: Path) -> None:
-    with sqlite3.connect(db_path) as db:
-        db.execute("PRAGMA foreign_keys = ON")
-        tables = db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-        for (table,) in tables:
-            if table == "sessions" or not table.replace("_", "").isalnum():
-                continue
-            columns = {row[1] for row in db.execute(f'PRAGMA table_info("{table}")')}
-            if "session_id" in columns:
-                db.execute(f'DELETE FROM "{table}" WHERE session_id = ?', (session_id,))
-        db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-
-
-def delete_session(summary: dict) -> None:
-    kind = summary["_kind"]
-    if kind == "copilot-db":
-        delete_copilot_db_session(summary["_session_id"], summary["_source"])
-        return
-    source: Path = summary["_source"]
-    if kind == "copilot-legacy":
-        shutil.rmtree(source)
-    else:
-        source.unlink()
-
-
-def read_external_session(path: Path, provider: str) -> dict:
+def parse_export_session(path: Path, provider: str) -> dict:
     try:
         updated = path.stat().st_mtime
     except OSError:
@@ -768,16 +507,24 @@ def read_external_session(path: Path, provider: str) -> dict:
         session["project"] = encoded.replace("--", ":\\", 1).replace("-", "\\")
     if records and isinstance(records[0], dict):
         first = records[0]
-        session["id"] = normalize_codex_id(first.get("sessionId") or first.get("session_id") or session["id"]) if provider == "codex" else str(first.get("sessionId") or first.get("session_id") or session["id"])
-        session["name"] = codex_name(first, session["id"]) if provider == "codex" else str(
-            first.get("title") or first.get("name") or first.get("summary") or session["id"]
-        )
+        session["id"], session["name"] = PROVIDER_ADAPTERS[provider].identity(first, session["id"])
 
     def get_turn(key: str) -> dict:
         return turns.setdefault(key, new_turn(key))
 
     current_turn = ""
+    parse_records: list[dict] = []
     for record in records:
+        messages = record.get("messages")
+        if isinstance(messages, list):
+            for index, message_record in enumerate(messages, start=1):
+                if isinstance(message_record, dict):
+                    item = dict(message_record)
+                    item.setdefault("turn_id", item.get("turnId") or record.get("conversationId") or f"turn-{index}")
+                    parse_records.append(item)
+        else:
+            parse_records.append(record)
+    for record in parse_records:
         payload = record.get("payload", record)
         if not isinstance(payload, dict):
             continue
@@ -801,8 +548,12 @@ def read_external_session(path: Path, provider: str) -> dict:
         raw = json.dumps(record, indent=2, ensure_ascii=False)
         turn = get_turn(turn_id)
         turn["raw"].append(raw)
-        role = payload.get("role") or message.get("role") or item.get("role")
-        content = payload.get("content") or message.get("content") or item.get("content") or payload.get("text") or item.get("text") or payload.get("last_agent_message")
+        author = payload.get("author") or message.get("author") or item.get("author") or {}
+        if not isinstance(author, dict):
+            author = {}
+        role = payload.get("role") or message.get("role") or item.get("role") or author.get("role")
+        content = (payload.get("content") or message.get("content") or item.get("content")
+                   or payload.get("text") or item.get("text") or payload.get("last_agent_message"))
         if isinstance(content, list):
             content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
         if content and role == "user":
@@ -843,76 +594,54 @@ def read_external_session(path: Path, provider: str) -> dict:
     return session
 
 
-def sort_sessions(sessions: list[dict]) -> list[dict]:
-    return sorted(
-        (session for session in sessions if session["turns"]),
-        key=lambda session: session["updated"],
-        reverse=True,
-    )
+def read_session(folder: Path) -> dict:
+    """Compatibility entry point for the Copilot legacy parser."""
+    return parse_session(folder)
 
 
-def read_external_sessions(files: list[Path], provider: str) -> list[dict]:
-    return sort_sessions([read_external_session(path, provider) for path in files])
+def read_external_session(path: Path, provider: str) -> dict:
+    """Compatibility entry point for Codex and Claude transcript parsing."""
+    return parse_export_session(path, provider)
 
 
-def load_copilot_sessions(root: Path) -> list[dict]:
-    """Load current chatSessions files and legacy events.jsonl folders."""
-    folders: list[Path] = []
-    try:
-        if root.name == "emptyWindowChatSessions":
-            chat_files = list(root.glob("*.jsonl"))
-        else:
-            chat_files = list(root.rglob("chatSessions/*.jsonl"))
-        candidate_paths = [root] if (root / "events.jsonl").is_file() else list(root.iterdir())
-        for item in candidate_paths:
-            if not item.is_dir() or item.name == "__pycache__":
+def load_session_index(root: Path, provider: str, show_empty: bool = False) -> list[dict]:
+    """Load inexpensive provider summaries for the sidebar."""
+    adapter = PROVIDER_ADAPTERS[provider]
+    normalized = []
+    for item in adapter.index(root):
+        item["provider"] = provider
+        normalized.append(normalize_session_data(item))
+    if show_empty:
+        return normalized
+    visible = []
+    for item in normalized:
+        if item.get("_has_data") is False:
+            continue
+        # Some providers cannot determine emptiness from their cheap metadata
+        # scan. Parse those summaries lazily so the toggle has consistent
+        # behavior across every provider.
+        if item.get("_has_data") is not True:
+            if not session_has_content(adapter.details(item)):
                 continue
-            try:
-                has_events = (item / "events.jsonl").exists()
-            except OSError:
-                has_events = False
-            if has_events:
-                folders.append(item)
-    except OSError:
-        return []
-    sessions = [read_copilot_chat_session(path) for path in chat_files]
-    sessions.extend(read_session(folder) for folder in folders)
-    return sort_sessions(sessions)
+        visible.append(item)
+    return visible
 
 
-def load_sessions(root: Path, provider: str = "copilot") -> list[dict]:
-    if provider == "copilot":
-        return load_copilot_sessions(root)
-    if provider == "codex":
-        external_root = Path.home() / ".codex" / "sessions"
-        try:
-            files = list(external_root.rglob("*.jsonl")) if external_root.exists() else []
-        except OSError:
-            files = []
-        return read_external_sessions(files, provider)
-    if provider == "claude":
-        files: list[Path] = []
-        locations = (
-            (Path.home() / ".claude" / "sessions", "*.json"),
-            (Path.home() / ".claude" / "projects", "*.jsonl"),
-            (Path.home() / "AppData" / "Local" / "Claude-3p" / "local-agent-mode-sessions", "audit.jsonl"),
-        )
-        for location, pattern in locations:
-            try:
-                if location.exists():
-                    files.extend(location.glob(pattern) if pattern == "*.json" else location.rglob(pattern))
-            except OSError:
-                continue
-        return read_external_sessions(list(dict.fromkeys(files)), provider)
-    return []
+def load_session_details(summary: dict, provider: str) -> dict:
+    """Load one full transcript through its provider adapter."""
+    return normalize_session_data(PROVIDER_ADAPTERS[provider].details(summary))
+
+
+def delete_session(summary: dict) -> None:
+    """Delete a session using the owning provider's storage rules."""
+    provider = summary.get("provider") or summary.get("_provider")
+    if not isinstance(provider, str) or provider not in PROVIDER_ADAPTERS:
+        raise ValueError("Session summary does not identify its provider")
+    PROVIDER_ADAPTERS[provider].delete(summary)
 
 
 def provider_path(root: Path, provider: str) -> Path:
-    if provider == "codex":
-        return Path.home() / ".codex" / "sessions"
-    if provider == "claude":
-        return Path.home() / ".claude" / "sessions"
-    return root
+    return PROVIDER_ADAPTERS[provider].display_root(root)
 
 
 def fmt(value: int | None) -> str:
@@ -936,7 +665,7 @@ def token_cards(tokens: dict[str, int | None], extra_class: str = "") -> str:
     )
 
 
-def turn_token_cards(tokens: dict[str, int | None], session_id: str, provider: str, turn_index: int, selected_turn: int | None, selected_metric: str | None) -> str:
+def turn_token_cards(tokens: dict[str, int | None], session_id: str, provider: str, turn_index: int, selected_turn: int | None, selected_metric: str | None, show_empty: bool = False) -> str:
     cards = []
     for key in TOKEN_KEYS:
         active = selected_turn == turn_index and selected_metric == key
@@ -945,6 +674,7 @@ def turn_token_cards(tokens: dict[str, int | None], session_id: str, provider: s
             "session": session_id,
             "turn": turn_index,
             "metric": key,
+            "show_empty": int(show_empty),
         }), quote=True)
         cards.append(
             f'<a class="metric compact clickable {"active" if active else ""}" href="{href}">'
@@ -964,8 +694,8 @@ def explorer_content(turn: dict, metric: str | None) -> tuple[str, str, str]:
     return "Token content", "Click a token card in a turn to inspect its associated content.", ""
 
 
-def render_session_row(item: dict, provider: str, selected: bool) -> str:
-    query = esc(urlencode({"provider": provider, "session": item["id"]}), quote=True)
+def render_session_row(item: dict, provider: str, selected: bool, show_empty: bool = False) -> str:
+    query = esc(urlencode({"provider": provider, "session": item["id"], "show_empty": int(show_empty)}), quote=True)
     label = conversation_name(item.get("name"), item["id"])
     id_detail = "" if str(item["id"]).lower() in str(label).lower() else f'<small>{esc(item["id"])}</small>'
     metadata = (
@@ -982,25 +712,20 @@ def render_session_row(item: dict, provider: str, selected: bool) -> str:
 
 
 def session_tool(summary: dict, provider: str) -> str:
-    """Return the product surface that produced the stored session."""
-    kind = summary.get("_kind")
-    if kind == "copilot-db" or provider == "codex":
-        return "CLI"
-    if provider == "claude" and "local-agent-mode-sessions" in str(summary.get("_source", "")):
-        return "Desktop"
-    return "Extension"
+    """Return the product surface reported by the owning provider."""
+    return PROVIDER_ADAPTERS[provider].tool(summary)
 
 
-def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot") -> str:
-    sessions = load_session_index(root, provider)
+def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False) -> str:
+    sessions = load_session_index(root, provider, show_empty)
     chosen_summary = next((item for item in sessions if item["id"] == selected), sessions[0] if sessions else None)
     chosen = load_session_details(chosen_summary, provider) if chosen_summary else None
     provider_menu = "".join(
-        f'<a class="provider {"selected" if provider == key else ""}" href="/?provider={key}">{esc(label)}</a>'
+        f'<a class="provider {"selected" if provider == key else ""}" href="/?{esc(urlencode({"provider": key, "show_empty": int(show_empty)}), quote=True)}">{esc(label)}</a>'
         for key, label in PROVIDERS.items()
     )
     session_rows = "".join(
-        render_session_row(item, provider, bool(chosen_summary and item["id"] == chosen_summary["id"]))
+        render_session_row(item, provider, bool(chosen_summary and item["id"] == chosen_summary["id"]), show_empty)
         for item in sessions
     )
     turns = ""
@@ -1012,11 +737,11 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             turns += f'''<article class="turn"><header><b>Turn {esc(turn_label)}{esc(step_label)}</b></header>
                 <div class="message user"><label>User</label><p>{esc(turn["user"] or "(no user message)")}</p></div>
                 <div class="message assistant"><label>Assistant</label><p>{esc(assistant)}</p></div>
-                <div class="turn-metrics">{turn_token_cards(turn["tokens"], chosen["id"], provider, index, selected_turn, selected_metric)}</div></article>'''
+                <div class="turn-metrics">{turn_token_cards(turn["tokens"], chosen["id"], provider, index, selected_turn, selected_metric, show_empty)}</div></article>'''
     detail = ""
     if chosen:
         turn_note = " · input/cache/reasoning values estimated from session totals" if len(chosen["turns"]) > 1 else ""
-        refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "session": chosen["id"]}), quote=True)
+        refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "session": chosen["id"], "show_empty": int(show_empty)}), quote=True)
         explorer_title, explorer_text, explorer_raw = explorer_content(
             chosen["turns"][selected_turn - 1], selected_metric
         ) if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else explorer_content({}, None)
@@ -1034,8 +759,10 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     else:
         detail = '<section class="detail no-sessions"><h1>No sessions found</h1><p>Choose a folder containing session subfolders with events.jsonl files.</p></section>'
 
-    refresh_url = esc("/?" + urlencode({"provider": provider}), quote=True)
-    return PAGE.replace("__PROVIDER_MENU__", provider_menu).replace("__SESSION_ROWS__", session_rows).replace("__DETAIL__", detail).replace("__REFRESH_URL__", refresh_url).replace("__ROOT__", esc(provider_path(root, provider)))
+    refresh_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty)}), quote=True)
+    toggle_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(not show_empty)}), quote=True)
+    toggle = f'<a class="empty-toggle" href="{toggle_url}">{"Hide" if show_empty else "Show"} empty</a>'
+    return PAGE.replace("__PROVIDER_MENU__", provider_menu).replace("__SESSION_ROWS__", session_rows).replace("__DETAIL__", detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", toggle).replace("__ROOT__", esc(provider_path(root, provider)))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1052,7 +779,7 @@ class Handler(BaseHTTPRequestHandler):
         if provider not in PROVIDERS or not session_id:
             self.send_error(400, "Invalid delete request")
             return
-        summaries = load_session_index(self.root, provider)
+        summaries = load_session_index(self.root, provider, show_empty=True)
         summary = next((item for item in summaries if item["id"] == session_id), None)
         if summary is None:
             self.send_error(404, "Session not found")
@@ -1077,8 +804,9 @@ class Handler(BaseHTTPRequestHandler):
         turn_value = query.get("turn", [None])[0]
         selected_turn = int(turn_value) if turn_value and turn_value.isdigit() else None
         selected_metric = query.get("metric", [None])[0]
+        show_empty = query.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
         try:
-            body = render(self.root, selected, selected_turn, selected_metric, provider).encode("utf-8")
+            body = render(self.root, selected, selected_turn, selected_metric, provider, show_empty).encode("utf-8")
         except OSError:
             self.send_error(500, "Unable to read session files")
             return
@@ -1098,8 +826,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    from github_copilot_provider import default_root as copilot_default_root
     parser = argparse.ArgumentParser(description="View Copilot session token usage")
-    parser.add_argument("--root", type=Path, default=default_copilot_root(), help="Copilot/agent session root folder")
+    parser.add_argument("--root", type=Path, default=copilot_default_root(), help="Copilot/agent session root folder")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     Handler.root = args.root.expanduser().resolve()
@@ -1167,8 +896,11 @@ PAGE = PAGE.replace("</style></head>", r'''<style>
 .session.selected{border-color:#3b6b9d;background:#203653}
 .session-row form{width:26px;flex-basis:26px}
 .delete-session{width:26px;color:#8ba0bd}
-.sessions-heading{display:flex;align-items:center;justify-content:space-between;margin:0 10px 8px}
+.sessions-heading{display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:2;margin:0 0 8px;padding:8px 10px;background:#0f192b;border-bottom:1px solid #223451}
 .sessions-heading .count{margin:0}
+.sessions-heading-actions{display:flex;align-items:center;gap:6px}
+.empty-toggle{color:#9eb5d0;font-size:10px;text-decoration:none;white-space:nowrap;padding:6px 7px;border:1px solid #2b4668;border-radius:7px;background:#172943}
+.empty-toggle:hover{background:#24558a;color:#fff}
 .refresh-sessions{display:inline-flex;align-items:center;justify-content:center;width:27px;height:27px;border:1px solid #2b4668;border-radius:7px;background:#172943;color:#a9c2df;text-decoration:none;font-size:16px;line-height:1;transition:background .15s,border-color .15s,color .15s}
 .refresh-sessions:hover{background:#24558a;border-color:#4d8bc4;color:#fff}
 /* Keep the sidebar outside the document scroll area on desktop. */
@@ -1179,7 +911,7 @@ PAGE = PAGE.replace("</style></head>", r'''<style>
 @media(max-width:700px){.app{display:block}.sidebar{position:static;width:auto;height:auto;min-height:auto;max-height:none}.detail{margin-left:0;width:100%}.sessions-area{overflow:visible;padding-right:0;margin-right:0}}
 </style></head>''')
 
-PAGE = PAGE.replace('<div class="count">Sessions</div>__SESSION_ROWS__', '<div class="sessions-area"><div class="sessions-heading"><div class="count">Sessions</div><a class="refresh-sessions" href="__REFRESH_URL__" title="Refresh sessions" aria-label="Refresh sessions">↻</a></div>__SESSION_ROWS__</div>')
+PAGE = PAGE.replace('<div class="count">Sessions</div>__SESSION_ROWS__', '<div class="sessions-area"><div class="sessions-heading"><div class="count">Sessions</div><div class="sessions-heading-actions">__EMPTY_TOGGLE__<a class="refresh-sessions" href="__REFRESH_URL__" title="Refresh sessions" aria-label="Refresh sessions">↻</a></div></div>__SESSION_ROWS__</div>')
 
 
 if __name__ == "__main__":
