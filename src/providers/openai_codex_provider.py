@@ -16,7 +16,7 @@ def display_root(root: Path) -> Path:
 
 
 def tool(summary: dict) -> str:
-    return "CLI"
+    return "CLI / VS Code integration"
 
 
 def identity(record: dict, fallback: str) -> tuple[str, str]:

@@ -12,6 +12,10 @@ python session_token_viewer.py
 
 The app opens at `http://127.0.0.1:8765`.
 
+See [Provider storage and viewer support matrix](docs/provider-storage-matrix.md)
+for the supported chat and code surfaces, storage locations, and local-read
+limitations.
+
 Sidebar entries show the conversation name when the provider supplies one; otherwise they show the conversation ID. Every entry also shows its source and last-updated timestamp.
 
 Each conversation also has a delete button. Deletion requires browser confirmation and removes the provider’s stored transcript or database records locally:
@@ -35,101 +39,17 @@ Stop the server with `Ctrl+C`.
 
 ## Supported providers
 
-### GitHub Copilot
+Provider-specific storage paths, formats, token behavior, and limitations are
+documented separately:
 
-The VS Code session actions are archive and delete, which are two different things
+- [GitHub Copilot](docs/providers/github-copilot.md)
+- [OpenAI Codex](docs/providers/openai-codex.md)
+- [Anthropic Claude Code](docs/providers/claude-code.md)
+- [Microsoft 365 Copilot](docs/providers/microsoft-365-copilot.md)
+- [Provider storage and viewer support matrix](docs/provider-storage-matrix.md)
 
-The VS Code non-project-related workspace storage directory:
-
-```text
-%APPDATA%\Code\User\globalStorage\emptyWindowChatSessions\*.jsonl
-```
-
-The VS Code project-related workspace storage directory:
-
-```text
-%APPDATA%\Code\User\workspaceStorage\*\chatSessions\*.jsonl
-```
-
-This source does include `input_tokens` and `output_tokens` per-turn values.
-
-Older session-state folders containing the following files are also supported:
-
-```text
-<root>\<session-id>\workspace.yaml
-<root>\<session-id>\events.jsonl
-```
-
-Newer VSCode Copilot project and non-project-related sessions also maintain additional metadata in (but no usage details):
-
-```text
-%APPDATA%\Code\User\globalStorage\github.copilot-chat\session-store.db
-```
-
-This source does not include uage and therefore no per-turn values.
-
-Newer CLI Copilot project and non-project-related sessions also maintain additional metadata in (and with usage details):
-
-```text
-%USERPROFILE%\.copilot\session-store.db
-```
-
-This source includes per-turn `cache_read_tokens`, `cache_write_tokens`, and `reasoning_tokens` values.
-
-
-### OpenAI Codex
-
-The VS Code session actions are archive, which is a delete operation
-
-Reads Codex JSONL rollout files from:
-
-```text
-%USERPROFILE%\.codex\sessions\**\*.jsonl
-```
-
-The adapter understands Codex records such as:
-
-- `response_item`
-- `event_msg`
-- `token_count`
-- Nested `turn_id` metadata
-
-### Anthropic Claude Code
-
-The VS Code session actions are delete, which is a delete operation
-
-Reads Codex JSONL files from:
-
-```text
-%USERPROFILE%\.claude\projects\**\*.jsonl
-```
-
-Claude Code Desktop local-agent transcripts:
-
-```text
-%LOCALAPPDATA%\Claude-3p\local-agent-mode-sessions\**\audit.jsonl
-```
-
-Metadata-only session files are ignored. Desktop transcripts are identified by their `session_id` values.
-
-### Microsoft 365 Copilot
-
-Microsoft 365 Copilot conversation history is normally cloud-backed; its
-Office/WebView local cache is not a stable, supported transcript interface.
-The viewer therefore supports local JSON/JSONL transcript exports using the
-same turn, token, raw-event, and delete behavior as the other file-backed
-providers.
-
-Set the export directory before starting the viewer:
-
-```text
-set M365_COPILOT_ROOT=C:\path\to\m365-copilot\sessions
-python session_token_viewer.py
-```
-
-The default directory is `%USERPROFILE%\m365-copilot\sessions`. Files are
-identified from `sessionId`/`conversationId` and common `title` fields; message
-roles, nested content, and common usage fields are parsed when present.
+The viewer only reads local transcripts or user-provided exports. It does not
+download cloud-only chat history.
 
 ## Provider architecture
 
@@ -167,12 +87,12 @@ native file or database format.
 
 Provider-specific behavior is implemented in:
 
-- `github_copilot_provider.py`
-- `openai_codex_provider.py`
-- `anthropic_claude_provider.py`
-- `m365_copilot_provider.py`
+- `src/providers/github_copilot_provider.py`
+- `src/providers/openai_codex_provider.py`
+- `src/providers/anthropic_claude_provider.py`
+- `src/providers/m365_copilot_provider.py`
 
-Each provider adapter exposes the same operations:
+Each provider adapter under `src/providers/` exposes the same operations:
 
 - `index(root)` discovers conversations and returns inexpensive sidebar summaries.
 - `details(summary)` loads and parses one complete conversation.
@@ -252,5 +172,3 @@ Encrypted payloads can be displayed as raw text but cannot be decrypted by this 
 - Active sessions may not appear until their provider writes a transcript file.
 - Temporary folders without event files are ignored.
 - Provider-specific token fields may be unavailable or estimated.
-- Claude Desktop browser/UI cache data is not parsed; the supported desktop source is `local-agent-mode-sessions\\**\\audit.jsonl`.
-- The app is intentionally read-only.

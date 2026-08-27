@@ -6,7 +6,19 @@ The provider scans JSONL rollout files under:
 
 `%USERPROFILE%\\.codex\\sessions\\**\\*.jsonl`
 
-The exact rollout path is retained as `_source` and displayed as the information source. The source label is OpenAI Codex and the tool surface is reported as CLI.
+The exact rollout path is retained as `_source` and displayed as the information source. The source label is OpenAI Codex and the tool surface is reported as CLI / VS Code integration.
+
+The same local rollout storage can contain both Codex coding sessions and Codex
+chat conversations created through the CLI or the VS Code integration. The
+viewer reads both types from the JSONL transcript records; no separate chat
+storage location is required.
+
+## Actions
+
+Codex exposes **Archive**, which functions as a delete operation for the local
+rollout. The viewer exposes **Delete** and removes the selected JSONL rollout
+file. This only removes the local transcript; it does not affect any remote
+account data.
 
 ## Identity and metadata
 

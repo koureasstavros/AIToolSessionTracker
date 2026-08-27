@@ -7,9 +7,22 @@ The provider scans:
 - VS Code project sessions: `%APPDATA%\\Code\\User\\workspaceStorage\\*\\chatSessions\\*.jsonl`
 - VS Code non-project sessions: `%APPDATA%\\Code\\User\\globalStorage\\emptyWindowChatSessions\\*.jsonl`
 - Legacy session-state folders containing `workspace.yaml` and `events.jsonl`
+- VS Code session metadata: `%APPDATA%\\Code\\User\\globalStorage\\github.copilot-chat\\session-store.db`
 - Copilot CLI metadata from `%USERPROFILE%\\.copilot\\session-store.db`
 
 A source path is retained in `_source` and displayed as the information source. The source label identifies VS Code, Copilot legacy, or Copilot CLI.
+
+The VS Code JSONL source includes per-turn input and output values when the
+transcript persists them. The VS Code SQLite metadata source does not provide
+usage values. Copilot CLI database records can include cache-read,
+cache-write, and reasoning-token values.
+
+## Actions
+
+The VS Code Copilot session actions are **Archive** and **Delete**; these are
+different operations in VS Code. The viewer exposes **Delete** only. It removes
+the selected JSONL transcript, removes the complete legacy session folder, or
+deletes the CLI database session and its related rows.
 
 ## Identity and metadata
 

@@ -9,6 +9,13 @@ The provider scans:
 
 The provider deduplicates entries by conversation ID and prefers a source with data, then the most recently updated source.
 
+## Actions
+
+Claude Code exposes **Delete** for local transcripts. The viewer exposes
+**Delete** and removes the selected Claude Code JSONL transcript or Desktop
+`audit.jsonl` file. This is a local file operation and does not delete ordinary
+cloud-backed Claude Chat history.
+
 ## Identity and metadata
 
 - **GUID / ID:** Prefer `sessionId`, `session_id`, `conversationId`, or `conversation_id`. Fall back to the filename stem.

@@ -9,6 +9,13 @@ The provider reads local JSON and JSONL transcript exports from:
 
 Microsoft 365 Copilot's cloud conversation history and Office/WebView cache are not treated as stable transcript sources. The exact export path is retained as `_source` and displayed as the information source.
 
+## Actions
+
+Microsoft 365 Copilot history is cloud-backed, so the viewer cannot archive or
+delete the account conversation. For a local JSON/JSONL export, the viewer's
+**Delete** action removes the selected export file only. It does not change the
+conversation in Microsoft 365 or delete the cloud history.
+
 ## Identity and metadata
 
 - **GUID / ID:** Prefer `sessionId`, `session_id`, `conversationId`, or `conversation_id`. Fall back to the filename stem.

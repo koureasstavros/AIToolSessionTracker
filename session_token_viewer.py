@@ -20,10 +20,10 @@ from pathlib import Path
 from typing import TypedDict
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
-import anthropic_claude_provider
-import github_copilot_provider
-import m365_copilot_provider
-import openai_codex_provider
+from src.providers import anthropic_claude_provider
+from src.providers import github_copilot_provider
+from src.providers import m365_copilot_provider
+from src.providers import openai_codex_provider
 
 TOKEN_KEYS = (
     "inputTokens",
@@ -872,7 +872,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    from github_copilot_provider import default_root as copilot_default_root
+    from src.providers.github_copilot_provider import default_root as copilot_default_root
     parser = argparse.ArgumentParser(description="View Copilot session token usage")
     parser.add_argument("--root", type=Path, default=copilot_default_root(), help="Copilot/agent session root folder")
     parser.add_argument("--port", type=int, default=8765)
