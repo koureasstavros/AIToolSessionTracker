@@ -14,8 +14,8 @@ def _viewer():
     return viewer
 
 
-def _read_legacy(folder: Path) -> dict:
-    """Parse the legacy workspace.yaml/events.jsonl Copilot format."""
+def _read_session_state(folder: Path) -> dict:
+    """Parse the Copilot session-state workspace.yaml/events.jsonl format."""
     viewer = _viewer()
     try:
         updated = folder.stat().st_mtime
@@ -242,7 +242,9 @@ def display_root(root: Path) -> Path:
 
 
 def tool(summary: dict) -> str:
-    return "CLI" if summary.get("_kind") == "copilot-db" else "Extension"
+    # The local Copilot database path identifies the storage family, but its
+    # records do not contain a reliable CLI-versus-Desktop marker.
+    return "CLI / Desktop" if summary.get("_kind") in {"copilot-db", "copilot-session-state"} else "Extension"
 
 
 def identity(record: dict, fallback: str) -> tuple[str, str]:
@@ -274,7 +276,7 @@ def index(root: Path) -> list[dict]:
             candidates = [scan_root] if (scan_root / "events.jsonl").is_file() else list(scan_root.iterdir())
             for path in candidates:
                 if path.is_dir() and path.name != "__pycache__" and (path / "events.jsonl").exists():
-                    entries.append(viewer.session_summary(path, "copilot", "copilot-legacy"))
+                    entries.append(viewer.session_summary(path, "copilot", "copilot-session-state"))
         except OSError:
             continue
     entries.extend(_db_index())
@@ -313,7 +315,7 @@ def _db_index() -> list[dict]:
             return fallback
     return [{"id": sid, "name": name, "updated": timestamp(updated),
              "turns": [], "tokens": viewer.blank_tokens(), "model": "GitHub Copilot",
-             "_source": path, "_session_id": sid, "_source_label": "Copilot CLI", "_kind": "copilot-db"}
+             "_source": path, "_session_id": sid, "_source_label": "CLI / Desktop", "_kind": "copilot-db"}
             for sid, name, updated in rows]
 
 
@@ -325,7 +327,7 @@ def details(summary: dict) -> dict:
     elif kind == "copilot-chat":
         result = _read_chat(summary["_source"])
     else:
-        result = _read_legacy(summary["_source"])
+        result = _read_session_state(summary["_source"])
     viewer.subtract_cached_input(result)
     metadata = summary.get("_db_metadata")
     if isinstance(metadata, dict):
@@ -344,7 +346,7 @@ def delete(summary: dict) -> None:
     viewer = _viewer()
     if summary["_kind"] != "copilot-db":
         source = summary["_source"]
-        if summary["_kind"] == "copilot-legacy":
+        if summary["_kind"] == "copilot-session-state":
             import shutil
             shutil.rmtree(source)
         else:

@@ -4,15 +4,15 @@
 
 The provider scans:
 
-- VS Code project sessions: `%APPDATA%\\Code\\User\\workspaceStorage\\*\\chatSessions\\*.jsonl`
-- VS Code non-project sessions: `%APPDATA%\\Code\\User\\globalStorage\\emptyWindowChatSessions\\*.jsonl`
-- Legacy session-state folders containing `workspace.yaml` and `events.jsonl`
-- VS Code session metadata: `%APPDATA%\\Code\\User\\globalStorage\\github.copilot-chat\\session-store.db`
-- Copilot CLI metadata from `%USERPROFILE%\\.copilot\\session-store.db`
+- Extension sessions: `%APPDATA%\\Code\\User\\globalStorage\\github.copilot-chat\\session-store.db`
+- Extension project sessions and metadata: `%APPDATA%\\Code\\User\\workspaceStorage\\*\\chatSessions\\*.jsonl`
+- Extension non-project sessions and metadata: `%APPDATA%\\Code\\User\\globalStorage\\emptyWindowChatSessions\\*.jsonl`
+- Copilot Desktop / CLI session and metadata from `%USERPROFILE%\\.copilot\\session-store.db`
+- Copilot Desktop / CLI session and metadata from `%USERPROFILE%\.copilot\session-state\<session-id>\` containing `workspace.yaml`, `events.jsonl`, and optional per-session database files
 
-A source path is retained in `_source` and displayed as the information source. The source label identifies VS Code, Copilot legacy, or Copilot CLI.
+A source path is retained in `_source` and displayed as the information source. The source label identifies VS Code, Copilot session-state, or the CLI / Desktop database.
 
-The VS Code JSONL source includes per-turn input and output values when the
+The Extension JSONL source includes per-turn input and output values when the
 transcript persists them. The VS Code SQLite metadata source does not provide
 usage values. Copilot CLI database records can include cache-read,
 cache-write, and reasoning-token values.
@@ -21,7 +21,7 @@ cache-write, and reasoning-token values.
 
 The VS Code Copilot session actions are **Archive** and **Delete**; these are
 different operations in VS Code. The viewer exposes **Delete** only. It removes
-the selected JSONL transcript, removes the complete legacy session folder, or
+the selected JSONL transcript, removes the complete session-state folder, or
 deletes the CLI database session and its related rows.
 
 ## Identity and metadata
@@ -32,6 +32,16 @@ deletes the CLI database session and its related rows.
 - **Model:** Prefer a request `modelId`. CLI sessions use the stored model metadata when available; otherwise display `model unavailable` or the provider fallback.
 - **Project:** Prefer `folder`, `workspaceFolder`, or `projectPath`. If absent, infer the VS Code workspace from the parent workspace-storage path. CLI sessions use the stored working-directory/project column when available.
 - **Source:** Use the exact JSONL or database path that supplied the conversation.
+
+## Surface identification
+
+- Extension JSONL sessions are labelled `Extension`.
+- Session-state folders are labelled `CLI / Desktop`, because these local
+  Copilot session sources are written by the CLI/Desktop storage family and do
+  not contain a reliable marker to distinguish the two surfaces.
+- Sessions from the local `.copilot\\session-store.db` are labelled `CLI / Desktop`:
+	the database location identifies the local Copilot store, but the records do
+	not contain a reliable client marker to distinguish CLI from Desktop.
 
 ## Turns
 

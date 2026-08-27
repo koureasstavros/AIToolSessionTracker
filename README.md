@@ -21,7 +21,7 @@ Sidebar entries show the conversation name when the provider supplies one; other
 Each conversation also has a delete button. Deletion requires browser confirmation and removes the provider’s stored transcript or database records locally:
 
 - Copilot and Codex/Claude file-backed sessions: removes the related transcript file.
-- Legacy Copilot folders: removes the session folder and its contents.
+- Copilot session-state folders: removes the session folder and its contents.
 - Copilot CLI database sessions: removes the session and related rows from `session-store.db`.
 
 Deletion cannot be undone by this application.
@@ -107,7 +107,7 @@ provider-specific parsing or deletion rules.
 
 Deletion remains abstract in the main application: it validates the selected
 conversation and delegates the actual operation to the owning adapter. For
-example, file-backed providers unlink transcript files, legacy Copilot removes
+example, file-backed providers unlink transcript files, Copilot session-state removes
 the session directory, and Copilot CLI removes related database rows.
 
 ## What the app displays

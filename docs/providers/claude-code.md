@@ -9,6 +9,14 @@ The provider scans:
 
 The provider deduplicates entries by conversation ID and prefers a source with data, then the most recently updated source.
 
+## Surface identification
+
+- Desktop sessions are identified by the `Claude-3p\\local-agent-mode-sessions` path.
+- Sessions under `.claude\\projects` or `.claude\\sessions` may originate from
+	either Claude Code CLI or the VS Code integration because those surfaces can
+	share the same transcript locations. The viewer labels them `CLI / Extension`
+	rather than claiming a single surface without explicit metadata.
+
 ## Actions
 
 Claude Code exposes **Delete** for local transcripts. The viewer exposes

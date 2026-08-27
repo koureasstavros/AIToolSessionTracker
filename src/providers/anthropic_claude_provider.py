@@ -13,7 +13,10 @@ def display_root(root: Path) -> Path:
 
 
 def tool(summary: dict) -> str:
-    return "Desktop" if "local-agent-mode-sessions" in str(summary.get("_source", "")) else "Extension"
+    # Claude Code CLI and the VS Code integration can share the same
+    # ~/.claude transcript locations. Only Desktop has a distinct local-agent
+    # storage path, so expose both possible labels when the source is shared.
+    return "Desktop" if "local-agent-mode-sessions" in str(summary.get("_source", "")) else "CLI / Extension"
 
 
 def identity(record: dict, fallback: str) -> tuple[str, str]:
@@ -62,6 +65,10 @@ def index(root: Path) -> list[dict]:
     entries = [viewer.session_summary(path, "claude", "external") for path in _files()]
     for entry in entries:
         entry["_has_data"] = _has_data(entry["_source"])
+        # Keep the sidebar flag consistent with the surface shown in the
+        # conversation header. Shared .claude paths intentionally retain both
+        # possible labels.
+        entry["_source_label"] = tool(entry)
     # A conversation can be discovered through more than one local Claude
     # source while it is being written. Keep one sidebar item per session ID.
     unique: dict[str, dict] = {}

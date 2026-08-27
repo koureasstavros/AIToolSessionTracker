@@ -452,8 +452,8 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
     summary["_source"] = path
     summary["_kind"] = kind
     summary["_source_label"] = {
-        "copilot-chat": "VS Code",
-        "copilot-legacy": "Copilot legacy",
+        "copilot-chat": "Extension",
+        "copilot-session-state": "CLI / Desktop",
         "external": PROVIDERS.get(provider, provider),
     }.get(kind, PROVIDERS.get(provider, provider))
     if kind == "copilot-chat":
@@ -498,7 +498,7 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
                                 and (has_completion or has_message or has_response)):
                             summary["_has_data"] = True
                             break
-    elif kind == "copilot-legacy":
+    elif kind == "copilot-session-state":
         workspace = path / "workspace.yaml"
         try:
             for line in workspace.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -630,7 +630,7 @@ def parse_export_session(path: Path, provider: str) -> dict:
 
 
 def read_session(folder: Path) -> dict:
-    """Compatibility entry point for the Copilot legacy parser."""
+    """Compatibility entry point for the Copilot session-state parser."""
     return parse_session(folder)
 
 
