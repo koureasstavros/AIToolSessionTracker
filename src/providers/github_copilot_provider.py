@@ -379,6 +379,14 @@ def details(summary: dict) -> dict:
                 turn["assistant"] = other.get("assistant", [])
             if not turn.get("raw"):
                 turn["raw"] = other.get("raw", [])
+            # A session-state transcript can provide the same logical turn
+            # without the database usage-step metadata. Preserve that
+            # metadata when the database representation is merged into it;
+            # otherwise the first request is rendered as an unnumbered turn
+            # while only the later request appears as "Step 2 of 2".
+            for key in ("turn_index", "step", "step_count"):
+                if other.get(key) is not None:
+                    turn[key] = other[key]
             for key in viewer.TOKEN_KEYS:
                 if database_usage and other.get("tokens", {}).get(key) is not None:
                     turn["tokens"][key] = other["tokens"][key]
