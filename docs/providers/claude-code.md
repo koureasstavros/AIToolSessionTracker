@@ -4,10 +4,19 @@
 
 The provider scans:
 
-- `%USERPROFILE%\\.claude\\projects\\**\\*.jsonl`
-- Claude Desktop audit files under `%LOCALAPPDATA%\\Claude-3p\\local-agent-mode-sessions\\**\\audit.jsonl`
+- Extension / CLI `%USERPROFILE%\\.claude\\projects\\**\\*.jsonl`
+- Desktop `%LOCALAPPDATA%\\Claude-3p\\local-agent-mode-sessions\\**\\audit.jsonl`
 
-The provider deduplicates entries by conversation ID and prefers a source with data, then the most recently updated source.
+The exact transcript or audit path is retained as `_source` and displayed as the
+information source. The source label is Anthropic Claude Code, and the tool
+surface is reported as CLI, Extension, or Desktop when the storage location
+provides enough evidence.
+
+Claude Code and the VS Code integration may share the same `.claude` transcript
+locations. The viewer reads both from the JSONL records and labels ambiguous
+sessions `CLI / Extension` rather than claiming a single surface. The provider
+deduplicates entries by conversation ID and prefers a source with data, then
+the most recently updated source.
 
 ## Surface identification
 

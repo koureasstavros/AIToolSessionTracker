@@ -2,11 +2,11 @@
 
 ## Sources
 
-The provider scans JSONL rollout files under:
+The provider scans:
 
-`%USERPROFILE%\\.codex\\sessions\\**\\*.jsonl`
+- Extension / CLI / Desktop `%USERPROFILE%\\.codex\\sessions\\**\\*.jsonl`
 
-The exact rollout path is retained as `_source` and displayed as the information source. The source label is OpenAI Codex and the tool surface is reported as CLI / VS Code integration.
+The exact rollout path is retained as `_source` and displayed as the information source. The source label is OpenAI Codex and the tool surface is reported as Extension, CLI and Desktop.
 
 The same local rollout storage can contain both Codex coding sessions and Codex
 chat conversations created through the CLI or the VS Code integration. The
