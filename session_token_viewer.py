@@ -94,7 +94,7 @@ def normalize_session_data(value: dict) -> SessionData:
         "model": value.get("model") if isinstance(value.get("model"), str) else None,
         "project": value.get("project") if isinstance(value.get("project"), str) else None,
     }
-    for key in ("source", "_source", "_kind", "_source_label", "_session_id", "_db_metadata", "_has_data", "provider"):
+    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_session_id", "_db_metadata", "_has_data", "provider"):
         if key in value:
             result[key] = value[key]
     return result

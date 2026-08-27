@@ -11,6 +11,10 @@ The provider scans:
 - Copilot Desktop / CLI session and metadata from `%USERPROFILE%\.copilot\session-state\<session-id>\` containing `workspace.yaml`, `events.jsonl`, and optional per-session database files
 
 A source path is retained in `_source` and displayed as the information source. The source label identifies VS Code, Copilot session-state, or the CLI / Desktop database.
+When the same session ID exists in more than one source, all matching sources
+are read. Session-state events provide the conversation content and the local
+database supplements metadata, messages, and usage fields when they are
+available; neither source is discarded during indexing.
 
 The Extension JSONL source includes per-turn input and output values when the
 transcript persists them. The VS Code SQLite metadata source does not provide
@@ -45,7 +49,19 @@ deletes the CLI database session and its related rows.
 
 ## Turns
 
-The parser reconstructs requests from the initial `requests` array and later JSONL patch records. A request can contain:
+GitHub Copilot uses source-specific turn handling:
+
+- **VS Code JSONL:** one logical turn is created for each request in the
+  `requests` array, including requests reconstructed from later JSONL patch
+  records. Serialized tool invocations are additional `kind: tool` turns.
+- **CLI / Desktop session-state:** events are grouped by `interactionId`, or by
+  the linked `turnId`. Session-shutdown metrics are session-level; when they
+  cannot be mapped to a turn, input/cache/reasoning totals are distributed
+  across turns using output-token weights. This is an estimate.
+- **CLI / Desktop SQLite:** multiple assistant usage steps become separate
+  turns, and usage-only records can become synthetic turns.
+
+A request or event group can contain:
 
 - User input from `message.text`
 - Assistant output from response items with readable `value` text
@@ -67,6 +83,11 @@ Supported normalized fields are:
 Input/output values come from request fields such as `promptTokens` and `completionTokens`, result metadata, and recognized usage aliases. Session totals are aggregated from turns. Cached input is subtracted from total input where the source reports both values.
 
 The VS Code chat-session source often does not persist usage statistics. In that case, prompts, responses, and tool events remain visible while token fields remain unavailable.
+
+Token availability is not uniform across GitHub Copilot turns. A text-bearing
+turn, especially one read from VS Code JSONL, may have `null` token fields.
+Tool turns do not inherit or duplicate the parent request's usage. Session
+totals use persisted usage, apart from the documented session-state allocation.
 
 ## Empty-session rule
 

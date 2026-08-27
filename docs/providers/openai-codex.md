@@ -31,7 +31,10 @@ account data.
 
 ## Turns
 
-Records are grouped by `turn_id`, `turnId`, nested item turn ID, `promptId`, or a record UUID fallback. User and assistant messages are assigned from their roles and readable content.
+Records are grouped by `turn_id`, `turnId`, nested item turn ID, `promptId`, or
+a record UUID fallback. User and assistant messages are assigned from their
+roles and readable content. A logical conversation turn is not guaranteed to
+have a usage record: Codex can persist text without token metadata.
 
 Codex function calls are handled specially:
 
@@ -41,6 +44,12 @@ Codex function calls are handled specially:
 - Tool output displays the returned result.
 - Parallel calls remain separate tool turns.
 - Raw records are retained on every turn.
+
+Each function call and its matching output is a separate `kind: tool` turn, not
+part of the parent assistant turn. Tool turns commonly have no token values.
+The parser does not copy response usage onto message or tool turns, so
+individual turns can show unavailable token values even when the session total
+is available.
 
 Metadata-only records such as initial queue/attachment records are not displayed as turns.
 
@@ -54,7 +63,12 @@ Usage is read primarily from `event_msg` records containing `token_count.info.la
 - `outputTokens`
 - `reasoningTokens`
 
-Totals are aggregated from parsed turns. Codex frequently stores usage for a model response or broader turn rather than for each individual function call. Tool turns without a matching usage record therefore legitimately have missing token values; duplicating one usage record across every tool call would overcount totals.
+Totals are aggregated only from usage attached to parsed records/turns. Codex
+frequently stores usage for a model response or broader turn rather than for
+each individual function call. Therefore token information is not available
+on every turn, especially function-call turns, and missing values are not
+inferred or copied. Duplicating one usage record across every tool call would
+overcount totals.
 
 ## Empty-session rule
 

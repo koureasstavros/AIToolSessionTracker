@@ -27,9 +27,18 @@ conversation in Microsoft 365 or delete the cloud history.
 
 ## Turns
 
-The parser accepts common message containers, roles, nested content, and text fields. User content is assigned to the turn's user field; assistant/model content is appended to assistant output. Raw source records are retained.
+The parser accepts common message containers, roles, nested content, and text
+fields. User content is assigned to the turn's user field; assistant/model
+content is appended to assistant output. Records are grouped using the generic
+export parser's identifiers where available, with a stable record fallback.
+Raw source records are retained.
 
 If the export contains tool-call or tool-result records in a supported structure, they are retained as raw event data. The provider's primary contract is local transcript export parsing rather than a provider-specific tool protocol.
+
+Turn boundaries depend on the export schema. The provider does not invent turns
+from message length or split a generic assistant message into provider-specific
+steps. Tool events are not guaranteed to become separate display turns unless
+the export exposes them in a supported structure.
 
 ## Tokens
 
@@ -42,6 +51,10 @@ Common usage fields and aliases are normalized to:
 - `reasoningTokens`
 
 Values are displayed when present in the export. Missing values are not fabricated. Session totals are calculated from parsed per-turn values when available.
+
+Token fields may therefore be unavailable on individual turns or on the whole
+session when the export contains no usage metadata. Values are not propagated
+from a session total to turns.
 
 ## Empty-session rule
 

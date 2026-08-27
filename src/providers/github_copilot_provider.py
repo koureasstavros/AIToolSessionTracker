@@ -199,7 +199,7 @@ def _read_db(session_id: str, db_path: Path) -> dict:
             extra = f", {project_column}" if project_column else ""
             row = db.execute(f"SELECT summary, updated_at{extra} FROM sessions WHERE id = ?", (session_id,)).fetchone()
             turns = db.execute("SELECT turn_index, user_message, assistant_response FROM turns WHERE session_id = ? ORDER BY turn_index", (session_id,)).fetchall()
-            usage = db.execute("SELECT turn_index, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens FROM assistant_usage_events WHERE session_id = ? ORDER BY id", (session_id,)).fetchall()
+            usage = db.execute("SELECT turn_index, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens FROM assistant_usage_events WHERE session_id = ? ORDER BY id", (session_id,)).fetchall()
             if row:
                 session["name"] = row[0] or session_id
                 if project_column and row[2]:
@@ -223,6 +223,20 @@ def _read_db(session_id: str, db_path: Path) -> dict:
             turn["tokens"].update({key: value if isinstance(value, int) else 0 for key, value in tokens.items()})
             turn["turn_index"], turn["step"], turn["step_count"] = index, step if len(steps) > 1 else None, len(steps)
             turn["raw"].append(json.dumps({"user": user, "assistant": assistant, "step": step}, ensure_ascii=False))
+            session["turns"].append(turn)
+    # Usage can be persisted even when the database has no corresponding row
+    # in `turns` (for example, a session whose transcript is in session-state).
+    # Keep those records as synthetic turns so they can supplement the content
+    # parsed from the other source during multi-source merging.
+    known_indices = {turn.get("turn_index") for turn in session["turns"]}
+    for index, steps in by_turn.items():
+        if index in known_indices:
+            continue
+        for step, tokens in enumerate(steps, 1):
+            turn = viewer.new_turn(f"{index}.{step}" if len(steps) > 1 else str(index))
+            turn["turn_index"], turn["step"], turn["step_count"] = index, step if len(steps) > 1 else None, len(steps)
+            turn["tokens"].update({key: value if isinstance(value, int) else 0 for key, value in tokens.items()})
+            turn["raw"].append(json.dumps({"source": "assistant_usage_events", "turn_index": index, "step": step, "tokens": tokens}, ensure_ascii=False))
             session["turns"].append(turn)
     for key in viewer.TOKEN_KEYS:
         values = [turn["tokens"][key] for turn in session["turns"]]
@@ -283,13 +297,24 @@ def index(root: Path) -> list[dict]:
     unique: dict[str, dict] = {}
     for entry in entries:
         existing = unique.get(entry["id"])
-        if existing is None or existing.get("_kind") == "copilot-db":
+        if existing is None:
+            entry["_sources"] = [entry.copy()]
             unique[entry["id"]] = entry
-        elif entry.get("_kind") == "copilot-db":
+            continue
+        # A Copilot conversation can be represented by both session-state
+        # events and the local database. Keep every representation so details
+        # can combine the richer parts instead of discarding one source.
+        existing.setdefault("_sources", [existing.copy()]).append(entry.copy())
+        if existing.get("_kind") == "copilot-db" and entry.get("_kind") != "copilot-db":
+            primary = entry
+            primary["_sources"] = existing["_sources"]
+            unique[entry["id"]] = primary
+            existing = primary
+        if entry.get("_kind") == "copilot-db":
             existing["_db_metadata"] = {key: entry.get(key) for key in ("name", "updated", "model")}
-            if existing.get("name") in {None, "", existing["id"]} and entry.get("name"):
-                existing["name"] = entry["name"]
-            existing["updated"] = max(existing["updated"], entry["updated"])
+        if existing.get("name") in {None, "", existing["id"]} and entry.get("name"):
+            existing["name"] = entry["name"]
+        existing["updated"] = max(existing["updated"], entry["updated"])
     return sorted(unique.values(), key=lambda item: item["updated"], reverse=True)
 
 
@@ -302,7 +327,7 @@ def _db_index() -> list[dict]:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
             rows = db.execute(
                 "SELECT id, COALESCE(summary, id), updated_at FROM sessions "
-                "WHERE id IN (SELECT DISTINCT session_id FROM turns) ORDER BY updated_at DESC"
+                "ORDER BY updated_at DESC"
             ).fetchall()
     except (OSError, sqlite3.Error):
         return []
@@ -321,13 +346,49 @@ def _db_index() -> list[dict]:
 
 def details(summary: dict) -> dict:
     viewer = _viewer()
-    kind = summary["_kind"]
-    if kind == "copilot-db":
-        result = _read_db(summary["_session_id"], summary["_source"])
-    elif kind == "copilot-chat":
-        result = _read_chat(summary["_source"])
-    else:
-        result = _read_session_state(summary["_source"])
+    sources = summary.get("_sources") or [summary]
+    parsed: list[dict] = []
+    for source in sources:
+        kind = source["_kind"]
+        if kind == "copilot-db":
+            parsed.append(_read_db(source["_session_id"], source["_source"]))
+        elif kind == "copilot-chat":
+            parsed.append(_read_chat(source["_source"]))
+        else:
+            parsed.append(_read_session_state(source["_source"]))
+    result = parsed[0]
+    # The same session may have a sparse session-state event stream and a
+    # complete database transcript. Fill missing messages and usage from every
+    # source, matching turns by their stable id and then by ordinal position.
+    for source_summary, supplement in zip(sources[1:], parsed[1:]):
+        database_usage = source_summary.get("_kind") == "copilot-db"
+        result["name"] = result.get("name") if result.get("name") not in {None, "", result["id"]} else supplement.get("name", result["name"])
+        result["model"] = result.get("model") if result.get("model") not in {None, "", "model unavailable"} else supplement.get("model")
+        result["project"] = result.get("project") or supplement.get("project")
+        result["updated"] = max(result.get("updated", 0), supplement.get("updated", 0))
+        by_id = {str(turn.get("id")): turn for turn in result["turns"]}
+        for index, other in enumerate(supplement.get("turns", [])):
+            turn = by_id.get(str(other.get("id")))
+            if turn is None and index < len(result["turns"]):
+                turn = result["turns"][index]
+            if turn is None:
+                result["turns"].append(other)
+                continue
+            turn["user"] = turn.get("user") or other.get("user", "")
+            if not turn.get("assistant"):
+                turn["assistant"] = other.get("assistant", [])
+            if not turn.get("raw"):
+                turn["raw"] = other.get("raw", [])
+            for key in viewer.TOKEN_KEYS:
+                if database_usage and other.get("tokens", {}).get(key) is not None:
+                    turn["tokens"][key] = other["tokens"][key]
+                elif turn["tokens"].get(key) is None:
+                    turn["tokens"][key] = other.get("tokens", {}).get(key)
+        for key in viewer.TOKEN_KEYS:
+            if database_usage and supplement.get("tokens", {}).get(key) is not None:
+                result["tokens"][key] = supplement["tokens"][key]
+            elif result["tokens"].get(key) is None:
+                result["tokens"][key] = supplement.get("tokens", {}).get(key)
     viewer.subtract_cached_input(result)
     metadata = summary.get("_db_metadata")
     if isinstance(metadata, dict):

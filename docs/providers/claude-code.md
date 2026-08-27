@@ -35,7 +35,11 @@ cloud-backed Claude Chat history.
 
 ## Turns
 
-Records are grouped by turn identifiers such as `turn_id`, `turnId`, metadata turn IDs, `promptId`, or a user-record UUID fallback. A new user message after an existing populated turn starts a new logical turn, even when Claude reuses the same turn ID.
+Records are grouped by turn identifiers such as `turn_id`, `turnId`, metadata
+turn IDs, `promptId`, or a user-record UUID fallback. A new user message after
+an existing populated turn starts a new logical turn, even when Claude reuses
+the same turn ID. Usage is attached only when it occurs in a source record
+belonging to that turn.
 
 Tool activity is exposed separately:
 
@@ -45,6 +49,11 @@ Tool activity is exposed separately:
 - Tool results are shown as readable output rather than JSON user input.
 - Pure tool-result records are not treated as new user prompts.
 - Raw source records remain attached to the turn.
+
+Tool-use/tool-result pairs are represented as separate `kind: tool` turns.
+Tool-result records serialized with the `user` role are treated as tool output,
+not as new user prompts. Turns without persisted usage keep token fields
+unavailable; token counts are never estimated from text length.
 
 ## Tokens
 
