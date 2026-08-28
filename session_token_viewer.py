@@ -819,7 +819,9 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             steps = turn.get("steps") if isinstance(turn.get("steps"), list) else []
             if len(steps) > 1:
                 step_markup = '<div class="turn-steps"><div class="steps-label">Steps in this turn</div>' + "".join(
-                    f'<div class="turn-step"><span>Step {esc(step.get("index", step_index))}</span><div class="step-metrics">{token_cards(step.get("tokens", {}), "compact")}</div></div>'
+                    f'<div class="turn-step"><span>Step {esc(step.get("index", step_index))}'
+                    f'{" <span class=\"turn-kind\">Usage summary</span>" if step.get("kind") == "usage_summary" else ""}'
+                    f'</span><div class="step-metrics">{token_cards(step.get("tokens", {}), "compact")}</div></div>'
                     for step_index, step in enumerate(steps, 1) if isinstance(step, dict)
                 ) + '</div>'
             turns += f'''<article class="turn"><header><b>Turn {esc(turn_label)}</b>{f'<span class="step-count">{len(steps)} steps</span>' if len(steps) > 1 else ""}{kind_label}</header>
