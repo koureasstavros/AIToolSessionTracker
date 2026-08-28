@@ -1,6 +1,15 @@
+---
+language: ["en"]
+tags: ["ai", "tool", "model", "llm", "slm", "session", "tracker", "turn", "invocation"]
+license: "apache-2.0"
+version: v0.0.10
+---
+
 # AI Tool Session Explorer
 
 A local, read-only browser app for exploring AI coding-agent sessions, turns, content, raw events, and token usage.
+
+![AI Tool Session Tracker](material/ai_tool_session_tracker.png)
 
 ## Run
 
@@ -113,6 +122,8 @@ the session directory, and Copilot CLI removes related database rows.
 ## What the app displays
 
 The left-hand provider menu selects the data source. The session list then shows sessions for that provider.
+
+![AI Tool Session Tracker](material/sessions_invocations.png)
 
 ### Interface
 
