@@ -71,9 +71,27 @@ def details(summary: dict) -> dict:
     records = viewer.safe_json_lines(path)
     result["project"] = viewer.project_from_records(records)
     turns: dict[str, dict] = {}
-    tool_turns: dict[str, str] = {}
-    usage_turn_id = "__codex_usage_summary__"
-    current = ""
+    tool_calls: dict[str, tuple[dict, dict]] = {}
+    current_turn_id = ""
+    current_invocation: dict | None = None
+
+    def get_turn(turn_id: str | None = None) -> dict:
+        nonlocal current_turn_id
+        current_turn_id = str(turn_id or current_turn_id or f"turn-{len(turns) + 1}")
+        return turns.setdefault(current_turn_id, viewer.new_turn(current_turn_id))
+
+    def get_invocation(turn: dict) -> dict:
+        nonlocal current_invocation
+        if current_invocation is None:
+            current_invocation = {
+                "index": len(turn.setdefault("invocations", [])) + 1,
+                "tokens": viewer.blank_tokens(),
+                "tools": [],
+                "assistant": [],
+            }
+            turn["invocations"].append(current_invocation)
+        return current_invocation
+
     for record in records:
         payload = record.get("payload", record)
         if not isinstance(payload, dict):
@@ -85,54 +103,59 @@ def details(summary: dict) -> dict:
             metadata = {}
         turn_id = (payload.get("turn_id") or payload.get("turnId") or item.get("turn_id")
                    or metadata.get("turn_id") or record.get("promptId"))
+        event_type = record.get("type")
+        payload_type = payload.get("type")
+        if event_type in {"event_msg", "turn_context"} and payload_type in {"task_started", "task_complete"}:
+            turn_id = turn_id or payload.get("turn_id")
+        if turn_id and (payload_type == "task_started" or event_type == "turn_context"):
+            current_turn_id = str(turn_id)
+            current_invocation = None
         if not turn_id and record.get("type") == "user":
             turn_id = record.get("uuid")
-        if not turn_id and not current and record.get("type") in {"queue-operation", "attachment"}:
+        if not turn_id and not current_turn_id and record.get("type") in {"queue-operation", "attachment"}:
             continue
-        payload_type = payload.get("type")
         call_id = str(payload.get("call_id") or payload.get("callId") or "")
         role = payload.get("role") or message.get("role") or item.get("role")
-        if payload_type == "token_count":
-            # Codex reports usage in a separate event after a model response.
-            # It is not attributable to the last function call in a batch.
-            current = usage_turn_id
-        elif payload_type == "function_call":
-            current = f"{call_id or turn_id or len(turns)}:tool:{len(turns)}"
-            tool_turns[call_id] = current
-        elif payload_type == "function_call_output" and call_id in tool_turns:
-            current = tool_turns[call_id]
-        else:
-            # Session metadata, world state, and other header records do not
-            # represent a conversation turn. Do not create an empty turn for
-            # them before the first user/assistant event establishes current.
-            if not turn_id and not current and role not in {"user", "assistant", "model"}:
-                continue
-            current = str(turn_id or current or len(turns))
-        turn = turns.setdefault(current, viewer.new_turn(current))
+        relevant = (
+            role in {"user", "assistant", "model"}
+            or payload_type in {"function_call", "function_call_output", "token_count", "reasoning", "task_started", "task_complete"}
+            or event_type == "turn_context"
+        )
+        if not relevant or (not current_turn_id and not turn_id):
+            continue
+        turn = get_turn(str(turn_id) if turn_id else None)
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
-        if payload_type == "token_count":
-            turn["kind"] = "usage_summary"
-            if not turn["assistant"]:
-                turn["assistant"].append("Codex usage reported for the preceding model response; it is not attributable to an individual tool call.")
-        if payload_type in {"function_call", "function_call_output"}:
-            turn["kind"] = "tool"
-            if payload_type == "function_call":
-                arguments = payload.get("arguments", payload.get("input", {}))
-                turn.setdefault("tools", []).append({
+        info = payload.get("info") or {}
+        usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or (info.get("last_token_usage") if isinstance(info, dict) else {})
+        normalized_usage = viewer.usage_from(usage) if isinstance(usage, dict) else viewer.blank_tokens()
+        has_usage = any(value is not None for value in normalized_usage.values())
+        creates_invocation = (
+            payload_type in {"function_call", "function_call_output", "reasoning"}
+            or role in {"assistant", "model"}
+            or (payload_type == "token_count" and has_usage)
+        )
+        invocation = get_invocation(turn) if creates_invocation else None
+        if payload_type == "function_call":
+            arguments = payload.get("arguments", payload.get("input", {}))
+            tool = {
                     "id": call_id,
                     "name": payload.get("name", "unknown"),
                     "arguments": arguments,
                     "status": "started",
-                })
-            else:
-                output = payload.get("output", payload.get("result", ""))
-                tools = turn.setdefault("tools", [])
-                tool = next((entry for entry in tools if entry.get("id") == call_id), None)
-                if tool is None:
-                    tool = {"id": call_id, "name": "unknown"}
-                    tools.append(tool)
-                tool["status"] = "completed"
-                tool["result"] = output
+            }
+            turn.setdefault("tools", []).append(tool)
+            if invocation is not None:
+                invocation["tools"].append(tool)
+            tool_calls[call_id] = (turn, tool)
+        elif payload_type == "function_call_output":
+            owner_turn, tool = tool_calls.get(call_id, (turn, None))
+            if tool is None:
+                tool = {"id": call_id, "name": "unknown", "status": "started"}
+                owner_turn.setdefault("tools", []).append(tool)
+                if invocation is not None:
+                    invocation["tools"].append(tool)
+            tool["status"] = "completed"
+            tool["result"] = payload.get("output", payload.get("result", ""))
         content = payload.get("content") or message.get("content") or item.get("content") or payload.get("text") or item.get("text")
         if isinstance(content, list):
             content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
@@ -140,12 +163,20 @@ def details(summary: dict) -> dict:
             turn["user"] = str(content)
         elif content and role in {"assistant", "model"}:
             turn["assistant"].append(str(content))
-        info = payload.get("info") or {}
-        usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or (info.get("last_token_usage") if isinstance(info, dict) else {})
-        if isinstance(usage, dict):
-            for key, value in viewer.usage_from(usage).items():
-                if value is not None:
-                    turn["tokens"][key] = (turn["tokens"][key] or 0) + value
+            if invocation is not None:
+                invocation["assistant"].append(str(content))
+        for key, value in normalized_usage.items():
+            if value is not None:
+                turn["tokens"][key] = (turn["tokens"][key] or 0) + value
+                if invocation is not None:
+                    invocation["tokens"][key] = (invocation["tokens"][key] or 0) + value
+        if payload_type == "token_count" and has_usage:
+            # A token_count closes one model invocation. The next assistant
+            # message or tool batch begins a new invocation in this turn.
+            current_invocation = None
+        elif payload_type == "task_complete":
+            current_invocation = None
+            current_turn_id = ""
         if not result["model"] and payload.get("model"):
             result["model"] = payload["model"]
     if records and isinstance(records[0], dict):

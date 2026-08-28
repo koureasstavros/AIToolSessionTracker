@@ -31,25 +31,25 @@ account data.
 
 ## Turns
 
-Records are grouped by `turn_id`, `turnId`, nested item turn ID, `promptId`, or
-a record UUID fallback. User and assistant messages are assigned from their
-roles and readable content. A logical conversation turn is not guaranteed to
-have a usage record: Codex can persist text without token metadata.
+One user request is displayed as one logical turn. Records are associated using
+`turn_id`, `turnId`, nested item turn IDs, `promptId`, task boundaries, or a
+record UUID fallback. User and assistant messages are assigned from their roles
+and readable content.
 
-Codex function calls are handled specially:
+Within a turn, each model call is displayed as a numbered invocation. A
+`token_count` event closes the current invocation, and the next assistant
+message or tool batch begins another invocation. Multi-invocation and
+tool-using requests show the complete invocation breakdown. A single
+invocation without tools is not expanded
+separately because the same usage is already visible at turn level.
 
-- Each `function_call` creates a separate turn marked `kind: tool`.
-- The call's `call_id` pairs it with the matching `function_call_output`.
-- Tool input displays the function/tool name and arguments.
-- Tool output displays the returned result.
-- Parallel calls remain separate tool turns.
-- Raw records are retained on every turn.
+Codex function calls are grouped under their owning invocation:
 
-Each function call and its matching output is a separate `kind: tool` turn, not
-part of the parent assistant turn. Tool turns commonly have no token values.
-The parser does not copy response usage onto message or tool turns, so
-individual turns can show unavailable token values even when the session total
-is available.
+- `call_id` pairs each `function_call` with its `function_call_output`.
+- Parallel calls remain separate vertically listed tools within the same invocation.
+- Tool names, arguments, status, and stored results are available by expanding
+	the tool row.
+- Raw records remain attached to the logical turn.
 
 Metadata-only records such as initial queue/attachment records are not displayed as turns.
 
@@ -63,12 +63,12 @@ Usage is read primarily from `event_msg` records containing `token_count.info.la
 - `outputTokens`
 - `reasoningTokens`
 
-Totals are aggregated only from usage attached to parsed records/turns. Codex
-frequently stores usage for a model response or broader turn rather than for
-each individual function call. Therefore token information is not available
-on every turn, especially function-call turns, and missing values are not
-inferred or copied. Duplicating one usage record across every tool call would
-overcount totals.
+Each `token_count.info.last_token_usage` record supplies exact metrics for one
+invocation. Invocation metrics are grouped in the UI as **User / Input** and
+**Assistant / Output**, then summed into the logical turn and session totals.
+Token information is not attributed to individual tools because tool call and
+result records do not contain separate usage. Missing values are not inferred
+or copied; duplicating an invocation's usage across its tools would overcount totals.
 
 ## Empty-session rule
 

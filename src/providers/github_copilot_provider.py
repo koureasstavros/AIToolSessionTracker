@@ -43,6 +43,17 @@ def _read_session_state(folder: Path) -> dict:
     def get_turn(key: str) -> dict:
         return turns.setdefault(key, viewer.new_turn(key))
 
+    def get_invocation(turn: dict, index: int) -> dict:
+        invocations = turn.setdefault("invocations", [])
+        while len(invocations) < index:
+            invocations.append({
+                "index": len(invocations) + 1,
+                "tokens": viewer.blank_tokens(),
+                "tools": [],
+                "assistant": [],
+            })
+        return invocations[index - 1]
+
     for event in records:
         data = event.get("data") or {}
         if not isinstance(data, dict):
@@ -67,27 +78,37 @@ def _read_session_state(folder: Path) -> dict:
                 turn["user"] = str(data.get("content", ""))
         elif event_type == "assistant.message":
             turn = get_turn(interaction_id)
-            turn["_event_step_count"] = turn.get("_event_step_count", 0) + 1
+            turn["_event_invocation_count"] = turn.get("_event_invocation_count", 0) + 1
+            invocation = get_invocation(turn, turn["_event_invocation_count"])
             if data.get("content"):
                 turn["assistant"].append(str(data["content"]))
+                invocation["assistant"].append(str(data["content"]))
             viewer.add_token_usage(turn["tokens"], data)
+            viewer.add_token_usage(invocation["tokens"], data)
             value = viewer.number(data.get("outputTokens"))
             if value is not None:
                 output_total += value
         elif event_type == "tool.execution_start":
-            turn.setdefault("tools", []).append({
+            invocation_index = max(turn.get("_event_invocation_count", 0), 1)
+            invocation = get_invocation(turn, invocation_index)
+            tool = {
                 "id": data.get("toolCallId"),
                 "name": data.get("toolName") or "unknown",
                 "arguments": data.get("arguments"),
                 "status": "started",
-            })
+                "_invocation_index": invocation_index,
+            }
+            turn.setdefault("tools", []).append(tool)
+            invocation["tools"].append(tool)
         elif event_type == "tool.execution_complete":
             tool_id = data.get("toolCallId")
             tools = turn.setdefault("tools", [])
             tool = next((item for item in tools if item.get("id") == tool_id), None)
             if tool is None:
-                tool = {"id": tool_id, "name": data.get("toolName") or "unknown"}
+                invocation_index = max(turn.get("_event_invocation_count", 0), 1)
+                tool = {"id": tool_id, "name": data.get("toolName") or "unknown", "_invocation_index": invocation_index}
                 tools.append(tool)
+                get_invocation(turn, invocation_index)["tools"].append(tool)
             tool["status"] = "completed" if data.get("success", True) else "failed"
             if data.get("result"):
                 tool["result"] = data["result"]
@@ -173,7 +194,10 @@ def _read_chat(path: Path) -> dict:
         )
         for usage_source in (request, metadata):
             for key, value in viewer.usage_from(usage_source).items():
-                if value is not None:
+                # request.promptTokens/completionTokens are aggregate turn
+                # totals. metadata.promptTokens/outputTokens describe the
+                # final model round and must not overwrite those aggregates.
+                if value is not None and turn["tokens"].get(key) is None:
                     turn["tokens"][key] = value
         if (not turn["assistant"]
             and turn["tokens"]["outputTokens"] is None
@@ -181,34 +205,65 @@ def _read_chat(path: Path) -> dict:
             and turn["tokens"]["inputTokens"] is None):
             continue
         turn["raw"].append(json.dumps(request, indent=2, ensure_ascii=False))
+        rounds = metadata.get("toolCallRounds") if isinstance(metadata.get("toolCallRounds"), list) else []
+        tool_results = metadata.get("toolCallResults") if isinstance(metadata.get("toolCallResults"), dict) else {}
+        if rounds:
+            turn["invocations"] = []
+            for round_index, round_data in enumerate(rounds, 1):
+                if not isinstance(round_data, dict):
+                    continue
+                invocation = {
+                    "index": round_index,
+                    "tokens": viewer.blank_tokens(),
+                    "tools": [],
+                    "assistant": [str(round_data["response"])] if round_data.get("response") else [],
+                }
+                for call in round_data.get("toolCalls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    call_id = str(call.get("id") or call.get("toolCallId") or "")
+                    tool = {
+                        "id": call_id,
+                        "name": call.get("name") or "unknown",
+                        "arguments": call.get("arguments"),
+                        "status": "completed" if call_id in tool_results else "recorded",
+                    }
+                    if call_id in tool_results:
+                        tool["result"] = tool_results[call_id]
+                    invocation["tools"].append(tool)
+                    turn.setdefault("tools", []).append(tool)
+                turn["invocations"].append(invocation)
+            # VS Code stores exact prompt/output values for the final model
+            # round separately from aggregate request completionTokens.
+            if turn["invocations"]:
+                final_tokens = turn["invocations"][-1]["tokens"]
+                final_tokens["inputTokens"] = viewer.number(metadata.get("promptTokens"))
+                final_tokens["outputTokens"] = viewer.number(metadata.get("outputTokens"))
+        else:
+            for response_item in response:
+                if not isinstance(response_item, dict) or response_item.get("kind") != "toolInvocationSerialized":
+                    continue
+                tool_id = response_item.get("toolId") or response_item.get("toolCallId") or "unknown"
+                invocation = response_item.get("invocationMessage") or response_item.get("pastTenseMessage") or ""
+                if isinstance(invocation, dict):
+                    invocation = invocation.get("value") or ""
+                tool = {
+                    "id": response_item.get("toolCallId"),
+                    "name": tool_id,
+                    "arguments": response_item.get("toolSpecificData") or invocation or None,
+                    "status": "completed",
+                }
+                turn.setdefault("tools", []).append(tool)
+            if turn.get("tools"):
+                turn["invocations"] = [{
+                    "index": 1,
+                    "tokens": viewer.blank_tokens(),
+                    "tools": turn["tools"],
+                    "assistant": list(turn["assistant"]),
+                }]
         session["turns"].append(turn)
         for key in ("inputTokens", "outputTokens"):
             session["tokens"][key] = (session["tokens"][key] or 0) + (turn["tokens"][key] or 0)
-        tool_index = 0
-        for response_item in response:
-            if not isinstance(response_item, dict) or response_item.get("kind") != "toolInvocationSerialized":
-                continue
-            tool_index += 1
-            tool_turn = viewer.new_turn(f"{request.get('requestId') or index}:tool:{tool_index}")
-            tool_turn["kind"] = "tool"
-            tool_turn["raw"].append(json.dumps(response_item, indent=2, ensure_ascii=False))
-            tool_id = response_item.get("toolId") or response_item.get("toolCallId") or "unknown"
-            invocation = response_item.get("invocationMessage") or response_item.get("pastTenseMessage") or ""
-            if isinstance(invocation, dict):
-                invocation = invocation.get("value") or ""
-            tool_turn["assistant"].append(f"Tool: {tool_id}\n{invocation}".strip())
-            details = response_item.get("resultDetails")
-            if isinstance(details, dict):
-                output = details.get("output")
-                if output:
-                    rendered = []
-                    for item in output if isinstance(output, list) else [output]:
-                        if isinstance(item, dict):
-                            rendered.append(str(item.get("value") or item.get("text") or json.dumps(item, ensure_ascii=False)))
-                        else:
-                            rendered.append(str(item))
-                    tool_turn["assistant"].append("Tool output:\n" + "\n".join(rendered))
-            session["turns"].append(tool_turn)
     session["model"] = str(next((request.get("modelId") for request in requests if request.get("modelId")), "model unavailable"))
     return session
 
@@ -239,24 +294,24 @@ def _read_db(session_id: str, db_path: Path) -> dict:
     for index, *values in usage:
         by_turn.setdefault(index or 0, []).append(dict(zip(viewer.TOKEN_KEYS, values)))
     for index, user, assistant in turns:
-        steps = by_turn.get(index) or [{key: 0 for key in viewer.TOKEN_KEYS}]
+        invocations = by_turn.get(index) or [{key: 0 for key in viewer.TOKEN_KEYS}]
         # Several assistant_usage_events rows can belong to one logical turn.
-        # Keep one UI turn card and retain the individual usage rows as steps
+        # Keep one UI turn card and retain the individual usage rows as invocations
         # inside it instead of presenting every row as a separate conversation.
         turn = viewer.new_turn(str(index))
         turn["user"] = user or ""
         turn["assistant"] = [assistant] if assistant else []
-        turn["turn_index"], turn["step_count"] = index, len(steps)
-        turn["steps"] = []
-        for step, tokens in enumerate(steps, 1):
+        turn["turn_index"], turn["invocation_count"] = index, len(invocations)
+        turn["invocations"] = []
+        for invocation_index, tokens in enumerate(invocations, 1):
             normalized_tokens = {
                 key: value if isinstance(value, int) else 0
                 for key, value in tokens.items()
             }
-            turn["steps"].append({"index": step, "tokens": normalized_tokens})
+            turn["invocations"].append({"index": invocation_index, "tokens": normalized_tokens})
             for key, value in normalized_tokens.items():
                 turn["tokens"][key] = (turn["tokens"][key] or 0) + value
-            turn["raw"].append(json.dumps({"user": user, "assistant": assistant, "step": step, "tokens": normalized_tokens}, ensure_ascii=False))
+            turn["raw"].append(json.dumps({"user": user, "assistant": assistant, "invocation": invocation_index, "tokens": normalized_tokens}, ensure_ascii=False))
         if not turn["user"] and not turn["assistant"]:
             turn["kind"] = "usage_summary"
         session["turns"].append(turn)
@@ -265,22 +320,22 @@ def _read_db(session_id: str, db_path: Path) -> dict:
     # Keep those records as synthetic turns so they can supplement the content
     # parsed from the other source during multi-source merging.
     known_indices = {turn.get("turn_index") for turn in session["turns"]}
-    for index, steps in by_turn.items():
+    for index, invocations in by_turn.items():
         if index in known_indices:
             continue
         turn = viewer.new_turn(str(index))
         turn["kind"] = "usage_summary"
-        turn["turn_index"], turn["step_count"] = index, len(steps)
-        turn["steps"] = []
-        for step, tokens in enumerate(steps, 1):
+        turn["turn_index"], turn["invocation_count"] = index, len(invocations)
+        turn["invocations"] = []
+        for invocation_index, tokens in enumerate(invocations, 1):
             normalized_tokens = {
                 key: value if isinstance(value, int) else 0
                 for key, value in tokens.items()
             }
-            turn["steps"].append({"index": step, "kind": "usage_summary", "tokens": normalized_tokens})
+            turn["invocations"].append({"index": invocation_index, "kind": "usage_summary", "tokens": normalized_tokens})
             for key, value in normalized_tokens.items():
                 turn["tokens"][key] = (turn["tokens"][key] or 0) + value
-            turn["raw"].append(json.dumps({"source": "assistant_usage_events", "turn_index": index, "step": step, "tokens": normalized_tokens}, ensure_ascii=False))
+            turn["raw"].append(json.dumps({"source": "assistant_usage_events", "turn_index": index, "invocation": invocation_index, "tokens": normalized_tokens}, ensure_ascii=False))
         session["turns"].append(turn)
     for key in viewer.TOKEN_KEYS:
         values = [turn["tokens"][key] for turn in session["turns"]]
@@ -416,17 +471,17 @@ def details(summary: dict) -> dict:
             # those API calls in one user interaction. The event stream owns
             # interaction boundaries; assistant-message counts identify which
             # ordered database usage rows belong to each interaction.
-            database_steps = [
-                step
+            database_invocations = [
+                invocation
                 for database_turn in supplement.get("turns", [])
-                for step in (database_turn.get("steps") or [])
-                if isinstance(step, dict)
+                for invocation in (database_turn.get("invocations") or [])
+                if isinstance(invocation, dict)
             ]
-            event_step_counts = [
-                turn.get("_event_step_count", 0)
+            event_invocation_counts = [
+                turn.get("_event_invocation_count", 0)
                 for turn in result["turns"]
             ]
-            if database_steps and sum(event_step_counts) == len(database_steps):
+            if database_invocations and sum(event_invocation_counts) == len(database_invocations):
                 issue = (
                     "Copilot session-store.db usage rows were grouped using "
                     "the interaction boundaries from events.jsonl."
@@ -434,18 +489,22 @@ def details(summary: dict) -> dict:
                 result["_db_issue"] = issue
                 viewer.LOGGER.warning("%s Session %s", issue, result["id"])
                 offset = 0
-                for index, (turn, step_count) in enumerate(zip(result["turns"], event_step_counts)):
-                    steps = [dict(step) for step in database_steps[offset:offset + step_count]]
-                    offset += step_count
-                    for step_index, step in enumerate(steps, 1):
-                        step["index"] = step_index
-                        step.pop("kind", None)
-                    turn["steps"] = steps
-                    turn["step_count"] = step_count
+                for index, (turn, invocation_count) in enumerate(zip(result["turns"], event_invocation_counts)):
+                    invocations = [dict(invocation) for invocation in database_invocations[offset:offset + invocation_count]]
+                    offset += invocation_count
+                    for invocation_index, invocation in enumerate(invocations, 1):
+                        invocation["index"] = invocation_index
+                        invocation.pop("kind", None)
+                        invocation["tools"] = [
+                            tool for tool in turn.get("tools", [])
+                            if tool.get("_invocation_index") == invocation_index
+                        ]
+                    turn["invocations"] = invocations
+                    turn["invocation_count"] = invocation_count
                     turn["turn_index"] = index
                     turn["tokens"] = viewer.blank_tokens()
-                    for step in steps:
-                        for key, value in step.get("tokens", {}).items():
+                    for invocation in invocations:
+                        for key, value in invocation.get("tokens", {}).items():
                             turn["tokens"][key] = (turn["tokens"][key] or 0) + value
                 for key in viewer.TOKEN_KEYS:
                     if supplement.get("tokens", {}).get(key) is not None:
@@ -465,18 +524,18 @@ def details(summary: dict) -> dict:
             if not turn.get("raw"):
                 turn["raw"] = other.get("raw", [])
             # A session-state transcript can provide the same logical turn
-            # without the database usage-step metadata. Preserve that
+            # without the database usage-invocation metadata. Preserve that
             # metadata when the database representation is merged into it;
             # otherwise the first request is rendered as an unnumbered turn
-            # while only the later request appears as "Step 2 of 2".
-            for key in ("turn_index", "step", "step_count"):
+            # while only the later request appears as "Invocation 2 of 2".
+            for key in ("turn_index", "invocation", "invocation_count"):
                 if other.get(key) is not None:
                     turn[key] = other[key]
-            if database_usage and isinstance(other.get("steps"), list):
-                turn["steps"] = [dict(step) for step in other["steps"] if isinstance(step, dict)]
+            if database_usage and isinstance(other.get("invocations"), list):
+                turn["invocations"] = [dict(invocation) for invocation in other["invocations"] if isinstance(invocation, dict)]
                 if turn.get("user") or turn.get("assistant"):
-                    for step in turn["steps"]:
-                        step.pop("kind", None)
+                    for invocation in turn["invocations"]:
+                        invocation.pop("kind", None)
             for key in viewer.TOKEN_KEYS:
                 if database_usage and other.get("tokens", {}).get(key) is not None:
                     turn["tokens"][key] = other["tokens"][key]

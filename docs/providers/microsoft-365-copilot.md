@@ -37,7 +37,7 @@ If the export contains tool-call or tool-result records in a supported structure
 
 Turn boundaries depend on the export schema. The provider does not invent turns
 from message length or split a generic assistant message into provider-specific
-steps. Tool events are not guaranteed to become separate display turns unless
+invocations. Tool events are not guaranteed to become separate display turns unless
 the export exposes them in a supported structure.
 
 ## Tokens

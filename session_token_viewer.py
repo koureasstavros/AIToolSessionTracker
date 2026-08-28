@@ -1,4 +1,4 @@
-"""Local viewer for GitHub Copilot session-state folders.
+"""Local viewer for AI Tool Sessions.
 
 Run with: python session_token_viewer.py
 Then open http://127.0.0.1:8765 in a browser.
@@ -45,6 +45,7 @@ PROVIDERS = {
     "claude": "Anthropic Claude Code",
     "m365_copilot": "Microsoft 365 Copilot",
 }
+APP_NAME = "AI Tool Session Explorer"
 PROVIDER_ADAPTERS = {
     "copilot": github_copilot_provider,
     "codex": openai_codex_provider,
@@ -175,7 +176,14 @@ def add_token_usage(tokens: dict[str, int | None], source: dict) -> None:
 
 def subtract_cached_input(session: dict) -> None:
     """Convert total input into uncached input when cache usage is reported."""
-    for tokens in [session.get("tokens", {})] + [turn.get("tokens", {}) for turn in session.get("turns", [])]:
+    turn_tokens = [turn.get("tokens", {}) for turn in session.get("turns", [])]
+    invocation_tokens = [
+        invocation.get("tokens", {})
+        for turn in session.get("turns", [])
+        for invocation in turn.get("invocations", [])
+        if isinstance(invocation, dict)
+    ]
+    for tokens in [session.get("tokens", {})] + turn_tokens + invocation_tokens:
         input_tokens = tokens.get("inputTokens")
         cache_read = tokens.get("cacheReadTokens")
         cache_write = tokens.get("cacheWriteTokens")
@@ -706,8 +714,26 @@ def esc(value: object, quote: bool = True) -> str:
 
 def token_cards(tokens: dict[str, int | None], extra_class: str = "") -> str:
     return "".join(
-        f'<div class="metric {extra_class}"><span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))}</strong></div>'
+        f'<div class="metric {extra_class}" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))}</strong></div>'
         for key in TOKEN_KEYS
+    )
+
+
+def invocation_token_cards(tokens: dict[str, int | None]) -> str:
+    """Render per-invocation usage grouped by the side of the model exchange."""
+    def cards(keys: tuple[str, ...]) -> str:
+        return "".join(
+            f'<div class="metric compact" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))}</strong></div>'
+            for key in keys
+        )
+
+    return (
+        '<div class="invocation-usage">'
+        '<section class="invocation-metric-group input-group"><div class="invocation-group-title"><span>U</span>User / input</div>'
+        f'<div class="invocation-metrics">{cards(("inputTokens", "cacheReadTokens", "cacheWriteTokens"))}</div></section>'
+        '<section class="invocation-metric-group output-group"><div class="invocation-group-title"><span>AI</span>Assistant / output</div>'
+        f'<div class="invocation-metrics">{cards(("outputTokens", "reasoningTokens"))}</div></section>'
+        '</div>'
     )
 
 
@@ -723,10 +749,36 @@ def turn_token_cards(tokens: dict[str, int | None], session_id: str, provider: s
             "metric": key,
         }), quote=True)
         cards.append(
-            f'<a class="metric compact clickable {"active" if active else ""}" href="{href}">'
+            f'<a class="metric compact clickable {"active" if active else ""}" data-metric="{esc(key)}" href="{href}">'
             f'<span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))}</strong></a>'
         )
     return "".join(cards)
+
+
+def invocation_tools(invocation: dict) -> str:
+    """Render the tool calls that belong to one model invocation."""
+    tools = invocation.get("tools") if isinstance(invocation.get("tools"), list) else []
+    if not tools:
+        return '<div class="invocation-no-tools">Model response · no tool calls</div>'
+    rendered = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name") or "unknown"
+        status = tool.get("status") or "unknown"
+        sections = []
+        for label, field in (("Arguments", "arguments"), ("Result", "result")):
+            value = tool.get(field)
+            if value is None:
+                continue
+            text = value if isinstance(value, str) else json.dumps(value, indent=2, ensure_ascii=False)
+            sections.append(f'<div class="tool-payload"><b>{label}</b><pre>{esc(text)}</pre></div>')
+        rendered.append(
+            f'<details class="invocation-tool"><summary><span class="tool-name">{esc(name)}</span>'
+            f'<span class="tool-status {esc(status)}">{esc(status)}</span></summary>'
+            f'<div class="invocation-tool-body">{"".join(sections) or "No stored arguments or result."}</div></details>'
+        )
+    return '<div class="invocation-tools">' + "".join(rendered) + '</div>'
 
 
 def explorer_content(turn: dict, metric: str | None) -> tuple[str, str, str]:
@@ -764,7 +816,7 @@ def render_session_row(item: dict, provider: str, selected: bool, show_empty: bo
     )
     return (
         f'<div class="session-row"><a class="session session-link {"selected" if selected else ""}" href="/?{query}">'
-        f'<span class="dot"></span><span><b>{esc(label)}</b>{id_detail}{metadata}</span></a>'
+        f'<span class="session-glyph" aria-hidden="true">{esc(str(label)[:1].upper() or "S")}</span><span class="session-copy"><b>{esc(label)}</b>{id_detail}{metadata}</span></a>'
         f'<form method="post" action="/delete" onsubmit="return confirm(\'Delete this conversation and its stored data?\');">'
         f'<input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}">'
         f'<input type="hidden" name="session" value="{esc(item["id"])}">'
@@ -782,7 +834,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     chosen_summary = next((item for item in sessions if item["id"] == selected), None) if selected else None
     chosen = load_session_details(chosen_summary, provider) if chosen_summary else None
     provider_menu = "".join(
-        f'<a class="provider {"selected" if provider == key else ""}" href="/?{esc(urlencode({"provider": key, "show_empty": int(show_empty)}), quote=True)}">{esc(label)}</a>'
+        f'<a class="provider {"selected" if provider == key else ""}" data-provider="{esc(key)}" href="/?{esc(urlencode({"provider": key, "show_empty": int(show_empty)}), quote=True)}"><span class="provider-mark" aria-hidden="true"></span><span>{esc(label)}</span></a>'
         for key, label in PROVIDERS.items()
     )
     session_rows = "".join(
@@ -794,8 +846,13 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         for index, turn in enumerate(chosen["turns"], start=1):
             assistant = "\n\n".join(turn["assistant"]) or "(no assistant text)"
             tools = turn.get("tools") if isinstance(turn.get("tools"), list) else []
+            invocations = turn.get("invocations") if isinstance(turn.get("invocations"), list) else []
+            tools_are_nested = any(
+                isinstance(invocation, dict) and isinstance(invocation.get("tools"), list) and invocation["tools"]
+                for invocation in invocations
+            )
             tool_markup_parts = []
-            for tool in tools:
+            for tool in ([] if tools_are_nested else tools):
                 if not isinstance(tool, dict):
                     continue
                 details = ""
@@ -815,52 +872,62 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             )
             turn_label = turn.get("turn_index", index)
             raw_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"], "turn": index, "raw": 1}), quote=True)
-            step_markup = ""
-            steps = turn.get("steps") if isinstance(turn.get("steps"), list) else []
-            if len(steps) > 1:
-                step_markup = '<div class="turn-steps"><div class="steps-label">Steps in this turn</div>' + "".join(
-                    f'<div class="turn-step"><span>Step {esc(step.get("index", step_index))}'
-                    f'{" <span class=\"turn-kind\">Usage summary</span>" if step.get("kind") == "usage_summary" else ""}'
-                    f'</span><div class="step-metrics">{token_cards(step.get("tokens", {}), "compact")}</div></div>'
-                    for step_index, step in enumerate(steps, 1) if isinstance(step, dict)
-                ) + '</div>'
-            turns += f'''<article class="turn"><header><b>Turn {esc(turn_label)}</b>{f'<span class="step-count">{len(steps)} steps</span>' if len(steps) > 1 else ""}{kind_label}</header>
-                <div class="message user"><label>User</label><p>{esc(turn["user"] or "(no user message)")}</p></div>
-                <div class="message assistant"><label>Assistant</label><p>{esc(assistant)}</p></div>
+            invocation_markup = ""
+            show_invocation_breakdown = len(invocations) > 1 or tools_are_nested
+            if show_invocation_breakdown:
+                invocation_markup = '<details class="turn-invocations" open><summary><span>Model invocations</span><span class="summary-count">' + str(len(invocations)) + '</span></summary><div class="invocations-list">' + "".join(
+                    f'<div class="turn-invocation"><span class="invocation-name"><i></i>Invocation {esc(invocation.get("index", invocation_index))}'
+                    f'{" <span class=\"turn-kind\">Usage summary</span>" if invocation.get("kind") == "usage_summary" else ""}'
+                    f'</span><div class="invocation-content">{invocation_tools(invocation)}{invocation_token_cards(invocation.get("tokens", {}))}</div></div>'
+                    for invocation_index, invocation in enumerate(invocations, 1) if isinstance(invocation, dict)
+                ) + '</div></details>'
+            invocation_label = f'{len(invocations)} {"invocation" if len(invocations) == 1 else "invocations"}'
+            tool_label = f'{len(tools)} {"tool" if len(tools) == 1 else "tools"}'
+            turns += f'''<article class="turn" id="turn-{index}"><header><div class="turn-number"><span>{index:02d}</span><div><b>Turn {esc(turn_label)}</b><small>{tool_label} · {invocation_label}</small></div></div><div class="turn-badges">{f'<span class="invocation-count">{invocation_label}</span>' if show_invocation_breakdown else ""}{kind_label}</div></header>
+                <div class="message user"><div class="role"><span aria-hidden="true">U</span><label>User</label></div><p>{esc(turn["user"] or "(no user message)")}</p></div>
+                <div class="message assistant"><div class="role"><span aria-hidden="true">AI</span><label>Assistant</label></div><p>{esc(assistant)}</p></div>
                 {tool_markup}
-                {step_markup}
-                <div class="turn-metrics">{turn_token_cards(turn["tokens"], chosen["id"], provider, index, selected_turn, selected_metric, show_empty)}</div>
-                <a class="show-raw clickable" href="{raw_url}">Show Raw</a></article>'''
+                {invocation_markup}
+                <div class="turn-footer"><div class="turn-metrics">{turn_token_cards(turn["tokens"], chosen["id"], provider, index, selected_turn, selected_metric, show_empty)}</div>
+                <a class="show-raw clickable" href="{raw_url}"><span aria-hidden="true">&lt;/&gt;</span>View raw event data <span class="raw-arrow" aria-hidden="true">→</span></a></div></article>'''
     detail = ""
     if chosen:
-        turn_note = " · input/cache/reasoning values estimated from session totals" if len(chosen["turns"]) > 1 else ""
+        turn_note = " · input/cache/reasoning values estimated from session totals" if provider == "copilot" and len(chosen["turns"]) > 1 else ""
         refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"]}), quote=True)
         selected_content_turn = chosen["turns"][selected_turn - 1] if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else {}
         if selected_raw:
             explorer_title, explorer_text, explorer_raw = "Raw event data", "", "\n\n".join(selected_content_turn.get("raw", []))
         else:
             explorer_title, explorer_text, explorer_raw = explorer_content(selected_content_turn, selected_metric)
-        detail = f'''<section class="detail"><div class="eyebrow">{esc(PROVIDERS.get(provider, provider).upper())}</div><div class="detail-heading"><div><h1>{esc(chosen["name"])}</h1>
-            <div class="session-header-metadata"><span>Session:</span> {esc(chosen["id"])} <span>·</span> <span>Tool:</span> {esc(session_tool(chosen_summary, provider))} <span>·</span> <span>Timestamp:</span> {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))} <span>·</span> <span>Model:</span> {esc(chosen["model"] or "unavailable")}</div>
-            <div class="session-header-project"><span>Project Source:</span> {esc(chosen.get("project") or "unavailable")}</div>
-            </div><div class="detail-actions"><a class="detail-refresh clickable" href="{refresh_conversation_url}">Refresh conversation</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
+        invocation_total = sum(len(turn.get("invocations", [])) for turn in chosen["turns"] if isinstance(turn.get("invocations"), list))
+        # Reasoning tokens are already included in output tokens, so they are
+        # not added again in the headline total.
+        token_total = sum(
+            chosen["tokens"].get(key) or 0
+            for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens")
+        )
+        close_explorer_url = refresh_conversation_url
+        detail = f'''<main class="detail"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>{esc(PROVIDERS.get(provider, provider))}</div><h1>{esc(chosen["name"])}</h1>
+            <div class="header-chips"><span>{esc(session_tool(chosen_summary, provider))}</span><span>{esc(chosen["model"] or "Model unavailable")}</span><span>{esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span></div>
+            </div><div class="detail-actions"><a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
             <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
-            <button type="submit">Delete conversation</button></form></div></div>
-            <div class="source-location"><span>Information Source:</span> {esc(chosen.get("source") or "unknown")}{f'<br><span>Provider note:</span> {esc(chosen["_db_issue"])}' if chosen.get("_db_issue") else ""}</div>
-            <h2>Session token totals</h2><div class="metrics">{token_cards(chosen["tokens"])}</div>
-            <h2>Turns <span class="muted">{len(chosen["turns"])}{esc(turn_note)}</span></h2>
-            <div class="content-layout"><div class="turns">{turns or '<div class="empty">No turn events found.</div>'}</div>
-            <aside class="explorer"><div class="explorer-header"><div class="eyebrow">CONTENT EXPLORER</div><h2>{esc(explorer_title)}</h2></div><div class="explorer-body">{f'<p>{esc(explorer_text)}</p>' if explorer_text else ''}{f'<pre>{esc(explorer_raw)}</pre>' if explorer_raw and selected_raw else ''}</div></aside></div></section>'''
+            <button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form></div></header>
+            <section class="session-facts"><div><span>Session ID</span><code>{esc(chosen["id"])}</code></div><div><span>Project</span><code>{esc(chosen.get("project") or "Unavailable")}</code></div><div><span>Source</span><code>{esc(chosen.get("source") or "Unknown")}</code></div></section>
+            {f'<div class="provider-note"><b>Provider note</b>{esc(chosen["_db_issue"])}</div>' if chosen.get("_db_issue") else ""}
+            <section class="overview"><div class="section-heading"><div><span class="section-kicker">OVERVIEW</span><h2>Session usage</h2></div><div class="overview-stats"><span><b>{len(chosen["turns"])}</b> turns</span><span><b>{invocation_total}</b> invocations</span><span><b>{fmt(token_total)}</b> tokens</span></div></div><div class="metrics">{token_cards(chosen["tokens"])}</div></section>
+            <section class="conversation"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Conversation turns</h2></div><span class="muted">{len(chosen["turns"])} turns{esc(turn_note)}</span></div>
+            <div class="content-layout"><div class="turns">{turns or '<div class="empty"><b>No turns yet</b><span>No conversation events were found for this session.</span></div>'}</div>
+            <aside class="explorer {"is-active" if selected_turn else ""}"><div class="explorer-header"><div><span class="section-kicker">INSPECTOR</span><h2>{esc(explorer_title)}</h2></div><a href="{close_explorer_url}" class="explorer-close" aria-label="Close inspector">×</a></div><div class="explorer-body">{f'<p>{esc(explorer_text)}</p>' if explorer_text else ''}{f'<pre>{esc(explorer_raw)}</pre>' if explorer_raw and selected_raw else ''}</div></aside></div></section></main>'''
     else:
         if sessions:
-            detail = '<section class="detail no-sessions"><h1>Select a session</h1><p>Choose a conversation from the sidebar to view its turns, tokens, and content.</p></section>'
+            detail = '<main class="detail no-sessions"><div class="empty-hero"><span class="hero-icon">↗</span><span class="section-kicker">__APP_NAME__</span><h1>Select a session</h1><p>Choose a conversation to inspect its turns, model invocations, token usage, tools, and raw events.</p></div></main>'
         else:
-            detail = '<section class="detail no-sessions"><h1>No sessions found</h1><p>Choose a folder containing session subfolders with events.jsonl files.</p></section>'
+            detail = '<main class="detail no-sessions"><div class="empty-hero"><span class="hero-icon">○</span><span class="section-kicker">__APP_NAME__</span><h1>No sessions found</h1><p>No local conversations were found for this provider. Try showing empty sessions or refresh the source.</p></div></main>'
 
     refresh_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty)}), quote=True)
     toggle_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(not show_empty)}), quote=True)
     toggle = f'<a class="empty-toggle" href="{toggle_url}">{"Hide" if show_empty else "Show"} empty</a>'
-    return PAGE.replace("__PROVIDER_MENU__", provider_menu).replace("__SESSION_ROWS__", session_rows).replace("__DETAIL__", detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", toggle).replace("__ROOT__", esc(provider_path(root, provider)))
+    return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__PROVIDER_MENU__", provider_menu).replace("__SESSION_ROWS__", session_rows).replace("__SESSION_COUNT__", str(len(sessions))).replace("__DETAIL__", detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", toggle).replace("__ROOT__", esc(provider_path(root, provider)))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -946,7 +1013,7 @@ def main() -> None:
         server.server_close()
 
 
-PAGE = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Session Token Viewer</title><style>
+PAGE = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>__APP_NAME__</title><style>
 :root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#e7edf7;background:#0b1220}*{box-sizing:border-box}body{margin:0}.app{display:grid;grid-template-columns:340px 1fr;min-height:100vh}.sidebar{padding:28px 18px;background:#111b2d;border-right:1px solid #22304a}.brand{font-size:20px;font-weight:750;margin:0 10px 8px}.path{font-size:11px;color:#8fa2bf;margin:0 10px 24px;word-break:break-all}.provider-menu{display:grid;gap:4px;margin:0 0 25px}.provider{display:block;padding:9px 10px;color:#b8c9df;text-decoration:none;border-radius:8px;font-size:13px}.provider:hover,.provider.selected{background:#24558a;color:#fff}.count{font-size:11px;color:#8194b0;text-transform:uppercase;letter-spacing:1px;margin:0 10px 8px}.session-row{display:flex;align-items:stretch;gap:4px}.session-row form{display:flex;align-items:center;width:30px;flex:0 0 30px}.session{display:flex;flex:1;gap:11px;align-items:flex-start;padding:12px 10px;margin:3px 0;color:#cfdaea;text-decoration:none;border-radius:9px;min-width:0}.session:hover,.session.selected{background:#1b2b46}.session b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:250px}.session small{display:block;color:#8297b5;font-size:10px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.session .session-meta{color:#6380a2;font-size:9px;margin-top:3px}.delete-session{width:30px;height:30px;border:0;background:transparent;color:#7188a6;border-radius:6px;font-size:19px;line-height:1;padding:0;cursor:pointer}.delete-session:hover{background:#5b2534;color:#ffb4c0}.dot{width:7px;height:7px;background:#5ca8ff;border-radius:50%;margin-top:5px;flex:none}.detail{max-width:1500px;width:100%;padding:42px 4vw}.eyebrow{font-size:11px;letter-spacing:2px;color:#68b5ff;font-weight:700}h1{font-size:32px;margin:7px 0}.id{font:12px ui-monospace,monospace;color:#8094b2}.id span{padding:0 8px;color:#405576}h2{font-size:15px;margin:34px 0 12px}.muted{font-size:12px;color:#7890b1;font-weight:400}.metrics,.turn-metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}.metric{padding:15px;background:#121f34;border:1px solid #223753;border-radius:10px}.metric span{display:block;color:#91a5c3;font-size:11px}.metric strong{display:block;font-size:21px;margin-top:7px;color:#f0f6ff}.turn{background:#101c30;border:1px solid #223753;border-radius:12px;margin:12px 0;overflow:hidden}.turn header{padding:12px 16px;background:#15243b;font-size:13px}.message{padding:13px 16px;border-top:1px solid #1e304a}.message label{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#7fa6d2}.message p{white-space:pre-wrap;line-height:1.5;font-size:13px;margin:7px 0 0;color:#d4dfef}.message.user p{color:#abc7e8}.turn-metrics{padding:12px 16px;border-top:1px solid #1e304a}.metric.compact{padding:9px 10px}.clickable{display:block;color:inherit;text-decoration:none}.clickable:hover,.clickable.active{border-color:#59aaff;background:#18365a}.content-layout{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:22px;align-items:start}.explorer{position:sticky;top:24px;margin-top:12px;padding:18px;background:#111f34;border:1px solid #2c4666;border-radius:12px}.explorer h2{margin:8px 0 12px}.explorer p{white-space:pre-wrap;color:#c9d8eb;line-height:1.5;font-size:13px;margin:0}.explorer details{margin-top:18px;border-top:1px solid #2c4666;padding-top:12px}.explorer summary{cursor:pointer;color:#68b5ff;font-size:12px}.explorer pre{max-height:520px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#b9c9dd;font:10px ui-monospace,monospace;line-height:1.4}.empty{color:#8fa2bf;padding:28px;background:#101c30;border-radius:10px}@media(max-width:800px){.app{grid-template-columns:1fr}.sidebar{border-right:0;border-bottom:1px solid #22304a}.metrics,.turn-metrics{grid-template-columns:repeat(2,1fr)}.content-layout{grid-template-columns:1fr}.explorer{position:static}.detail{padding:32px 20px}}
 </style><style>.loading{position:fixed;inset:0;background:rgba(11,18,32,.72);display:flex;align-items:center;justify-content:center;z-index:10;color:#dbeafe;font-size:14px}.spinner{width:24px;height:24px;border:3px solid #416080;border-top-color:#68b5ff;border-radius:50%;animation:spin .8s linear infinite;margin-right:10px}@keyframes spin{to{transform:rotate(360deg)}}.is-loading{pointer-events:none;opacity:.65}</style></head><body><div class="app"><aside class="sidebar"><div class="brand">Session explorer</div><div class="path">__ROOT__</div><nav class="provider-menu">__PROVIDER_MENU__</nav><div class="count">Sessions</div>__SESSION_ROWS__</aside>__DETAIL__</div><script>document.querySelectorAll('a.session-link,.clickable,.provider').forEach(function(link){link.addEventListener('click',function(){document.body.classList.add('is-loading');var overlay=document.createElement('div');overlay.className='loading';overlay.innerHTML='<span class="spinner"></span><span>Loading session data…</span>';document.body.appendChild(overlay);});});</script><script>document.querySelectorAll('form[action="/delete"]').forEach(function(form){form.addEventListener('submit',function(){document.body.classList.add('is-loading');var overlay=document.createElement('div');overlay.className='loading';overlay.innerHTML='<span class="spinner"></span><span>Deleting conversation…</span>';document.body.appendChild(overlay);form.querySelector('button').disabled=true;});});</script></body></html>'''
 
@@ -1015,7 +1082,7 @@ PAGE = PAGE.replace('<div class="count">Sessions</div>__SESSION_ROWS__', '<div c
 
 PAGE = PAGE.replace('</head>', '<style>.turn header{display:flex;align-items:center;justify-content:space-between;gap:12px}.turn-kind{color:#9ed1ff;background:#1b4268;border:1px solid #326b9e;border-radius:999px;padding:3px 9px;font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;white-space:nowrap}.show-raw{display:block;margin:10px 16px 14px;padding:7px 12px;border:1px solid #315479;border-radius:6px;background:#142a43;color:#9ed1ff;text-align:center;text-decoration:none;font-size:11px}.show-raw:hover{background:#1b4268;color:#fff}.content-layout{align-items:stretch}.explorer{height:calc(100vh - 84px);max-height:calc(100vh - 84px);position:sticky;top:42px;overflow:hidden;display:flex;flex-direction:column}.explorer-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex:none;overflow:hidden;background:transparent;padding:10px 12px;border-bottom:1px solid #223753;z-index:1}.explorer-header h2{margin:0}.explorer-body{display:flex;flex:1;min-height:0;flex-direction:column;overflow-y:auto;overflow-x:hidden;padding-top:12px;scrollbar-width:thin;scrollbar-color:#416b98 #0c1627}.explorer-body>p{flex:none}.explorer-body>pre{flex:none;max-height:none;overflow:visible}.explorer details{display:block;flex:none}.explorer details pre{max-height:none;overflow:visible}@media(max-width:700px){.explorer{height:auto;max-height:none;position:static;overflow:visible}.explorer-header{position:static;border-bottom:0}.explorer-body{display:block;overflow:visible}.explorer-body>pre{max-height:60vh;overflow:auto}.explorer details{display:block}.explorer details pre{max-height:60vh;overflow:auto}}</style></head>')
 
-PAGE = PAGE.replace('</head>', '<style>.turn-steps{margin:12px 16px 4px;padding:10px 12px;border:1px solid #263e5d;border-radius:8px;background:#101f34}.steps-label{margin-bottom:7px;color:#89a6c7;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase}.turn-step{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid #203653}.turn-step>span{color:#c8dbf2;font-size:11px;white-space:nowrap}.step-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;flex:1}.step-metrics .metric{padding:5px 6px}.step-metrics .metric span{font-size:8px}.step-metrics .metric strong{font-size:11px}.step-count{margin-left:auto;color:#9ed1ff;background:#1b4268;border:1px solid #326b9e;border-radius:999px;padding:3px 9px;font-size:10px;font-weight:700;white-space:nowrap}@media(max-width:700px){.turn-step{display:block}.step-metrics{margin-top:6px}.turn-step .step-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head>')
+PAGE = PAGE.replace('</head>', '<style>.turn-invocations{margin:12px 16px 4px;padding:10px 12px;border:1px solid #263e5d;border-radius:8px;background:#101f34}.invocations-label{margin-bottom:7px;color:#89a6c7;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase}.turn-invocation{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 0;border-top:1px solid #203653}.turn-invocation>span{color:#c8dbf2;font-size:11px;white-space:nowrap}.invocation-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;flex:1}.invocation-metrics .metric{padding:5px 6px}.invocation-metrics .metric span{font-size:8px}.invocation-metrics .metric strong{font-size:11px}.invocation-count{margin-left:auto;color:#9ed1ff;background:#1b4268;border:1px solid #326b9e;border-radius:999px;padding:3px 9px;font-size:10px;font-weight:700;white-space:nowrap}@media(max-width:700px){.turn-invocation{display:block}.invocation-metrics{margin-top:6px}.turn-invocation .invocation-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}</style></head>')
 
 PAGE = PAGE.replace('</body></html>', r'''<script>
 (function(){
@@ -1032,6 +1099,108 @@ PAGE = PAGE.replace('</body></html>', r'''<script>
     });
 })();
 </script><script>(function(){var params=new URLSearchParams(window.location.search);var key='session-detail-scroll:'+ (params.get('provider') || 'copilot') + ':' + (params.get('session') || '');var detail=document.querySelector('.detail');var saved=sessionStorage.getItem(key);if(saved !== null){requestAnimationFrame(function(){try{var position=JSON.parse(saved);if(detail){detail.scrollTop=Number(position.detail || 0);}window.scrollTo(0,Number(position.window || 0));}catch(error){if(detail){detail.scrollTop=Number(saved);}}});}document.querySelectorAll('.metric.clickable,.show-raw').forEach(function(link){link.addEventListener('click',function(){var current=document.querySelector('.detail');sessionStorage.setItem(key,JSON.stringify({detail:current ? current.scrollTop : 0,window:window.scrollY}));});});})();</script><script>document.querySelectorAll('form[action="/delete"]').forEach(function(form){form.addEventListener('submit',function(event){if(!event.defaultPrevented){return;}var overlay=document.querySelector('.loading');if(overlay){overlay.remove();}document.body.classList.remove('is-loading');var button=form.querySelector('button');if(button){button.disabled=false;}});});</script></body></html>''')
+
+PAGE = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>__APP_NAME__</title>
+<style>
+:root{
+    --bg:#080b12;--surface:#0e131d;--surface-2:#131a27;--surface-3:#182233;
+    --line:#202a3a;--line-strong:#2d3a50;--text:#f1f5fb;--muted:#8c9bb0;
+    --subtle:#65748a;--accent:#7c8cff;--accent-2:#57d4b2;--blue:#63b3ff;
+    --danger:#ff7285;--sidebar:330px;--radius:14px;--shadow:0 18px 50px rgba(0,0,0,.28);
+    font-family:Inter,"Segoe UI",system-ui,-apple-system,sans-serif;color:var(--text);background:var(--bg);
+}
+*{box-sizing:border-box}[hidden]{display:none!important}html{scroll-behavior:smooth}body{margin:0;min-width:320px;background:radial-gradient(circle at 72% -20%,rgba(70,83,170,.13),transparent 36%),var(--bg);color:var(--text)}
+a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height:100vh}.mobile-bar{display:none}.sidebar{position:fixed;inset:0 auto 0 0;width:var(--sidebar);display:flex;flex-direction:column;background:rgba(12,16,25,.96);border-right:1px solid var(--line);z-index:20;backdrop-filter:blur(18px)}
+.sidebar-top{padding:24px 20px 16px}.brand-row{display:flex;align-items:center;gap:11px}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:linear-gradient(145deg,#8b94ff,#5666de);box-shadow:0 8px 24px rgba(104,117,242,.3);font-size:17px;font-weight:800}.brand{font-size:15px;font-weight:750;letter-spacing:-.01em}.brand-subtitle{margin-top:2px;color:var(--subtle);font-size:11px}.path{margin:15px 0 0;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:#090d15;color:#718198;font:10px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.provider-menu{display:grid;gap:3px;margin-top:14px;padding:4px;border:1px solid var(--line);border-radius:11px;background:#090d15}.provider{display:flex;align-items:center;gap:10px;min-width:0;height:34px;padding:0 11px;border-radius:7px;color:#8291a6;text-decoration:none;font-size:11px;font-weight:600}.provider>span:last-child{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.provider-mark{width:8px;height:8px;flex:none;border-radius:50%;background:#68768a;transition:.2s}.provider[data-provider="copilot"] .provider-mark{background:#a995ff}.provider[data-provider="codex"] .provider-mark{background:#70d6b5}.provider[data-provider="claude"] .provider-mark{background:#e8a06c}.provider[data-provider="m365_copilot"] .provider-mark{background:#58a7ff}.provider:hover{background:var(--surface-3);color:#c7d0de}.provider.selected{background:#20283a;color:#f1f5fb;box-shadow:inset 0 0 0 1px #35425a}.provider.selected .provider-mark{transform:scale(1.18);box-shadow:0 0 0 3px rgba(124,140,255,.12)}
+.sessions-area{display:flex;flex:1;min-height:0;flex-direction:column}.sessions-heading{padding:12px 20px 10px}.heading-line{display:flex;align-items:center;justify-content:space-between}.count{color:#aab5c6;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}.count b{display:inline-grid;place-items:center;min-width:20px;height:20px;margin-left:6px;border-radius:6px;background:#1b2432;color:#cdd6e3;letter-spacing:0}.sessions-heading-actions{display:flex;gap:6px}.empty-toggle,.refresh-sessions{display:grid;place-items:center;height:28px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--muted);text-decoration:none;font-size:10px}.empty-toggle{padding:0 8px}.refresh-sessions{width:28px;font-size:15px}.empty-toggle:hover,.refresh-sessions:hover{border-color:var(--line-strong);background:var(--surface-3);color:var(--text)}
+.search-wrap{position:relative;margin-top:10px}.search-wrap svg{position:absolute;left:10px;top:9px;width:14px;color:#66758a}.session-search{width:100%;height:34px;padding:0 30px 0 31px;border:1px solid var(--line);border-radius:9px;outline:none;background:#090d15;color:var(--text);font-size:11px}.session-search::placeholder{color:#58677a}.session-search:focus{border-color:#5968bd;box-shadow:0 0 0 3px rgba(89,104,189,.12)}.search-key{position:absolute;right:8px;top:8px;color:#56657a;font:10px ui-monospace,monospace}
+.session-list{flex:1;min-height:0;overflow:auto;padding:0 10px 18px;scrollbar-width:thin;scrollbar-color:#344056 transparent}.empty-search{margin:24px 10px;padding:20px;border:1px dashed var(--line-strong);border-radius:10px;color:#6f7f95;text-align:center;font-size:11px}.session-row{position:relative;display:flex;align-items:center;margin:2px 0}.session{display:flex;align-items:flex-start;gap:10px;min-width:0;flex:1;padding:10px 34px 10px 10px;border:1px solid transparent;border-radius:11px;color:#b9c4d3;text-decoration:none}.session:hover{background:#131a26}.session.selected{border-color:#293750;background:linear-gradient(100deg,#182235,#131a27);color:#fff}.session-glyph{display:grid;place-items:center;width:27px;height:27px;flex:none;border:1px solid #29354a;border-radius:8px;background:#171f2e;color:#8396b2;font-size:10px;font-weight:800}.session.selected .session-glyph{border-color:#5362ad;background:#2a335b;color:#cdd3ff}.session-copy{min-width:0;flex:1}.session b{display:block;overflow:hidden;color:inherit;font-size:12px;font-weight:650;line-height:1.35;text-overflow:ellipsis;white-space:nowrap}.session small{display:block;overflow:hidden;margin-top:3px;color:#647389;font:9px/1.3 ui-monospace,monospace;text-overflow:ellipsis;white-space:nowrap}.session .session-meta{color:#73829a;font-family:inherit}.session-row form{position:absolute;right:8px;top:9px}.delete-session{display:grid;place-items:center;width:25px;height:25px;padding:0;border:0;border-radius:7px;background:transparent;color:#56657a;cursor:pointer;font-size:16px;opacity:0}.session-row:hover .delete-session,.delete-session:focus{opacity:1}.delete-session:hover{background:#331923;color:var(--danger)}
+.detail{width:calc(100% - var(--sidebar));min-height:100vh;margin-left:var(--sidebar);padding:42px clamp(24px,4vw,64px) 90px}.detail-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;max-width:1500px;margin:auto}.heading-copy{min-width:0}.eyebrow{display:flex;align-items:center;gap:7px;color:#8c9bb0;font-size:10px;font-weight:750;letter-spacing:.13em;text-transform:uppercase}.eyebrow>span{width:6px;height:6px;border-radius:50%;background:var(--accent-2);box-shadow:0 0 0 4px rgba(87,212,178,.09)}h1{max-width:900px;margin:8px 0 11px;font-size:clamp(25px,3vw,39px);font-weight:720;letter-spacing:-.035em;line-height:1.08;overflow-wrap:anywhere}.header-chips{display:flex;flex-wrap:wrap;gap:6px}.header-chips span{padding:5px 8px;border:1px solid var(--line);border-radius:7px;background:rgba(18,24,35,.7);color:#8090a6;font-size:10px}.detail-actions{display:flex;gap:7px}.icon-button{display:grid;place-items:center;width:34px;height:34px;padding:0;border:1px solid var(--line-strong);border-radius:9px;background:var(--surface-2);color:#a9b5c7;text-decoration:none;cursor:pointer}.icon-button:hover{background:var(--surface-3);color:#fff}.icon-button.danger:hover{border-color:#713243;background:#351721;color:var(--danger)}
+.session-facts{display:grid;grid-template-columns:minmax(160px,.7fr) minmax(220px,1fr) minmax(220px,1.3fr);max-width:1500px;margin:27px auto 0;border:1px solid var(--line);border-radius:12px;background:rgba(13,18,27,.72);overflow:hidden}.session-facts>div{min-width:0;padding:11px 14px;border-right:1px solid var(--line)}.session-facts>div:last-child{border:0}.session-facts span{display:block;margin-bottom:4px;color:#59687d;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.session-facts code{display:block;overflow:hidden;color:#8595aa;font:10px ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.provider-note{max-width:1500px;margin:10px auto 0;padding:10px 13px;border:1px solid #39452e;border-radius:9px;background:#171d13;color:#aeb99e;font-size:11px}.provider-note b{margin-right:8px;color:#c9d3ba}
+.overview,.conversation{max-width:1500px;margin:38px auto 0}.section-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:13px}.section-kicker{display:block;margin-bottom:4px;color:#5f7088;font-size:9px;font-weight:800;letter-spacing:.16em}.section-heading h2,.explorer-header h2{margin:0;font-size:16px;font-weight:680;letter-spacing:-.01em}.overview-stats{display:flex;align-items:center;gap:8px}.overview-stats span{padding:6px 9px;border:1px solid var(--line);border-radius:8px;color:#6f7e92;font-size:10px}.overview-stats b{color:#cbd4e1;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.metric{position:relative;display:flex;min-width:0;min-height:70px;flex-direction:column;align-items:center;justify-content:center;padding:14px 15px;border:1px solid var(--line);border-radius:11px;background:linear-gradient(145deg,#121925,#0f151f);text-align:center;overflow:hidden}.metric:before{content:"";position:absolute;inset:auto 0 0;height:2px;background:#6676d8;opacity:.5}.metric[data-metric="cacheReadTokens"]:before{background:#42b8c4}.metric[data-metric="cacheWriteTokens"]:before{background:#b985e5}.metric[data-metric="outputTokens"]:before{background:#54c99f}.metric[data-metric="reasoningTokens"]:before{background:#e4a35f}.metric span{display:block;width:100%;overflow:hidden;color:#697a91;font-size:9px;font-weight:700;letter-spacing:.06em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.metric strong{display:block;margin-top:8px;color:#e9eef7;font:600 19px/1 ui-monospace,SFMono-Regular,Consolas,monospace}.metric.compact{min-height:52px;padding:9px 10px;border-radius:8px;text-decoration:none}.metric.compact strong{margin-top:5px;font-size:12px}.metric.clickable{transition:transform .15s,border-color .15s,background .15s}.metric.clickable:hover{transform:translateY(-1px);border-color:#42516a;background:#182131}.metric.clickable.active{border-color:#6878db;background:#202843;box-shadow:0 0 0 2px rgba(104,120,219,.11)}
+.muted{color:#687990;font-size:10px}.content-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,340px);align-items:start;gap:14px}.turns{display:grid;gap:12px;min-width:0}.turn{min-width:0;border:1px solid var(--line);border-radius:var(--radius);background:rgba(14,19,29,.82);box-shadow:0 12px 36px rgba(0,0,0,.08);overflow:hidden}.turn>header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line);background:#111722}.turn-number{display:flex;align-items:center;gap:10px}.turn-number>span{display:grid;place-items:center;width:29px;height:29px;border:1px solid #2c3950;border-radius:8px;background:#182131;color:#8191aa;font:10px ui-monospace,monospace}.turn-number b{display:block;font-size:12px}.turn-number small{display:block;margin-top:2px;color:#5f6e83;font-size:9px}.turn-badges{display:flex;gap:5px}.step-count,.turn-kind,.summary-count{padding:4px 7px;border:1px solid #34425a;border-radius:999px;background:#1a2332;color:#8fa0b8;font-size:8px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}.message{display:grid;grid-template-columns:72px minmax(0,1fr);gap:10px;padding:14px 16px;border-bottom:1px solid rgba(32,42,58,.7)}.message.assistant{background:rgba(15,23,34,.6)}.role{display:flex;align-items:center;gap:7px;height:24px}.role>span{display:grid;place-items:center;width:22px;height:22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800}.assistant .role>span{background:#15372f;color:#8ee4c9}.message label{color:#7f8ea4;font-size:9px;font-weight:750;text-transform:uppercase}.message p{min-width:0;margin:2px 0 0;color:#b9c5d5;font:11px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;white-space:pre-wrap}.message.user p{color:#d8e0eb}.message.tool{display:block;background:#101722}.message.tool label{display:block;margin-bottom:4px}.message.tool code{display:inline-block;max-width:100%;margin-top:5px;color:#8ba0ba;white-space:pre-wrap;overflow-wrap:anywhere}
+.turn-steps{margin:12px 14px;border:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-steps>summary{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-steps summary::-webkit-details-marker{display:none}.steps-list{padding:0 12px 6px}.turn-step{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-top:1px solid #1b2432}.step-name{display:flex;align-items:center;gap:7px;width:90px;flex:none;padding-top:8px;color:#8292a8;font-size:9px}.step-name i{width:5px;height:5px;border-radius:50%;background:#5869cb}.step-content{display:grid;min-width:0;flex:1;gap:8px}.step-tools{display:grid;grid-template-columns:minmax(0,1fr);gap:6px}.step-tool{width:100%;min-width:0;border:1px solid #263247;border-radius:7px;background:#111925;overflow:hidden}.step-tool>summary{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;cursor:pointer;list-style:none}.tool-name{min-width:0;overflow:hidden;color:#aebcd0;font:9px ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.tool-status{padding:2px 5px;border-radius:999px;background:#252e3d;color:#8392a7;font-size:7px;font-weight:750;text-transform:uppercase}.tool-status.completed{background:#15352d;color:#7ed7bc}.tool-status.failed{background:#3a1c25;color:#ff91a0}.step-tool-body{padding:8px 9px;border-top:1px solid #263247;color:#75869d;font-size:9px}.tool-payload+ .tool-payload{margin-top:8px}.tool-payload b{display:block;margin-bottom:4px;color:#788ba4;font-size:8px;letter-spacing:.06em;text-transform:uppercase}.tool-payload pre{max-height:180px;margin:0;padding:7px;border-radius:6px;background:#090e16;color:#9cacbf;font:8px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}.step-no-tools{padding:6px 8px;border:1px dashed #263247;border-radius:7px;color:#64758a;font-size:9px}.step-usage{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:6px}.step-metric-group{min-width:0;padding:7px;border:1px solid #202a3a;border-radius:8px;background:#0d131d}.step-group-title{display:flex;align-items:center;gap:6px;margin:0 2px 6px;color:#74849b;font-size:8px;font-weight:750;letter-spacing:.06em;text-transform:uppercase}.step-group-title span{display:grid;place-items:center;width:16px;height:16px;border-radius:5px;background:#272d50;color:#bec6ff;font-size:6px}.output-group .step-group-title span{background:#15372f;color:#8ee4c9}.step-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;min-width:0}.output-group .step-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.step-metrics .metric{padding:6px 7px;background:#0f1621}.step-metrics .metric span{font-size:7px}.step-metrics .metric strong{margin-top:4px;font-size:9px}.turn-footer{padding:10px 14px 14px}.turn-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}.show-raw{display:flex;align-items:center;justify-content:center;gap:8px;min-height:34px;margin-top:9px;padding:8px 12px;border:1px solid #2d3b53;border-radius:8px;background:#131b28;color:#a9b7ca;text-decoration:none;font-size:10px;font-weight:650;letter-spacing:.01em}.show-raw>span:first-child{color:#8292ff;font:9px ui-monospace,monospace}.show-raw .raw-arrow{margin-left:2px;color:#71829a;font:12px system-ui,sans-serif;transition:transform .15s}.show-raw:hover{border-color:#5262b1;background:#1c2540;color:#fff}.show-raw:hover .raw-arrow{transform:translateX(2px);color:#aeb7ff}
+.turn-invocations{margin:12px 14px;border:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-invocations>summary{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-invocations summary::-webkit-details-marker{display:none}.invocations-list{padding:0 12px 6px}.turn-invocation{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-top:1px solid #1b2432}.invocation-name{display:flex;align-items:center;gap:7px;width:90px;flex:none;padding-top:8px;color:#8292a8;font-size:9px}.invocation-name i{width:5px;height:5px;border-radius:50%;background:#5869cb}.invocation-content{display:grid;min-width:0;flex:1;gap:8px}.invocation-tools{display:grid;grid-template-columns:minmax(0,1fr);gap:6px}.invocation-tool{width:100%;min-width:0;border:1px solid #263247;border-radius:7px;background:#111925;overflow:hidden}.invocation-tool>summary{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;cursor:pointer;list-style:none}.invocation-tool-body{padding:8px 9px;border-top:1px solid #263247;color:#75869d;font-size:9px}.invocation-no-tools{padding:6px 8px;border:1px dashed #263247;border-radius:7px;color:#64758a;font-size:9px}.invocation-usage{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:6px}.invocation-metric-group{min-width:0;padding:7px;border:1px solid #202a3a;border-radius:8px;background:#0d131d}.invocation-group-title{display:flex;align-items:center;gap:6px;margin:0 2px 6px;color:#74849b;font-size:8px;font-weight:750;letter-spacing:.06em;text-transform:uppercase}.invocation-group-title span{display:grid;place-items:center;width:16px;height:16px;border-radius:5px;background:#272d50;color:#bec6ff;font-size:6px}.output-group .invocation-group-title span{background:#15372f;color:#8ee4c9}.invocation-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;min-width:0}.output-group .invocation-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.invocation-metrics .metric{padding:6px 7px;background:#0f1621}.invocation-metrics .metric span{font-size:7px}.invocation-metrics .metric strong{margin-top:4px;font-size:9px}.invocation-count{padding:4px 7px;border:1px solid #34425a;border-radius:999px;background:#1a2332;color:#8fa0b8;font-size:8px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}.explorer{position:sticky;top:20px;display:flex;min-width:0;max-height:calc(100vh - 40px);flex-direction:column;border:1px solid var(--line);border-radius:var(--radius);background:#0c111a;box-shadow:var(--shadow);overflow:hidden}.explorer-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px;border-bottom:1px solid var(--line);background:#111722}.explorer-close{display:grid;place-items:center;width:25px;height:25px;border-radius:7px;color:#617086;text-decoration:none;font-size:16px}.explorer-close:hover{background:#20293a;color:#fff}.explorer-body{min-height:170px;padding:14px;overflow:auto;scrollbar-width:thin;scrollbar-color:#344056 transparent}.explorer-body p,.explorer-body pre{margin:0;color:#9eacbf;font:10px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;white-space:pre-wrap}.explorer-body pre{color:#aab8cb}.empty{display:flex;flex-direction:column;align-items:center;padding:50px;border:1px dashed var(--line-strong);border-radius:var(--radius);color:#6f8098;text-align:center}.empty b{color:#b6c1d1}.empty span{margin-top:5px;font-size:11px}.no-sessions{display:grid;place-items:center}.empty-hero{max-width:500px;text-align:center}.hero-icon{display:grid;place-items:center;width:54px;height:54px;margin:0 auto 18px;border:1px solid #303c52;border-radius:17px;background:linear-gradient(145deg,#192235,#101620);color:#94a3ff;font-size:23px;box-shadow:var(--shadow)}.empty-hero h1{margin:7px auto 10px}.empty-hero p{margin:0;color:#7989a0;font-size:13px;line-height:1.6}
+.sidebar-scrim{display:none}.loading{position:fixed;inset:0;display:grid;place-items:center;background:rgba(5,8,13,.55);z-index:100;backdrop-filter:blur(3px)}.loading-card{display:flex;align-items:center;gap:10px;padding:12px 16px;border:1px solid #303b50;border-radius:11px;background:#111722;box-shadow:var(--shadow);color:#b6c1d2;font-size:11px}.spinner{width:17px;height:17px;border:2px solid #39445a;border-top-color:#8b98ff;border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+:focus-visible{outline:2px solid #8190ff;outline-offset:2px}@media(max-width:1180px){:root{--sidebar:292px}.content-layout{grid-template-columns:minmax(0,1fr) 290px}.session-facts{grid-template-columns:1fr 1fr}.session-facts>div:last-child{grid-column:1/-1;border-top:1px solid var(--line)}}
+@media(max-width:900px){.mobile-bar{position:sticky;top:0;z-index:15;display:flex;align-items:center;justify-content:space-between;height:54px;padding:0 14px;border-bottom:1px solid var(--line);background:rgba(8,11,18,.92);backdrop-filter:blur(16px)}.mobile-bar b{font-size:13px}.menu-button{width:34px;height:34px;border:1px solid var(--line);border-radius:9px;background:var(--surface);cursor:pointer}.sidebar{width:min(var(--sidebar),calc(100vw - 42px));transform:translateX(-102%);transition:transform .22s ease;box-shadow:var(--shadow)}body.nav-open .sidebar{transform:none}.sidebar-scrim{position:fixed;inset:0;z-index:19;background:rgba(3,5,9,.62)}body.nav-open .sidebar-scrim{display:block}.detail{width:100%;margin:0;padding:30px 20px 70px}.content-layout{grid-template-columns:1fr}.explorer{position:static;display:none;max-height:none;order:-1}.explorer.is-active{display:flex}.explorer-body{max-height:55vh}.session-facts{grid-template-columns:1fr}.session-facts>div,.session-facts>div:last-child{grid-column:auto;border:0;border-bottom:1px solid var(--line)}.session-facts>div:last-child{border:0}}
+@media(max-width:620px){.detail{padding:24px 13px 60px}.detail-heading{align-items:flex-start}.detail-actions{flex-direction:column}.header-chips span:last-child{display:none}.overview-stats{display:none}.metrics,.turn-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.metrics .metric:last-child,.turn-metrics .metric:last-child{grid-column:1/-1}.metric{padding:11px}.metric strong{font-size:16px}.section-heading{align-items:flex-start}.section-heading>.muted{max-width:130px;text-align:right}.message{display:block;padding:13px}.role{margin-bottom:8px}.turn>header{align-items:flex-start}.turn-badges{flex-direction:column;align-items:flex-end}.turn-invocation{display:block}.invocation-name{width:auto;margin-bottom:7px}.invocation-usage{grid-template-columns:1fr}.invocation-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}.output-group .invocation-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.turn-footer{padding:2px 10px 10px}.session-facts{margin-top:20px}h1{font-size:25px}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+<div class="mobile-bar"><button class="menu-button" type="button" aria-label="Open sessions" aria-controls="sidebar">☰</button><b>__APP_NAME__</b><span style="width:34px"></span></div>
+<div class="app">
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-top">
+            <div class="brand-row"><span class="brand-mark">AI</span><div><div class="brand">__APP_NAME__</div><div class="brand-subtitle">Local AI activity</div></div></div>
+            <div class="path" title="__ROOT__">__ROOT__</div>
+            <nav class="provider-menu" aria-label="AI providers">__PROVIDER_MENU__</nav>
+        </div>
+        <div class="sessions-area">
+            <div class="sessions-heading">
+                <div class="heading-line"><div class="count">Sessions <b>__SESSION_COUNT__</b></div><div class="sessions-heading-actions">__EMPTY_TOGGLE__<a class="refresh-sessions" href="__REFRESH_URL__" aria-label="Refresh sessions" title="Refresh sessions">↻</a></div></div>
+                <div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg><input class="session-search" type="search" placeholder="Filter sessions…" aria-label="Filter sessions"><span class="search-key">/</span></div>
+            </div>
+            <div class="session-list">__SESSION_ROWS__<div class="empty-search" hidden>No matching sessions</div></div>
+        </div>
+    </aside>
+    <button class="sidebar-scrim" type="button" aria-label="Close sessions"></button>
+    __DETAIL__
+</div>
+<script>
+(function(){
+    var body=document.body, sidebar=document.querySelector('.sidebar'), search=document.querySelector('.session-search');
+    function closeNav(){body.classList.remove('nav-open')}
+    document.querySelector('.menu-button').addEventListener('click',function(){body.classList.toggle('nav-open')});
+    document.querySelector('.sidebar-scrim').addEventListener('click',closeNav);
+    document.addEventListener('keydown',function(event){
+        if(event.key==='Escape') closeNav();
+        if(event.key==='/' && document.activeElement!==search){event.preventDefault();search.focus();}
+    });
+    search.addEventListener('input',function(){
+        var query=search.value.trim().toLowerCase(), visible=0;
+        document.querySelectorAll('.session-row').forEach(function(row){var show=!query||row.textContent.toLowerCase().includes(query);row.hidden=!show;if(show)visible++;});
+        document.querySelector('.empty-search').hidden=visible!==0;
+    });
+    var params=new URLSearchParams(location.search), scrollKey='session-list:'+ (params.get('provider')||'copilot')+':'+(params.get('show_empty')||'0');
+    var list=document.querySelector('.session-list'), saved=sessionStorage.getItem(scrollKey);if(saved)list.scrollTop=Number(saved);
+    list.addEventListener('scroll',function(){sessionStorage.setItem(scrollKey,String(list.scrollTop))},{passive:true});
+    var detailKey='session-detail:'+(params.get('session')||'');var position=sessionStorage.getItem(detailKey);if(position)requestAnimationFrame(function(){scrollTo(0,Number(position))});
+    function loading(text){if(document.querySelector('.loading'))return;var layer=document.createElement('div');layer.className='loading';layer.innerHTML='<div class="loading-card"><span class="spinner"></span><span>'+text+'</span></div>';body.appendChild(layer);}
+    document.querySelectorAll('a.session-link,a.provider,a.clickable,a.refresh-sessions,a.empty-toggle').forEach(function(link){link.addEventListener('click',function(){sessionStorage.setItem(detailKey,String(scrollY));loading('Loading session data…');});});
+    document.querySelectorAll('form[action="/delete"]').forEach(function(form){form.addEventListener('submit',function(event){if(event.defaultPrevented)return;loading('Deleting conversation…');var button=form.querySelector('button');if(button)button.disabled=true;});});
+    if(sidebar){sidebar.addEventListener('click',function(event){if(event.target.closest('.session-link')&&innerWidth<=900)closeNav();});}
+})();
+</script>
+</body>
+</html>'''
+
+PAGE = PAGE.replace('</style>\n</head>', '''<style>
+/* Compact invocation cards: tools stay vertical, metrics stay horizontal. */
+.turn-invocations{margin:12px 14px;padding:0;border:1px solid #263247;border-radius:11px;background:#0b1018;overflow:hidden}
+.turn-invocations>summary{padding:11px 13px;background:#111925}
+.invocations-list{display:grid;gap:8px;padding:8px}
+.turn-invocation{display:grid;grid-template-columns:92px minmax(0,1fr);align-items:start;gap:10px;padding:10px;border:1px solid #263247;border-radius:9px;background:#101722}
+.invocation-name{width:auto;padding-top:5px;color:#91a2b9;font-size:9px;font-weight:700;letter-spacing:.03em}
+.invocation-content{gap:8px}
+.invocation-tools{gap:5px}
+.invocation-tool{border-color:#2b3850;background:#131d2b;box-shadow:0 2px 8px rgba(0,0,0,.12)}
+.invocation-tool>summary{min-height:31px;padding:7px 10px}
+.invocation-tool-body{background:#0d141f}
+.invocation-usage{grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:7px}
+.invocation-metric-group{padding:7px;background:#0d141f}
+.invocation-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
+.output-group .invocation-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+@media(max-width:620px){.turn-invocation{display:block}.invocation-name{margin-bottom:7px}.invocation-usage{grid-template-columns:1fr}}
+</style></head>''')
 
 
 if __name__ == "__main__":

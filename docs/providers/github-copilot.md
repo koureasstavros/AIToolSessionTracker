@@ -53,22 +53,29 @@ GitHub Copilot uses source-specific turn handling:
 
 - **VS Code JSONL:** one logical turn is created for each request in the
   `requests` array, including requests reconstructed from later JSONL patch
-  records. Serialized tool invocations are additional `kind: tool` turns.
+  records. Persisted `toolCallRounds` become numbered invocations. Tools
+  are listed vertically inside the round that initiated them, including their
+  arguments and stored results.
 - **CLI / Desktop session-state:** events are grouped by `interactionId`, or by
-  the linked `turnId`. Session-shutdown metrics are session-level; when they
-  cannot be mapped to a turn, input/cache/reasoning totals are distributed
-  across turns using output-token weights. This is an estimate.
-- **CLI / Desktop SQLite:** multiple assistant usage steps become separate
-  turns, and usage-only records can become synthetic turns.
+  the linked `turnId`. Internal assistant turns become invocations, and
+  tool start/completion events are attached to the assistant invocation that
+  initiated them.
+- **CLI / Desktop SQLite:** multiple assistant usage rows become invocations
+  inside their logical user turn. Usage-only records can still become
+  synthetic turns when no matching conversation content exists.
 
 A request or event group can contain:
 
 - User input from `message.text`
 - Assistant output from response items with readable `value` text
+- Numbered model invocations
+- Tool names, arguments, completion status, and stored results
 - Raw request/response JSON
 - Request-level usage metadata
 
-Requests without user text, assistant text, or token values are ignored when details are loaded. Serialized `toolInvocationSerialized` response items are exposed as separate turns marked `kind: tool`. Each tool turn includes the tool ID, invocation message, result output when available, and raw serialized event data.
+Requests without user text, assistant text, or token values are ignored when
+details are loaded. A single invocation without tools is not expanded separately
+because its usage is already shown by the turn.
 
 ## Tokens
 
@@ -80,14 +87,26 @@ Supported normalized fields are:
 - `outputTokens`
 - `reasoningTokens`
 
-Input/output values come from request fields such as `promptTokens` and `completionTokens`, result metadata, and recognized usage aliases. Session totals are aggregated from turns. Cached input is subtracted from total input where the source reports both values.
+Input/output values come from request fields such as `promptTokens` and
+`completionTokens`, result metadata, database usage rows, and recognized usage
+aliases. Session totals are aggregated from turns. Cached input is subtracted
+from total input where the source reports both values.
+
+Invocation metrics are grouped as **User / Input** and **Assistant / Output**.
+For session-state plus SQLite sessions, database usage rows provide invocation
+values and event boundaries associate tools with those invocations. For VS Code
+JSONL, `toolCallRounds` define the invocations. The source can expose exact input/output
+metrics for the final no-tool round while retaining only aggregate totals for
+the complete request; earlier tool rounds remain unavailable rather than being
+assigned estimated values.
 
 The VS Code chat-session source often does not persist usage statistics. In that case, prompts, responses, and tool events remain visible while token fields remain unavailable.
 
-Token availability is not uniform across GitHub Copilot turns. A text-bearing
-turn, especially one read from VS Code JSONL, may have `null` token fields.
-Tool turns do not inherit or duplicate the parent request's usage. Session
-totals use persisted usage, apart from the documented session-state allocation.
+Token availability is not uniform across GitHub Copilot turns and invocations.
+A text-bearing invocation may have `null` token fields. Tools never inherit or
+duplicate their parent invocation's usage because Copilot does not report tokens per individual
+tool. Session totals use persisted usage, apart from the documented
+session-state allocation.
 
 ## Empty-session rule
 

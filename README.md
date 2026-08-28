@@ -1,4 +1,4 @@
-# Session Token Viewer
+# AI Tool Session Explorer
 
 A local, read-only browser app for exploring AI coding-agent sessions, turns, content, raw events, and token usage.
 
@@ -128,8 +128,12 @@ Each session contains one or more interactions. An interaction is grouped into a
 
 - User input
 - Assistant output
+- Model invocations and the tool calls/results belonging to each invocation
 - Per-turn token metrics
 - Raw event records
+
+Provider-specific turn, invocation, tool, and token-grouping behavior is documented
+in the corresponding guide under [`docs/providers/`](docs/providers/).
 
 The supported token categories are:
 

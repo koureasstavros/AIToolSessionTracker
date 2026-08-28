@@ -94,10 +94,25 @@ def details(summary: dict) -> dict:
     if result["project"] and "local-agent-mode-sessions" in result["project"].replace("/", "\\").lower():
         result["project"] = None
     turns: dict[str, dict] = {}
-    tool_turns: dict[str, str] = {}
-    message_turns: dict[str, str] = {}
+    tool_calls: dict[str, tuple[dict, dict, dict]] = {}
+    message_invocations: dict[str, tuple[dict, dict]] = {}
     seen_usage_records: set[str] = set()
-    current = ""
+    current_turn: dict | None = None
+
+    def new_invocation(turn: dict, message_id: str | None) -> dict:
+        if message_id and message_id in message_invocations:
+            return message_invocations[message_id][1]
+        invocation = {
+            "index": len(turn.setdefault("invocations", [])) + 1,
+            "tokens": viewer.blank_tokens(),
+            "tools": [],
+            "assistant": [],
+        }
+        turn["invocations"].append(invocation)
+        if message_id:
+            message_invocations[message_id] = (turn, invocation)
+        return invocation
+
     for record in records:
         payload = record.get("payload", record)
         if not isinstance(payload, dict):
@@ -122,36 +137,7 @@ def details(summary: dict) -> dict:
             isinstance(part, dict) and part.get("type") == "tool_use"
             for part in content_parts
         )
-        if is_tool_result and role == "user":
-            # Claude serializes tool results as user-role messages. They are
-            # not new user prompts and should not appear as JSON input.
-            role = None
         turn_id = payload.get("turn_id") or payload.get("turnId") or metadata.get("turn_id") or item.get("turn_id") or record.get("promptId")
-        if not turn_id and record.get("type") == "user":
-            turn_id = record.get("uuid")
-        if not turn_id and not current and (payload.get("type") or record.get("type")) in {"session_meta", "world_state", "turn_context", "queue-operation", "attachment"}:
-            continue
-        tool_id = next(
-            (part.get("tool_use_id") for part in content_parts
-             if isinstance(part, dict) and part.get("type") == "tool_result" and part.get("tool_use_id")),
-            None,
-        )
-        mapped_tool_turn = tool_turns.get(str(tool_id)) if tool_id else None
-        message_id = message.get("id") if isinstance(message, dict) else None
-        mapped_message_turn = message_turns.get(str(message_id)) if message_id else None
-        next_turn = str(mapped_tool_turn or mapped_message_turn or turn_id or current or record.get("timestamp") or len(turns))
-        if not mapped_tool_turn and not mapped_message_turn and role in {"assistant", "model"} and current in turns:
-            previous = turns[current]
-            # Text and tool_use records with the same message ID are one API
-            # response. A new assistant message starts the next turn so its
-            # usage stays with the content represented by that usage.
-            if previous["assistant"] or previous.get("tools"):
-                next_turn = f"{next_turn}:assistant:{len(turns)}"
-        if message_id and not mapped_tool_turn:
-            message_turns[str(message_id)] = next_turn
-        current = next_turn
-        turn = turns.setdefault(current, viewer.new_turn(current))
-        turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
         content = "\n".join(
             (
                 str(part.get("text", ""))
@@ -161,35 +147,58 @@ def details(summary: dict) -> dict:
             for part in content_parts
             if not (isinstance(part, dict) and part.get("type") in {"tool_use", "tool_result"})
         )
+
+        if role == "user" and not is_tool_result:
+            logical_id = str(turn_id or record.get("uuid") or f"turn-{len(turns) + 1}")
+            current_turn = turns.setdefault(logical_id, viewer.new_turn(logical_id))
+            current_turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
+            if content:
+                current_turn["user"] = str(content)
+            continue
+
+        if is_tool_result:
+            for part in content_parts:
+                if not isinstance(part, dict) or part.get("type") != "tool_result":
+                    continue
+                reference = tool_calls.get(str(part.get("tool_use_id")))
+                if reference is None:
+                    continue
+                owner_turn, _, tool = reference
+                if not owner_turn["raw"] or owner_turn["raw"][-1] != json.dumps(record, indent=2, ensure_ascii=False):
+                    owner_turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
+                tool["status"] = "completed"
+                tool["result"] = part.get("content", "")
+            continue
+
+        if current_turn is None:
+            if role not in {"assistant", "model"}:
+                continue
+            logical_id = str(turn_id or record.get("timestamp") or f"turn-{len(turns) + 1}")
+            current_turn = turns.setdefault(logical_id, viewer.new_turn(logical_id))
+
+        turn = current_turn
+        turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
+        message_id_value = message.get("id") if isinstance(message, dict) else None
+        message_id = str(message_id_value) if message_id_value else None
+        invocation = new_invocation(turn, message_id) if role in {"assistant", "model"} or is_tool_use else None
         if is_tool_use:
-            turn["kind"] = "tool"
             for part in content_parts:
                 if isinstance(part, dict) and part.get("type") == "tool_use":
-                    turn.setdefault("tools", []).append({
+                    tool = {
                         "id": part.get("id"),
                         "name": part.get("name", "unknown"),
                         "arguments": part.get("input", {}),
                         "status": "started",
-                    })
+                    }
+                    turn.setdefault("tools", []).append(tool)
+                    if invocation is not None:
+                        invocation["tools"].append(tool)
                     if part.get("id"):
-                        tool_turns[str(part["id"])] = next_turn
-        if is_tool_result:
-            turn["kind"] = "tool"
-            for part in content_parts:
-                if isinstance(part, dict) and part.get("type") == "tool_result":
-                    tools = turn.setdefault("tools", [])
-                    tool = next((entry for entry in tools if entry.get("id") == part.get("tool_use_id")), None)
-                    if tool is None:
-                        tool = {"id": part.get("tool_use_id"), "name": "unknown"}
-                        tools.append(tool)
-                    tool["status"] = "completed"
-                    tool["result"] = part.get("content", "")
-        if content and role == "user":
-            turn["user"] = str(content)
-        elif content and role in {"assistant", "model"}:
+                        tool_calls[str(part["id"])] = (turn, invocation, tool)
+        if content and role in {"assistant", "model"}:
             turn["assistant"].append(str(content))
-        elif content and is_tool_result:
-            turn["assistant"].append(str(content))
+            if invocation is not None:
+                invocation["assistant"].append(str(content))
         info = payload.get("info") or {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or (info.get("last_token_usage") if isinstance(info, dict) else {})
         if isinstance(usage, dict):
@@ -206,6 +215,8 @@ def details(summary: dict) -> dict:
                 for key, value in viewer.usage_from(usage).items():
                     if value is not None:
                         turn["tokens"][key] = (turn["tokens"][key] or 0) + value
+                        if invocation is not None:
+                            invocation["tokens"][key] = (invocation["tokens"][key] or 0) + value
         if not result["model"] and payload.get("model"):
             result["model"] = payload["model"]
     if records and isinstance(records[0], dict):

@@ -44,25 +44,27 @@ cloud-backed Claude Chat history.
 
 ## Turns
 
-Records are grouped by turn identifiers such as `turn_id`, `turnId`, metadata
-turn IDs, `promptId`, or a user-record UUID fallback. A new user message after
-an existing populated turn starts a new logical turn, even when Claude reuses
-the same turn ID. Usage is attached only when it occurs in a source record
-belonging to that turn.
+Each real user prompt starts a logical turn. Tool-result records serialized
+with the `user` role remain part of the active turn and are not treated as new
+prompts. Explicit turn identifiers are preferred, with the user-record UUID or
+a generated identifier used as a fallback.
 
-Tool activity is exposed separately:
+Each unique Claude assistant message ID becomes a numbered model invocation.
+Claude can persist the text and `tool_use` portions of one API response as
+separate records with the same message ID; the viewer combines those records
+into the same invocation and counts their shared usage only once.
 
-- Each `tool_use` starts a turn marked `kind: tool`.
-- Matching `tool_result` records stay with the active tool turn.
-- Tool names and inputs are shown as readable assistant-side content.
-- Tool results are shown as readable output rather than JSON user input.
+Tool activity is nested under its owning invocation:
+
+- Each `tool_use` adds a vertically listed tool to the current invocation.
+- Its ID links the matching `tool_result` back to that tool and invocation.
+- Tool names, inputs, completion status, and results are expandable.
 - Pure tool-result records are not treated as new user prompts.
-- Raw source records remain attached to the turn.
+- Raw source records remain attached to the logical turn.
 
-Tool-use/tool-result pairs are represented as separate `kind: tool` turns.
-Tool-result records serialized with the `user` role are treated as tool output,
-not as new user prompts. Turns without persisted usage keep token fields
-unavailable; token counts are never estimated from text length.
+A final assistant response without tools remains a separate invocation when
+the turn contains multiple invocations. A single no-tool invocation is not expanded because
+its metrics are already shown at turn level.
 
 ## Tokens
 
@@ -74,8 +76,13 @@ Usage is read from payload `usage`, message `usage`, `usageMetadata`, or nested 
 - `outputTokens`
 - `reasoningTokens`
 
-Per-turn values are summed into session totals. Missing usage remains unavailable rather than inferred from message length.
+Usage attached to an assistant message is displayed on that exact invocation,
+grouped as **User / Input** and **Assistant / Output**. Invocation values are
+summed into turn and session totals. Tool calls do not receive separate token
+counts because Claude reports usage for the model response, not for each tool.
+Missing usage remains unavailable rather than inferred from message length.
 
 ## Empty-session rule
 
-A session is non-empty when a parsed turn contains user input, assistant output, or any numeric token value, including zero. Tool turns containing readable tool input/output also qualify as non-empty.
+A session is non-empty when a parsed turn contains user input, assistant output,
+tool activity, or any numeric token value, including zero.
