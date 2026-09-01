@@ -586,18 +586,37 @@ def delete(summary: dict) -> None:
 
 
 def export_source_files(summary: dict, archive: Path) -> Path:
-    """Export file-backed Copilot sources; database rows are not portable files."""
-    sources = []
+    """Export one richest file-backed representation of a Copilot session.
+
+    Copilot can expose one logical conversation through session-state, chat
+    JSONL, and database sources. Exporting all of them can create duplicate
+    imported sessions because the file representations do not always carry
+    the same identifier. The database is never a portable source file.
+    """
+    viewer = _viewer()
+    candidates = []
     for source in summary.get("_sources") or [summary]:
         if source.get("_kind") == "copilot-db":
             continue
         path = source.get("_source")
-        if isinstance(path, Path) and path.name != "session-store.db":
-            target = "." if path.is_dir() else path.name
-            if source.get("_kind") == "copilot-chat":
-                target = f"chatSessions/{path.name}"
-            sources.append((path, target))
-    return create_archive("copilot", archive, sources)
+        if not isinstance(path, Path) or path.name == "session-store.db":
+            continue
+        try:
+            parsed = (_read_chat(path) if source.get("_kind") == "copilot-chat"
+                      else _read_session_state(path))
+            richness = sum(
+                1 for turn in parsed.get("turns", [])
+                if turn.get("user") or turn.get("assistant")
+            )
+            richness += sum(value is not None for value in parsed.get("tokens", {}).values())
+        except (OSError, ValueError):
+            richness = 0
+        candidates.append((richness, source.get("_kind") == "copilot-chat", path, source))
+    if not candidates:
+        return create_archive("copilot", archive, [])
+    _, is_chat, path, _ = max(candidates, key=lambda item: (item[0], item[1]))
+    target = f"chatSessions/{path.name}" if is_chat else "."
+    return create_archive("copilot", archive, [(path, target)])
 
 
 def import_source_files(archive: Path, root: Path) -> list[Path]:

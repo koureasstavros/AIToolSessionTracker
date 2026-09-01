@@ -55,6 +55,32 @@ class SourceArchiveTests(unittest.TestCase):
             with zipfile.ZipFile(archive) as exported:
                 self.assertNotIn("session-store.db", exported.namelist())
 
+    def test_copilot_merged_session_exports_one_richest_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            state = base / "state-session"
+            state.mkdir()
+            (state / "events.jsonl").write_text(
+                '{"type":"user.message","data":{"content":"state prompt"}}\n',
+                encoding="utf-8",
+            )
+            chat = base / "chat.jsonl"
+            chat.write_text(
+                json.dumps({"v": {"sessionId": "chat-id", "requests": [{"message": {"text": "chat prompt"}, "response": [{"value": "chat answer"}]}]}}),
+                encoding="utf-8",
+            )
+            archive = base / "merged.zip"
+            github_copilot_provider.export_source_files(
+                {"_sources": [
+                    {"_source": state, "_kind": "copilot-session-state"},
+                    {"_source": chat, "_kind": "copilot-chat"},
+                ]},
+                archive,
+            )
+            with zipfile.ZipFile(archive) as exported:
+                source_members = [name for name in exported.namelist() if name.startswith("sources/")]
+            self.assertEqual(len(source_members), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
