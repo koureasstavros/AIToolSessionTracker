@@ -86,7 +86,7 @@ def delete(summary: dict) -> None:
 
 
 def export_source_files(summary: dict, archive: Path) -> Path:
-    return create_archive("m365_copilot", archive, [(summary["_source"], summary["_source"].name)])
+    return create_archive("m365_copilot", archive, [(summary["_source"], ".")])
 
 
 def import_source_files(archive: Path, root: Path) -> list[Path]:

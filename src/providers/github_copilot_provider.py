@@ -615,7 +615,7 @@ def export_source_files(summary: dict, archive: Path) -> Path:
     if not candidates:
         return create_archive("copilot", archive, [])
     _, is_chat, path, _ = max(candidates, key=lambda item: (item[0], item[1]))
-    target = f"chatSessions/{path.name}" if is_chat else "."
+    target = "chatSessions" if is_chat else "."
     return create_archive("copilot", archive, [(path, target)])
 
 

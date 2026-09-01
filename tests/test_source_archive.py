@@ -27,6 +27,7 @@ class SourceArchiveTests(unittest.TestCase):
                     with zipfile.ZipFile(archive) as exported:
                         manifest = json.loads(exported.read("manifest.json"))
                     self.assertEqual(manifest["provider"], provider)
+                    self.assertEqual(manifest["files"][0]["target"], "transcript.jsonl")
                     adapter.import_source_files(archive, base / "viewer-root")
 
     def test_copilot_exports_session_state_and_injects_it(self) -> None:
@@ -79,7 +80,9 @@ class SourceArchiveTests(unittest.TestCase):
             )
             with zipfile.ZipFile(archive) as exported:
                 source_members = [name for name in exported.namelist() if name.startswith("sources/")]
+                manifest = json.loads(exported.read("manifest.json"))
             self.assertEqual(len(source_members), 1)
+            self.assertEqual(manifest["files"][0]["target"], "chatSessions/chat.jsonl")
 
 
 if __name__ == "__main__":
