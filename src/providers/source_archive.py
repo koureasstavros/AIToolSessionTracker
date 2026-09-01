@@ -10,7 +10,12 @@ from typing import Iterable
 MANIFEST = "manifest.json"
 
 
-def create_archive(provider: str, archive: Path, sources: Iterable[tuple[Path, str]]) -> Path:
+def create_archive(
+    provider: str,
+    archive: Path,
+    sources: Iterable[tuple[Path, str]],
+    exclude_names: set[str] | None = None,
+) -> Path:
     """Archive source files and directories with their provider-relative targets."""
     entries: list[dict[str, str]] = []
     archive.parent.mkdir(parents=True, exist_ok=True)
@@ -26,6 +31,8 @@ def create_archive(provider: str, archive: Path, sources: Iterable[tuple[Path, s
             else:
                 continue
             for path in files:
+                if exclude_names and path.name in exclude_names:
+                    continue
                 relative = path.relative_to(base).as_posix()
                 member = f"sources/{len(entries):06d}-{Path(relative).name}"
                 output.write(path, member)

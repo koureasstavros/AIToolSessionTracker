@@ -389,6 +389,12 @@ def index(root: Path) -> list[dict]:
                           else scan_root.rglob("chatSessions/*.jsonl"))
             entries.extend(viewer.session_summary(path, "copilot", "copilot-chat") for path in chat_files)
             candidates = [scan_root] if (scan_root / "events.jsonl").is_file() else list(scan_root.iterdir())
+            imported_root = scan_root / "imported"
+            if imported_root.is_dir():
+                candidates.extend(
+                    event_file.parent
+                    for event_file in imported_root.glob("*/events.jsonl")
+                )
             for path in candidates:
                 if path.is_dir() and path.name != "__pycache__" and (path / "events.jsonl").exists():
                     entries.append(viewer.session_summary(path, "copilot", "copilot-session-state"))
@@ -616,7 +622,12 @@ def export_source_files(summary: dict, archive: Path) -> Path:
         return create_archive("copilot", archive, [])
     _, is_chat, path, _ = max(candidates, key=lambda item: (item[0], item[1]))
     target = "chatSessions" if is_chat else "."
-    return create_archive("copilot", archive, [(path, target)])
+    return create_archive(
+        "copilot",
+        archive,
+        [(path, target)],
+        exclude_names={"session.db", "session-store.db"},
+    )
 
 
 def import_source_files(archive: Path, root: Path) -> list[Path]:
