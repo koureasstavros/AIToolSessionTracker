@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 
+from .source_archive import create_archive, inject_archive
+
 
 def _viewer():
     # Lazy import keeps the executable module's shared data model authoritative
@@ -581,3 +583,23 @@ def delete(summary: dict) -> None:
             if "session_id" in columns:
                 db.execute(f'DELETE FROM "{table}" WHERE session_id = ?', (session_id,))
         db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+
+def export_source_files(summary: dict, archive: Path) -> Path:
+    """Export file-backed Copilot sources; database rows are not portable files."""
+    sources = []
+    for source in summary.get("_sources") or [summary]:
+        if source.get("_kind") == "copilot-db":
+            continue
+        path = source.get("_source")
+        if isinstance(path, Path) and path.name != "session-store.db":
+            target = "." if path.is_dir() else path.name
+            if source.get("_kind") == "copilot-chat":
+                target = f"chatSessions/{path.name}"
+            sources.append((path, target))
+    return create_archive("copilot", archive, sources)
+
+
+def import_source_files(archive: Path, root: Path) -> list[Path]:
+    """Inject Copilot files into the supplied workspace-storage root."""
+    return inject_archive("copilot", archive, root / "imported")

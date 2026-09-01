@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sqlite3
+import tempfile
 import threading
 import webbrowser
 from datetime import datetime
@@ -674,9 +675,8 @@ def load_session_index(root: Path, provider: str, show_empty: bool = False) -> l
         # absent. Parse such summaries before hiding them so conversations
         # containing prompts or responses but no token statistics remain
         # visible.
-        if item.get("_has_data") is not True:
-            if not session_has_content(adapter.details(item)):
-                continue
+        if item.get("_has_data") is not True and not session_has_content(adapter.details(item)):
+            continue
         visible.append(item)
     return visible
 
@@ -692,6 +692,16 @@ def delete_session(summary: dict) -> None:
     if not isinstance(provider, str) or provider not in PROVIDER_ADAPTERS:
         raise ValueError("Session summary does not identify its provider")
     PROVIDER_ADAPTERS[provider].delete(summary)
+
+
+def export_session_sources(summary: dict, provider: str, archive: Path) -> Path:
+    """Export the owning provider's original source files."""
+    return PROVIDER_ADAPTERS[provider].export_source_files(summary, archive)
+
+
+def import_session_sources(provider: str, archive: Path, root: Path) -> list[Path]:
+    """Inject an archive into the owning provider's native local storage."""
+    return PROVIDER_ADAPTERS[provider].import_source_files(archive, root)
 
 
 def provider_path(root: Path, provider: str) -> Path:
@@ -909,7 +919,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         close_explorer_url = refresh_conversation_url
         detail = f'''<main class="detail"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>{esc(PROVIDERS.get(provider, provider))}</div><h1>{esc(chosen["name"])}</h1>
             <div class="header-chips"><span>{esc(session_tool(chosen_summary, provider))}</span><span>{esc(chosen["model"] or "Model unavailable")}</span><span>{esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span></div>
-            </div><div class="detail-actions"><a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
+            </div><div class="detail-actions"><a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a><a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
             <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
             <button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form></div></header>
             <section class="session-facts"><div><span>Session ID</span><code>{esc(chosen["id"])}</code></div><div><span>Project</span><code>{esc(chosen.get("project") or "Unavailable")}</code></div><div><span>Source</span><code>{esc(chosen.get("source") or "Unknown")}</code></div></section>
@@ -926,19 +936,67 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
 
     refresh_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty)}), quote=True)
     toggle_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(not show_empty)}), quote=True)
-    toggle = f'<a class="empty-toggle" href="{toggle_url}">{"Hide" if show_empty else "Show"} empty</a>'
-    return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__PROVIDER_MENU__", provider_menu).replace("__SESSION_ROWS__", session_rows).replace("__SESSION_COUNT__", str(len(sessions))).replace("__DETAIL__", detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", toggle).replace("__ROOT__", esc(provider_path(root, provider)))
+    toggle_label = "Hide empty sessions" if show_empty else "Show empty sessions"
+    toggle_icon = (
+        '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"></path><circle cx="12" cy="12" r="3"></circle></svg>'
+        if show_empty else
+        '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18"></path><path d="M10.6 5.2A10.8 10.8 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-3.2 4.2"></path><path d="M6.2 6.2C3.5 8.1 2 12 2 12s3.5 7 10 7a10.8 10.8 0 0 0 3.4-.6"></path></svg>'
+    )
+    toggle = f'<a class="empty-toggle" href="{toggle_url}" title="{toggle_label}" aria-label="{toggle_label}">{toggle_icon}</a>'
+    import_form = f'<form class="import-inline" method="post" action="/import" enctype="multipart/form-data"><input id="source-archive" name="archive" type="file" accept=".zip" required onchange="this.form.submit()"><input type="hidden" name="provider" value="{esc(provider)}"><label class="import-button" for="source-archive" title="Import one session archive" aria-label="Import one session archive">⇧</label></form>'
+    return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__PROVIDER_MENU__", provider_menu).replace("__SESSION_ROWS__", session_rows).replace("__SESSION_COUNT__", str(len(sessions))).replace("__DETAIL__", detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", toggle).replace("__ROOT__", esc(provider_path(root, provider))).replace("__IMPORT_FORM__", import_form)
 
 
 class Handler(BaseHTTPRequestHandler):
     root = Path(".")
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/delete":
+        route = urlparse(self.path).path
+        if route not in {"/delete", "/import"}:
             self.send_error(404)
             return
         length = int(self.headers.get("Content-Length", "0"))
-        form = parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
+        body = self.rfile.read(length)
+        if route == "/import":
+            from email.parser import BytesParser
+            from email.policy import default as email_policy
+            content_type = self.headers.get("Content-Type", "")
+            message = BytesParser(policy=email_policy).parsebytes(
+                f"Content-Type: {content_type}\r\n\r\n".encode() + body
+            )
+            provider = ""
+            upload = b""
+            filename = "source.zip"
+            for part in message.walk():
+                if part.get_content_disposition() != "form-data":
+                    continue
+                field = part.get_param("name", header="content-disposition")
+                if field == "provider":
+                    provider = part.get_content().strip()
+                elif field == "archive":
+                    filename = part.get_filename() or filename
+                    upload = part.get_payload(decode=True) or b""
+            if provider not in PROVIDERS or not upload or not filename.lower().endswith(".zip"):
+                self.send_error(400, "Invalid import request")
+                return
+            descriptor, temporary_name = tempfile.mkstemp(prefix="session-import-", suffix=".zip")
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            try:
+                temporary.write_bytes(upload)
+                import_session_sources(provider, temporary, self.root)
+            except (OSError, ValueError, KeyError) as error:
+                LOGGER.warning("Unable to import %s source archive: %s", provider, error)
+                self.send_error(400, "Unable to import source archive")
+                return
+            finally:
+                temporary.unlink(missing_ok=True)
+            self.send_response(303)
+            self.send_header("Location", f"/?{urlencode({'provider': provider, 'show_empty': 1})}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        form = parse_qs(body.decode("utf-8", errors="replace"))
         provider = form.get("provider", ["copilot"])[0]
         session_id = form.get("session", [""])[0]
         show_empty = form.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
@@ -962,7 +1020,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
-        query = parse_qs(urlparse(self.path).query)
+        parsed_url = urlparse(self.path)
+        if parsed_url.path == "/export":
+            query = parse_qs(parsed_url.query)
+            provider = query.get("provider", [""])[0]
+            session_id = query.get("session", [""])[0]
+            if provider not in PROVIDERS or not session_id:
+                self.send_error(400, "Invalid export request")
+                return
+            summary = next((item for item in load_session_index(self.root, provider, True) if item["id"] == session_id), None)
+            if summary is None:
+                self.send_error(404, "Session not found")
+                return
+            descriptor, temporary_name = tempfile.mkstemp(prefix="session-export-", suffix=".zip")
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            try:
+                export_session_sources(summary, provider, temporary)
+                body = temporary.read_bytes()
+            except (OSError, ValueError) as error:
+                LOGGER.warning("Unable to export %s source archive: %s", provider, error)
+                self.send_error(500, "Unable to export source files")
+                return
+            finally:
+                temporary.unlink(missing_ok=True)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{provider}-{session_id}.zip"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        query = parse_qs(parsed_url.query)
         provider = query.get("provider", ["copilot"])[0]
         if provider not in PROVIDERS:
             provider = "copilot"
@@ -993,9 +1083,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    from src.providers.github_copilot_provider import default_root as copilot_default_root
     parser = argparse.ArgumentParser(description="View Copilot session token usage")
-    parser.add_argument("--root", type=Path, default=copilot_default_root(), help="Copilot/agent session root folder")
+    parser.add_argument("--root", type=Path, default=github_copilot_provider.default_root(), help="Copilot/agent session root folder")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     Handler.root = args.root.expanduser().resolve()
@@ -1118,11 +1207,12 @@ PAGE = r'''<!doctype html>
 *{box-sizing:border-box}[hidden]{display:none!important}html{scroll-behavior:smooth}body{margin:0;min-width:320px;background:radial-gradient(circle at 72% -20%,rgba(70,83,170,.13),transparent 36%),var(--bg);color:var(--text)}
 a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height:100vh}.mobile-bar{display:none}.sidebar{position:fixed;inset:0 auto 0 0;width:var(--sidebar);display:flex;flex-direction:column;background:rgba(12,16,25,.96);border-right:1px solid var(--line);z-index:20;backdrop-filter:blur(18px)}
 .sidebar-top{padding:24px 20px 16px}.brand-row{display:flex;align-items:center;gap:11px}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:linear-gradient(145deg,#8b94ff,#5666de);box-shadow:0 8px 24px rgba(104,117,242,.3);font-size:17px;font-weight:800}.brand{font-size:15px;font-weight:750;letter-spacing:-.01em}.brand-subtitle{margin-top:2px;color:var(--subtle);font-size:11px}.path{margin:15px 0 0;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:#090d15;color:#718198;font:10px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.import-inline{display:inline-flex;margin:0}.import-inline input[type=file]{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}.import-button,.session-export-button{display:inline-flex;align-items:center;justify-content:center;width:34px;height:28px;border:1px solid var(--line-strong);border-radius:7px;background:var(--surface-3);color:var(--text);padding:0;font-size:14px;cursor:pointer;text-decoration:none;white-space:nowrap}.session-export-button{height:34px}.import-button:hover,.session-export-button:hover{border-color:var(--accent);background:#202c4a}.empty-toggle svg,.import-button svg,.session-export-button svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .provider-menu{display:grid;gap:3px;margin-top:14px;padding:4px;border:1px solid var(--line);border-radius:11px;background:#090d15}.provider{display:flex;align-items:center;gap:10px;min-width:0;height:34px;padding:0 11px;border-radius:7px;color:#8291a6;text-decoration:none;font-size:11px;font-weight:600}.provider>span:last-child{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.provider-mark{width:8px;height:8px;flex:none;border-radius:50%;background:#68768a;transition:.2s}.provider[data-provider="copilot"] .provider-mark{background:#a995ff}.provider[data-provider="codex"] .provider-mark{background:#70d6b5}.provider[data-provider="claude"] .provider-mark{background:#e8a06c}.provider[data-provider="m365_copilot"] .provider-mark{background:#58a7ff}.provider:hover{background:var(--surface-3);color:#c7d0de}.provider.selected{background:#20283a;color:#f1f5fb;box-shadow:inset 0 0 0 1px #35425a}.provider.selected .provider-mark{transform:scale(1.18);box-shadow:0 0 0 3px rgba(124,140,255,.12)}
-.sessions-area{display:flex;flex:1;min-height:0;flex-direction:column}.sessions-heading{padding:12px 20px 10px}.heading-line{display:flex;align-items:center;justify-content:space-between}.count{color:#aab5c6;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}.count b{display:inline-grid;place-items:center;min-width:20px;height:20px;margin-left:6px;border-radius:6px;background:#1b2432;color:#cdd6e3;letter-spacing:0}.sessions-heading-actions{display:flex;gap:6px}.empty-toggle,.refresh-sessions{display:grid;place-items:center;height:28px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--muted);text-decoration:none;font-size:10px}.empty-toggle{padding:0 8px}.refresh-sessions{width:28px;font-size:15px}.empty-toggle:hover,.refresh-sessions:hover{border-color:var(--line-strong);background:var(--surface-3);color:var(--text)}
+.sessions-area{display:flex;flex:1;min-height:0;flex-direction:column}.sessions-heading{padding:12px 20px 10px}.heading-line{display:flex;align-items:center;justify-content:space-between}.count{color:#aab5c6;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}.count b{display:inline-grid;place-items:center;min-width:20px;height:20px;margin-left:6px;border-radius:6px;background:#1b2432;color:#cdd6e3;letter-spacing:0}.sessions-heading-actions{display:flex;gap:6px}.empty-toggle,.refresh-sessions{display:grid;place-items:center;height:28px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--muted);text-decoration:none;font-size:10px}.empty-toggle{width:34px;padding:0;font-size:14px}.refresh-sessions{width:34px;font-size:15px}.empty-toggle:hover,.refresh-sessions:hover{border-color:var(--line-strong);background:var(--surface-3);color:var(--text)}
 .search-wrap{position:relative;margin-top:10px}.search-wrap svg{position:absolute;left:10px;top:9px;width:14px;color:#66758a}.session-search{width:100%;height:34px;padding:0 30px 0 31px;border:1px solid var(--line);border-radius:9px;outline:none;background:#090d15;color:var(--text);font-size:11px}.session-search::placeholder{color:#58677a}.session-search:focus{border-color:#5968bd;box-shadow:0 0 0 3px rgba(89,104,189,.12)}.search-key{position:absolute;right:8px;top:8px;color:#56657a;font:10px ui-monospace,monospace}
 .session-list{flex:1;min-height:0;overflow:auto;padding:0 10px 18px;scrollbar-width:thin;scrollbar-color:#344056 transparent}.empty-search{margin:24px 10px;padding:20px;border:1px dashed var(--line-strong);border-radius:10px;color:#6f7f95;text-align:center;font-size:11px}.session-row{position:relative;display:flex;align-items:center;margin:2px 0}.session{display:flex;align-items:flex-start;gap:10px;min-width:0;flex:1;padding:10px 34px 10px 10px;border:1px solid transparent;border-radius:11px;color:#b9c4d3;text-decoration:none}.session:hover{background:#131a26}.session.selected{border-color:#293750;background:linear-gradient(100deg,#182235,#131a27);color:#fff}.session-glyph{display:grid;place-items:center;width:27px;height:27px;flex:none;border:1px solid #29354a;border-radius:8px;background:#171f2e;color:#8396b2;font-size:10px;font-weight:800}.session.selected .session-glyph{border-color:#5362ad;background:#2a335b;color:#cdd3ff}.session-copy{min-width:0;flex:1}.session b{display:block;overflow:hidden;color:inherit;font-size:12px;font-weight:650;line-height:1.35;text-overflow:ellipsis;white-space:nowrap}.session small{display:block;overflow:hidden;margin-top:3px;color:#647389;font:9px/1.3 ui-monospace,monospace;text-overflow:ellipsis;white-space:nowrap}.session .session-meta{color:#73829a;font-family:inherit}.session-row form{position:absolute;right:8px;top:9px}.delete-session{display:grid;place-items:center;width:25px;height:25px;padding:0;border:0;border-radius:7px;background:transparent;color:#56657a;cursor:pointer;font-size:16px;opacity:0}.session-row:hover .delete-session,.delete-session:focus{opacity:1}.delete-session:hover{background:#331923;color:var(--danger)}
-.detail{width:calc(100% - var(--sidebar));min-height:100vh;margin-left:var(--sidebar);padding:42px clamp(24px,4vw,64px) 90px}.detail-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;max-width:1500px;margin:auto}.heading-copy{min-width:0}.eyebrow{display:flex;align-items:center;gap:7px;color:#8c9bb0;font-size:10px;font-weight:750;letter-spacing:.13em;text-transform:uppercase}.eyebrow>span{width:6px;height:6px;border-radius:50%;background:var(--accent-2);box-shadow:0 0 0 4px rgba(87,212,178,.09)}h1{max-width:900px;margin:8px 0 11px;font-size:clamp(25px,3vw,39px);font-weight:720;letter-spacing:-.035em;line-height:1.08;overflow-wrap:anywhere}.header-chips{display:flex;flex-wrap:wrap;gap:6px}.header-chips span{padding:5px 8px;border:1px solid var(--line);border-radius:7px;background:rgba(18,24,35,.7);color:#8090a6;font-size:10px}.detail-actions{display:flex;gap:7px}.icon-button{display:grid;place-items:center;width:34px;height:34px;padding:0;border:1px solid var(--line-strong);border-radius:9px;background:var(--surface-2);color:#a9b5c7;text-decoration:none;cursor:pointer}.icon-button:hover{background:var(--surface-3);color:#fff}.icon-button.danger:hover{border-color:#713243;background:#351721;color:var(--danger)}
+.detail{width:calc(100% - var(--sidebar));min-height:100vh;margin-left:var(--sidebar);padding:42px clamp(24px,4vw,64px) 90px}.detail-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;max-width:1500px;margin:auto}.heading-copy{min-width:0}.eyebrow{display:flex;align-items:center;gap:7px;color:#8c9bb0;font-size:10px;font-weight:750;letter-spacing:.13em;text-transform:uppercase}.eyebrow>span{width:6px;height:6px;border-radius:50%;background:var(--accent-2);box-shadow:0 0 0 4px rgba(87,212,178,.09)}h1{max-width:900px;margin:8px 0 11px;font-size:clamp(25px,3vw,39px);font-weight:720;letter-spacing:-.035em;line-height:1.08;overflow-wrap:anywhere}.header-chips{display:flex;flex-wrap:wrap;gap:6px}.header-chips span{padding:5px 8px;border:1px solid var(--line);border-radius:7px;background:rgba(18,24,35,.7);color:#8090a6;font-size:10px}.detail-actions{display:flex;gap:7px}.icon-button{display:grid;place-items:center;width:34px;height:34px;padding:0;border:1px solid var(--line-strong);border-radius:9px;background:var(--surface-2);color:#a9b5c7;text-decoration:none;cursor:pointer}.icon-button:hover{background:var(--surface-3);color:#fff}.icon-button.danger:hover{border-color:#713243;background:#351721;color:var(--danger)}.detail-refresh{width:34px;height:34px;padding:0}
 .session-facts{display:grid;grid-template-columns:minmax(160px,.7fr) minmax(220px,1fr) minmax(220px,1.3fr);max-width:1500px;margin:27px auto 0;border:1px solid var(--line);border-radius:12px;background:rgba(13,18,27,.72);overflow:hidden}.session-facts>div{min-width:0;padding:11px 14px;border-right:1px solid var(--line)}.session-facts>div:last-child{border:0}.session-facts span{display:block;margin-bottom:4px;color:#59687d;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.session-facts code{display:block;overflow:hidden;color:#8595aa;font:10px ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.provider-note{max-width:1500px;margin:10px auto 0;padding:10px 13px;border:1px solid #39452e;border-radius:9px;background:#171d13;color:#aeb99e;font-size:11px}.provider-note b{margin-right:8px;color:#c9d3ba}
 .overview,.conversation{max-width:1500px;margin:38px auto 0}.section-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:13px}.section-kicker{display:block;margin-bottom:4px;color:#5f7088;font-size:9px;font-weight:800;letter-spacing:.16em}.section-heading h2,.explorer-header h2{margin:0;font-size:16px;font-weight:680;letter-spacing:-.01em}.overview-stats{display:flex;align-items:center;gap:8px}.overview-stats span{padding:6px 9px;border:1px solid var(--line);border-radius:8px;color:#6f7e92;font-size:10px}.overview-stats b{color:#cbd4e1;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.metric{position:relative;display:flex;min-width:0;min-height:70px;flex-direction:column;align-items:center;justify-content:center;padding:14px 15px;border:1px solid var(--line);border-radius:11px;background:linear-gradient(145deg,#121925,#0f151f);text-align:center;overflow:hidden}.metric:before{content:"";position:absolute;inset:auto 0 0;height:2px;background:#6676d8;opacity:.5}.metric[data-metric="cacheReadTokens"]:before{background:#42b8c4}.metric[data-metric="cacheWriteTokens"]:before{background:#b985e5}.metric[data-metric="outputTokens"]:before{background:#54c99f}.metric[data-metric="reasoningTokens"]:before{background:#e4a35f}.metric span{display:block;width:100%;overflow:hidden;color:#697a91;font-size:9px;font-weight:700;letter-spacing:.06em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.metric strong{display:block;margin-top:8px;color:#e9eef7;font:600 19px/1 ui-monospace,SFMono-Regular,Consolas,monospace}.metric.compact{min-height:52px;padding:9px 10px;border-radius:8px;text-decoration:none}.metric.compact strong{margin-top:5px;font-size:12px}.metric.clickable{transition:transform .15s,border-color .15s,background .15s}.metric.clickable:hover{transform:translateY(-1px);border-color:#42516a;background:#182131}.metric.clickable.active{border-color:#6878db;background:#202843;box-shadow:0 0 0 2px rgba(104,120,219,.11)}
 .muted{color:#687990;font-size:10px}.content-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,340px);align-items:start;gap:14px}.turns{display:grid;gap:12px;min-width:0}.turn{min-width:0;border:1px solid var(--line);border-radius:var(--radius);background:rgba(14,19,29,.82);box-shadow:0 12px 36px rgba(0,0,0,.08);overflow:hidden}.turn>header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line);background:#111722}.turn-number{display:flex;align-items:center;gap:10px}.turn-number>span{display:grid;place-items:center;width:29px;height:29px;border:1px solid #2c3950;border-radius:8px;background:#182131;color:#8191aa;font:10px ui-monospace,monospace}.turn-number b{display:block;font-size:12px}.turn-number small{display:block;margin-top:2px;color:#5f6e83;font-size:9px}.turn-badges{display:flex;gap:5px}.step-count,.turn-kind,.summary-count{padding:4px 7px;border:1px solid #34425a;border-radius:999px;background:#1a2332;color:#8fa0b8;font-size:8px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}.message{display:grid;grid-template-columns:72px minmax(0,1fr);gap:10px;padding:14px 16px;border-bottom:1px solid rgba(32,42,58,.7)}.message.assistant{background:rgba(15,23,34,.6)}.role{display:flex;align-items:center;gap:7px;height:24px}.role>span{display:grid;place-items:center;width:22px;height:22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800}.assistant .role>span{background:#15372f;color:#8ee4c9}.message label{color:#7f8ea4;font-size:9px;font-weight:750;text-transform:uppercase}.message p{min-width:0;margin:2px 0 0;color:#b9c5d5;font:11px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;white-space:pre-wrap}.message.user p{color:#d8e0eb}.message.tool{display:block;background:#101722}.message.tool label{display:block;margin-bottom:4px}.message.tool code{display:inline-block;max-width:100%;margin-top:5px;color:#8ba0ba;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -1141,12 +1231,11 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
     <aside class="sidebar" id="sidebar">
         <div class="sidebar-top">
             <div class="brand-row"><span class="brand-mark">AI</span><div><div class="brand">__APP_NAME__</div><div class="brand-subtitle">Local AI activity</div></div></div>
-            <div class="path" title="__ROOT__">__ROOT__</div>
             <nav class="provider-menu" aria-label="AI providers">__PROVIDER_MENU__</nav>
         </div>
         <div class="sessions-area">
             <div class="sessions-heading">
-                <div class="heading-line"><div class="count">Sessions <b>__SESSION_COUNT__</b></div><div class="sessions-heading-actions">__EMPTY_TOGGLE__<a class="refresh-sessions" href="__REFRESH_URL__" aria-label="Refresh sessions" title="Refresh sessions">↻</a></div></div>
+                <div class="heading-line"><div class="count">Sessions <b>__SESSION_COUNT__</b></div><div class="sessions-heading-actions">__EMPTY_TOGGLE__<a class="refresh-sessions" href="__REFRESH_URL__" aria-label="Refresh sessions" title="Refresh sessions">↻</a>__IMPORT_FORM__</div></div>
                 <div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg><input class="session-search" type="search" placeholder="Filter sessions…" aria-label="Filter sessions"><span class="search-key">/</span></div>
             </div>
             <div class="session-list">__SESSION_ROWS__<div class="empty-search" hidden>No matching sessions</div></div>

@@ -3,6 +3,8 @@ from pathlib import Path
 import json
 import re
 
+from .source_archive import create_archive, inject_archive
+
 UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 
 
@@ -197,3 +199,11 @@ def details(summary: dict) -> dict:
 
 def delete(summary: dict) -> None:
     summary["_source"].unlink()
+
+
+def export_source_files(summary: dict, archive: Path) -> Path:
+    return create_archive("codex", archive, [(summary["_source"], summary["_source"].name)])
+
+
+def import_source_files(archive: Path, root: Path) -> list[Path]:
+    return inject_archive("codex", archive, display_root(root) / "imported")

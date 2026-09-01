@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "model", "llm", "slm", "session", "tracker", "turn", "invocation"]
 license: "apache-2.0"
-version: v0.0.10
+version: v0.0.11
 ---
 
 # AI Tool Session Explorer
@@ -59,6 +59,28 @@ documented separately:
 
 The viewer only reads local transcripts or user-provided exports. It does not
 download cloud-only chat history.
+
+## Import and export source files
+
+The detail header provides **Export source files** for the selected conversation.
+The download is a ZIP containing the provider's original transcript files and a
+manifest. Use **Import source files** in the provider sidebar to inject a ZIP
+back into local provider storage; existing filenames are preserved when
+possible, and collisions receive a generated suffix.
+
+Imports are provider-specific:
+
+- GitHub Copilot injects file-backed sessions into the configured workspace
+	storage root's `imported` folder. Copilot database rows are intentionally not
+	exported because a database copy cannot be safely merged into the live
+	session store.
+- OpenAI Codex injects transcripts into `~/.codex/sessions/imported`.
+- Anthropic Claude Code injects transcripts into `~/.claude/projects/imported`.
+- Microsoft 365 Copilot injects transcripts into the `imported` subfolder of
+	`M365_COPILOT_ROOT` or its default local export directory.
+
+Archives are validated for provider ownership and path traversal before any
+file is written.
 
 ## Provider architecture
 

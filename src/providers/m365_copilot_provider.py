@@ -6,6 +6,8 @@ local folder and reuses the viewer's generic message and usage parser.
 """
 from pathlib import Path
 
+from .source_archive import create_archive, inject_archive
+
 
 def _viewer():
     import session_token_viewer as viewer
@@ -81,3 +83,11 @@ def details(summary: dict) -> dict:
 
 def delete(summary: dict) -> None:
     summary["_source"].unlink()
+
+
+def export_source_files(summary: dict, archive: Path) -> Path:
+    return create_archive("m365_copilot", archive, [(summary["_source"], summary["_source"].name)])
+
+
+def import_source_files(archive: Path, root: Path) -> list[Path]:
+    return inject_archive("m365_copilot", archive, default_root() / "imported")
