@@ -69,7 +69,7 @@ def _read_session_state(folder: Path) -> dict:
             turn = get_turn(interaction_id)
             turn["raw"].append(json.dumps(event, indent=2, ensure_ascii=False))
         if event_type == "session.start":
-            session["model"] = data.get("selectedModel")
+            session["model"] = data.get("model") or data.get("modelId") or data.get("selectedModel")
         elif event_type == "assistant.turn_start":
             interaction_id = interaction_id or turn_id
             turn_interactions[turn_id] = interaction_id
@@ -80,6 +80,10 @@ def _read_session_state(folder: Path) -> dict:
                 turn["user"] = str(data.get("content", ""))
         elif event_type == "assistant.message":
             turn = get_turn(interaction_id)
+            if isinstance(data.get("model"), str) and data["model"]:
+                turn["model"] = data["model"]
+            elif isinstance(data.get("modelId"), str) and data["modelId"]:
+                turn["model"] = data["modelId"]
             turn["_event_invocation_count"] = turn.get("_event_invocation_count", 0) + 1
             invocation = get_invocation(turn, turn["_event_invocation_count"])
             if data.get("content"):
@@ -119,7 +123,9 @@ def _read_session_state(folder: Path) -> dict:
             if isinstance(metrics, dict):
                 for model_name, model in metrics.items():
                     if isinstance(model, dict):
-                        session["model"] = session["model"] or str(model_name)
+                        # modelMetrics is the authoritative API model name;
+                        # selectedModel can be a deployment/display alias.
+                        session["model"] = str(model_name)
                         viewer.add_token_usage(session["tokens"], model.get("usage") or {})
 
     session["turns"] = list(turns.values())
@@ -141,6 +147,7 @@ def _read_session_state(folder: Path) -> dict:
                 value = total - assigned if index == len(weights) - 1 else int(total * weights[index] / total_weight)
                 assigned += value
                 turn["tokens"][key] = value
+    session["deployment"] = viewer.deployment_from_records(records)
     return session
 
 
@@ -182,6 +189,8 @@ def _read_chat(path: Path) -> dict:
             requests[key[1]][str(key[2])] = value
     for index, request in enumerate(requests, 1):
         turn = viewer.new_turn(str(request.get("requestId") or index))
+        if isinstance(request.get("modelId"), str) and request["modelId"]:
+            turn["model"] = request["modelId"]
         message = request.get("message") or {}
         if isinstance(message, dict):
             turn["user"] = str(message.get("text") or "")
@@ -267,6 +276,7 @@ def _read_chat(path: Path) -> dict:
         for key in ("inputTokens", "outputTokens"):
             session["tokens"][key] = (session["tokens"][key] or 0) + (turn["tokens"][key] or 0)
     session["model"] = str(next((request.get("modelId") for request in requests if request.get("modelId")), "model unavailable"))
+    session["deployment"] = viewer.deployment_from_records(records)
     return session
 
 
@@ -387,7 +397,16 @@ def index(root: Path) -> list[dict]:
         try:
             chat_files = (scan_root.glob("*.jsonl") if scan_root.name == "emptyWindowChatSessions"
                           else scan_root.rglob("chatSessions/*.jsonl"))
-            entries.extend(viewer.session_summary(path, "copilot", "copilot-chat") for path in chat_files)
+            chat_paths = list(chat_files)
+            for path in chat_paths:
+                if viewer.is_subagent_path(path):
+                    continue
+                entry = viewer.session_summary(path, "copilot", "copilot-chat")
+                entry["_children"] = [
+                    viewer.session_summary(child, "copilot", "copilot-chat")
+                    for child in viewer.related_subagent_paths(path, chat_paths)
+                ]
+                entries.append(entry)
             candidates = [scan_root] if (scan_root / "events.jsonl").is_file() else list(scan_root.iterdir())
             imported_root = scan_root / "imported"
             if imported_root.is_dir():
@@ -471,6 +490,7 @@ def details(summary: dict) -> dict:
         database_usage = source_summary.get("_kind") == "copilot-db"
         result["name"] = result.get("name") if result.get("name") not in {None, "", result["id"]} else supplement.get("name", result["name"])
         result["model"] = result.get("model") if result.get("model") not in {None, "", "model unavailable"} else supplement.get("model")
+        result["deployment"] = result.get("deployment") or supplement.get("deployment")
         result["project"] = result.get("project") or supplement.get("project")
         result["updated"] = max(result.get("updated", 0), supplement.get("updated", 0))
         if database_usage:
@@ -564,6 +584,20 @@ def details(summary: dict) -> dict:
         result["updated"] = max(result.get("updated", 0), metadata.get("updated") or 0)
     if not result.get("project"):
         result["project"] = summary.get("project")
+    result["ownTokens"] = dict(result.get("tokens", {}))
+    result["subagents"] = []
+    result["subagentTokens"] = viewer.blank_tokens()
+    for child_summary in summary.get("_children", []):
+        if not isinstance(child_summary, dict) or not isinstance(child_summary.get("_source"), Path):
+            continue
+        child = details(child_summary)
+        child["relation"] = "subagent"
+        result["subagents"].append(child)
+        for key in viewer.TOKEN_KEYS:
+            value = child.get("tokens", {}).get(key)
+            if isinstance(value, int):
+                result["subagentTokens"][key] = (result["subagentTokens"][key] or 0) + value
+                result["tokens"][key] = (result["tokens"][key] or 0) + value
     result["source"] = str(summary.get("_source", ""))
     return result
 
@@ -572,6 +606,17 @@ def delete(summary: dict) -> None:
     viewer = _viewer()
     if summary["_kind"] != "copilot-db":
         source = summary["_source"]
+        if summary.get("relation") == "subagent":
+            if summary["_kind"] == "copilot-session-state":
+                import shutil
+                shutil.rmtree(source)
+            else:
+                source.unlink()
+            return
+        for child in summary.get("_children", []):
+            child_source = child.get("_source") if isinstance(child, dict) else None
+            if isinstance(child_source, Path):
+                child_source.unlink(missing_ok=True)
         if summary["_kind"] == "copilot-session-state":
             import shutil
             shutil.rmtree(source)

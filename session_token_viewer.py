@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TypedDict
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
+from src import pricing
 from src.providers import anthropic_claude_provider
 from src.providers import github_copilot_provider
 from src.providers import m365_copilot_provider
@@ -70,6 +71,7 @@ class SessionData(TypedDict, total=False):
     turns: list[dict]
     tokens: dict[str, int | None]
     model: str | None
+    deployment: str | None
     project: str | None
     source: str
     _source: Path
@@ -94,11 +96,20 @@ def normalize_session_data(value: dict) -> SessionData:
         "turns": value.get("turns") if isinstance(value.get("turns"), list) else [],
         "tokens": tokens,
         "model": value.get("model") if isinstance(value.get("model"), str) else None,
+        "deployment": value.get("deployment") if isinstance(value.get("deployment"), str) else None,
         "project": value.get("project") if isinstance(value.get("project"), str) else None,
     }
-    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_session_id", "_db_metadata", "_db_issue", "_has_data", "provider"):
+    result["costUsd"] = value.get("costUsd") if isinstance(value.get("costUsd"), (int, float)) else None
+    result["pricingModel"] = value.get("pricingModel") if isinstance(value.get("pricingModel"), str) else None
+    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_session_id", "_db_metadata", "_db_issue", "_has_data", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation"):
         if key in value:
             result[key] = value[key]
+    for turn in result["turns"]:
+        if not isinstance(turn, dict) or not isinstance(turn.get("invocations"), list):
+            continue
+        for invocation in turn["invocations"]:
+            if isinstance(invocation, dict):
+                invocation["isSubagent"] = is_subagent_invocation(invocation)
     return result
 
 
@@ -132,7 +143,8 @@ def conversation_name(name: object, session_id: str) -> str:
 
 
 def derived_conversation_name(records: list[dict], fallback: str) -> str:
-    """Use the first real user message when a provider stores no title."""
+    """Derive a readable name from the first meaningful user prompt."""
+    slash_command: str | None = None
     for record in records:
         payload = record.get("payload", record)
         if not isinstance(payload, dict):
@@ -148,12 +160,52 @@ def derived_conversation_name(records: list[dict], fallback: str) -> str:
             for part in parts
             if isinstance(part, dict) and part.get("type") != "tool_result" and part.get("text")
         ) if isinstance(content, list) else str(content)
-        text = " ".join(text.split())
-        if text.lower().startswith(("<environment_context>", "<system>", "<developer>")):
+        text = clean_session_prompt(text)
+        if not text:
             continue
-        if text:
-            return text[:77].rstrip() + "..." if len(text) > 80 else text
-    return fallback
+        if is_slash_command(text):
+            slash_command = slash_command or text
+            continue
+        return text[:77].rstrip() + "..." if len(text) > 80 else text
+    return slash_command or fallback
+
+
+def clean_session_prompt(text: str) -> str:
+    """Remove generated command boilerplate and unwrap a leading prompt tag."""
+    text = " ".join(text.split()).strip()
+    lowered = text.lower()
+    skipped_prefixes = (
+        "<environment_context>", "<system>", "<developer>",
+        "<local-command-caveat>", "<local-command-stdout>",
+        "<command-name>", "<command-message>", "<command-args>",
+        "<skill>", "skill launch:", "launching skill:",
+    )
+    if lowered.startswith(skipped_prefixes):
+        return ""
+    # Generated local-command output can have a prose prefix rather than a
+    # dedicated XML tag. It should never become a conversation title.
+    if lowered.startswith(("caveat: the messages below", "this is the output of a local command")):
+        return ""
+    wrapper = re.fullmatch(r"<([a-z][a-z0-9_-]*)>\s*(.*?)\s*</\1>", text, re.IGNORECASE)
+    if wrapper:
+        text = " ".join(wrapper.group(2).split()).strip()
+    return text
+
+
+def is_slash_command(text: str) -> bool:
+    return bool(re.fullmatch(r"/[A-Za-z0-9][A-Za-z0-9_-]*(?:\s+.*)?", text))
+
+
+def is_subagent_invocation(invocation: dict) -> bool:
+    """Identify delegated-agent invocations from common provider tool names."""
+    tools = invocation.get("tools") if isinstance(invocation.get("tools"), list) else []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or tool.get("toolName") or "").strip().lower()
+        if re.search(r"(?:subagent|spawn[_ -]?agent|run[_ -]?agent|delegate|^agent$|^task$)", name):
+            return True
+    return bool(invocation.get("isSubagent"))
 
 
 def blank_tokens() -> dict[str, int | None]:
@@ -161,7 +213,7 @@ def blank_tokens() -> dict[str, int | None]:
 
 
 def new_session(session_id: str, name: str, updated: float, model: str | None = None, project: str | None = None) -> dict:
-    return {"id": session_id, "name": name, "updated": updated, "turns": [], "tokens": blank_tokens(), "model": model, "project": project}
+    return {"id": session_id, "name": name, "updated": updated, "turns": [], "tokens": blank_tokens(), "model": model, "deployment": None, "project": project}
 
 
 def new_turn(turn_id: str) -> dict:
@@ -292,6 +344,53 @@ def project_from_records(records: list[dict]) -> str | None:
         return None
 
     return visit(records)
+
+
+def model_from_records(records: list[dict]) -> str | None:
+    """Resolve a model name without mistaking a deployment name for it."""
+    preferred = ("model", "modelId", "model_id", "modelName", "model_name", "selectedModel")
+    return first_metadata_value(records, preferred)
+
+
+def first_metadata_value(records: object, keys: tuple[str, ...]) -> str | None:
+    """Safely find the first non-empty string for explicit metadata keys."""
+    if isinstance(records, dict):
+        for key in keys:
+            candidate = records.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        for child in records.values():
+            result = first_metadata_value(child, keys)
+            if result:
+                return result
+    elif isinstance(records, list):
+        for child in records:
+            result = first_metadata_value(child, keys)
+            if result:
+                return result
+    return None
+
+
+def deployment_from_records(records: list[dict]) -> str | None:
+    """Resolve a provider deployment/display identifier separately."""
+    preferred = ("deployment", "deploymentName", "deployment_name", "selectedModel")
+    return first_metadata_value(records, preferred)
+
+
+def is_subagent_path(path: Path) -> bool:
+    return path.parent.name == "subagents" and path.name.startswith("agent-")
+
+
+def related_subagent_paths(parent: Path, files: list[Path]) -> list[Path]:
+    """Find agent transcripts belonging to a parent directory."""
+    if is_subagent_path(parent):
+        return []
+    roots = [path for path in files if path.parent == parent.parent and not is_subagent_path(path)]
+    children = [
+        path for path in files
+        if is_subagent_path(path) and path.parent.parent == parent.parent
+    ]
+    return children if len(roots) == 1 else []
 
 
 def workspace_project_path(folder: Path) -> str | None:
@@ -592,6 +691,9 @@ def parse_export_session(path: Path, provider: str) -> dict:
         current_turn = turn_id
         raw = json.dumps(record, indent=2, ensure_ascii=False)
         turn = get_turn(turn_id)
+        turn_model = model_from_records([record])
+        if turn_model:
+            turn["model"] = turn_model
         turn["raw"].append(raw)
         author = payload.get("author") or message.get("author") or item.get("author") or {}
         if not isinstance(author, dict):
@@ -628,19 +730,8 @@ def parse_export_session(path: Path, provider: str) -> dict:
                     if value is not None:
                         turn["tokens"][key] = (turn["tokens"][key] or 0) + value
     session["turns"] = list(turns.values())
-    model = next(
-        (
-            candidate
-            for record in records
-            for candidate in (
-                record.get("model"),
-                (record.get("message") or {}).get("model") if isinstance(record.get("message"), dict) else None,
-                (record.get("payload") or {}).get("model") if isinstance(record.get("payload"), dict) else None,
-            )
-            if isinstance(candidate, str) and candidate
-        ),
-        None,
-    )
+    model = model_from_records(records)
+    session["deployment"] = deployment_from_records(records)
     session["model"] = model or provider
     for key in TOKEN_KEYS:
         values = [turn["tokens"][key] for turn in session["turns"] if turn["tokens"][key] is not None]
@@ -683,7 +774,7 @@ def load_session_index(root: Path, provider: str, show_empty: bool = False) -> l
 
 def load_session_details(summary: dict, provider: str) -> dict:
     """Load one full transcript through its provider adapter."""
-    return normalize_session_data(PROVIDER_ADAPTERS[provider].details(summary))
+    return pricing.apply_costs(normalize_session_data(PROVIDER_ADAPTERS[provider].details(summary)))
 
 
 def delete_session(summary: dict) -> None:
@@ -712,6 +803,25 @@ def fmt(value: int | None) -> str:
     return "—" if value is None else f"{value:,}"
 
 
+def fmt_cost(value: float | None) -> str:
+    return "—" if value is None else f"${value:,.2f}"
+
+
+def fmt_unit(value: float | int, currency: bool = False) -> str:
+    """Format large values compactly for chart labels and hover text."""
+    magnitude = abs(float(value))
+    suffix = ""
+    scaled = magnitude
+    for threshold, label in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if magnitude >= threshold:
+            scaled = magnitude / threshold
+            suffix = label
+            break
+    prefix = "$" if currency else ""
+    sign = "-" if value < 0 else ""
+    return f"{sign}{prefix}{scaled:.1f}{suffix}" if suffix else f"{sign}{prefix}{scaled:,.0f}"
+
+
 def format_timestamp(value: float) -> str:
     if not value:
         return "Unknown time"
@@ -722,18 +832,20 @@ def esc(value: object, quote: bool = True) -> str:
     return html.escape(str(value), quote=quote)
 
 
-def token_cards(tokens: dict[str, int | None], extra_class: str = "") -> str:
+def token_cards(tokens: dict[str, int | None], model: str | None = None, extra_class: str = "", costs: dict[str, float] | None = None) -> str:
+    costs = costs if costs is not None else pricing.cost_breakdown(tokens, model)
     return "".join(
-        f'<div class="metric {extra_class}" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))}</strong></div>'
+        f'<div class="metric {extra_class}" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
         for key in TOKEN_KEYS
     )
 
 
-def invocation_token_cards(tokens: dict[str, int | None]) -> str:
+def invocation_token_cards(tokens: dict[str, int | None], model: str | None = None) -> str:
     """Render per-invocation usage grouped by the side of the model exchange."""
+    costs = pricing.cost_breakdown(tokens, model)
     def cards(keys: tuple[str, ...]) -> str:
         return "".join(
-            f'<div class="metric compact" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))}</strong></div>'
+            f'<div class="metric compact" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
             for key in keys
         )
 
@@ -747,7 +859,8 @@ def invocation_token_cards(tokens: dict[str, int | None]) -> str:
     )
 
 
-def turn_token_cards(tokens: dict[str, int | None], session_id: str, provider: str, turn_index: int, selected_turn: int | None, selected_metric: str | None, show_empty: bool = False) -> str:
+def turn_token_cards(tokens: dict[str, int | None], model: str | None, session_id: str, provider: str, turn_index: int, selected_turn: int | None, selected_metric: str | None, show_empty: bool = False) -> str:
+    costs = pricing.cost_breakdown(tokens, model)
     cards = []
     for key in TOKEN_KEYS:
         active = selected_turn == turn_index and selected_metric == key
@@ -760,7 +873,7 @@ def turn_token_cards(tokens: dict[str, int | None], session_id: str, provider: s
         }), quote=True)
         cards.append(
             f'<a class="metric compact clickable {"active" if active else ""}" data-metric="{esc(key)}" href="{href}">'
-            f'<span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))}</strong></a>'
+            f'<span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></a>'
         )
     return "".join(cards)
 
@@ -789,6 +902,10 @@ def invocation_tools(invocation: dict) -> str:
             f'<div class="invocation-tool-body">{"".join(sections) or "No stored arguments or result."}</div></details>'
         )
     return '<div class="invocation-tools">' + "".join(rendered) + '</div>'
+
+
+def invocation_subagent_badge(invocation: dict) -> str:
+    return ""
 
 
 def explorer_content(turn: dict, metric: str | None) -> tuple[str, str, str]:
@@ -834,12 +951,148 @@ def render_session_row(item: dict, provider: str, selected: bool, show_empty: bo
     )
 
 
+def statistics_group_key(session: dict, group: str, provider: str, summary: dict) -> str:
+    if group == "tool":
+        return PROVIDERS.get(provider, provider)
+    if group == "model":
+        return str(session.get("pricingModel") or session.get("model") or "Unknown model")
+    if group == "project":
+        project = session.get("project")
+        if not project:
+            return "Unknown project"
+        # Windows paths are case-insensitive; normalize separators and case
+        # so the same workspace cannot appear in multiple project rows.
+        return os.path.normcase(os.path.normpath(str(project)))
+    timestamp = session.get("updated") or 0
+    if not timestamp:
+        return "Unknown date"
+    date = datetime.fromtimestamp(timestamp).date()
+    if group == "month":
+        return date.strftime("%Y-%m")
+    if group == "year":
+        return date.strftime("%Y")
+    if group == "week":
+        year, week, _ = date.isocalendar()
+        return f"{year}-W{week:02d}"
+    return date.isoformat()
+
+
+def render_timeline_svg(points: dict[str, dict[str, float]]) -> str:
+    """Render a compact dual-line timeline for tokens and USD cost."""
+    ordered = sorted(points.items())
+    if not ordered:
+        return '<div class="timeline-empty">No dated session data is available.</div>'
+    width, height, left, right, top, bottom = 1000, 330, 58, 28, 24, 54
+    cost_axis = width - right - 34
+    chart_width, chart_height = cost_axis - left, height - top - bottom
+    max_tokens = max((item["tokens"] for _, item in ordered), default=1) or 1
+    max_cost = max((item["cost"] for _, item in ordered), default=1) or 1
+
+    def coordinates(key: str, maximum: float) -> str:
+        values = []
+        denominator = max(len(ordered) - 1, 1)
+        for index, (_, item) in enumerate(ordered):
+            x = left + chart_width * index / denominator
+            y = top + chart_height * (1 - item[key] / maximum)
+            values.append(f"{x:.1f},{y:.1f}")
+        return " ".join(values)
+
+    def markers(key: str, maximum: float, css_class: str) -> str:
+        denominator = max(len(ordered) - 1, 1)
+        return "".join(
+            f'<circle class="timeline-point {css_class}" cx="{left + chart_width * index / denominator:.1f}" cy="{top + chart_height * (1 - item[key] / maximum):.1f}" r="5"><title>{esc(label)} · {"Tokens" if key == "tokens" else "Cost"}: {fmt_unit(item[key], key == "cost")}</title></circle>'
+            for index, (label, item) in enumerate(ordered)
+        )
+
+    labels = "".join(
+        f'<text x="{left + chart_width * index / max(len(ordered) - 1, 1):.1f}" y="{height - 22}" text-anchor="middle">{esc(label)}</text>'
+        for index, (label, _) in enumerate(ordered)
+    )
+    token_ticks = "".join(
+        f'<text class="tokens-axis-label" x="{left - 9}" y="{top + chart_height * (1 - fraction) + 4:.1f}" text-anchor="end">{fmt_unit(max_tokens * fraction)}</text>'
+        for fraction in (0, 0.5, 1)
+    )
+    cost_ticks = "".join(
+        f'<text class="cost-axis-label" x="{width - right + 9}" y="{top + chart_height * (1 - fraction) + 4:.1f}" text-anchor="start">{fmt_unit(max_cost * fraction, True)}</text>'
+        for fraction in (0, 0.5, 1)
+    )
+    return f'''<div class="timeline-chart"><div class="timeline-legend"><span class="timeline-key tokens-key">Tokens</span><span class="timeline-key cost-key">Cost</span><span class="timeline-hint">Hover points for details</span></div><svg viewBox="0 0 {width} {height}" role="img" aria-label="Token and cost timeline"><line class="timeline-axis" x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}"/><line class="timeline-axis" x1="{cost_axis}" y1="{top}" x2="{cost_axis}" y2="{height - bottom}"/><line class="timeline-axis" x1="{left}" y1="{height - bottom}" x2="{cost_axis}" y2="{height - bottom}"/>{token_ticks}{cost_ticks}<text class="tokens-axis-title" x="12" y="{top + chart_height / 2}" text-anchor="middle" transform="rotate(-90 12 {top + chart_height / 2})">Tokens</text><text class="cost-axis-title" x="{cost_axis + 22}" y="{top + chart_height / 2}" text-anchor="middle" transform="rotate(90 {cost_axis + 22} {top + chart_height / 2})">Cost</text><polyline class="timeline-tokens" points="{coordinates("tokens", max_tokens)}"/><polyline class="timeline-cost" points="{coordinates("cost", max_cost)}"/>{markers("tokens", max_tokens, "tokens-point")}{markers("cost", max_cost, "cost-point")}{labels}</svg></div>'''
+
+
+def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_group: str | None = None, time_range: str = "all") -> str:
+    """Render aggregate token and cost information across all providers."""
+    if group not in {"project", "day", "week", "month", "year", "tool", "model", "timeline"}:
+        group = "day"
+    range_days = {"7d": 7, "30d": 30, "90d": 90, "365d": 365}.get(time_range)
+    cutoff = datetime.now().timestamp() - range_days * 86400 if range_days else None
+    if cutoff is not None and group == "timeline":
+        summaries = [
+            (provider, summary) for provider, summary in summaries
+            if (summary.get("updated") or 0) >= cutoff
+        ]
+    totals = {key: 0 for key in TOKEN_KEYS}
+    total_costs = {key: 0.0 for key in TOKEN_KEYS}
+    total_cost = 0.0
+    groups: dict[str, dict] = {}
+    timeline_points: dict[str, dict[str, float]] = {}
+    for provider, summary in summaries:
+        session = load_session_details(summary, provider)
+        bucket = groups.setdefault(statistics_group_key(session, group, provider, summary), {
+            "sessions": 0,
+            "tokens": {key: 0 for key in TOKEN_KEYS},
+            "costs": {key: 0.0 for key in TOKEN_KEYS},
+            "cost": 0.0,
+            "items": [],
+        })
+        bucket["sessions"] += 1
+        bucket["items"].append((provider, summary, session))
+        for key in TOKEN_KEYS:
+            value = session.get("tokens", {}).get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                bucket["tokens"][key] += value
+                totals[key] += value
+        cost = session.get("costUsd")
+        if isinstance(cost, (int, float)):
+            bucket["cost"] += cost
+            total_cost += cost
+        timestamp = session.get("updated") or 0
+        if timestamp:
+            timeline_bucket = timeline_points.setdefault(datetime.fromtimestamp(timestamp).date().isoformat(), {"tokens": 0.0, "cost": 0.0})
+            timeline_bucket["tokens"] += sum(value or 0 for value in session.get("tokens", {}).values())
+            timeline_bucket["cost"] += cost if isinstance(cost, (int, float)) else 0
+        for key, value in pricing.cost_breakdown(session.get("tokens", {}), session.get("model")).items():
+            bucket["costs"][key] += value
+            total_costs[key] += value
+    ordered_groups = sorted(groups.items(), key=lambda item: item[0], reverse=True)
+    heading = {"project": "Project", "day": "Day", "week": "Week", "month": "Month", "year": "Year", "tool": "Provider", "model": "Model", "timeline": "Timeline"}[group]
+    session_count = len(summaries)
+    average_tokens = sum(totals.values()) / session_count if session_count else 0
+    average_cost = total_cost / session_count if session_count else 0
+    rows = "".join(
+        f'<tr><td><a class="stats-group-link" href="/?{urlencode({"provider": "copilot", "view": "statistics", "group": group, "group_value": label})}">{esc(label)}</a></td><td>{bucket["sessions"]:,}</td>'
+        + "".join(f'<td>{fmt(bucket["tokens"][key])}</td>' for key in TOKEN_KEYS)
+        + "".join(f'<td>{fmt_cost(bucket["costs"][key])}</td>' for key in TOKEN_KEYS)
+        + f'<td>{fmt(sum(bucket["tokens"].values()))}</td><td>{fmt_cost(bucket["cost"])}</td></tr>'
+        for label, bucket in ordered_groups
+    ) or '<tr><td colspan="14">No session data is available.</td></tr>'
+    related = ""
+    if selected_group in groups:
+        session_rows = "".join(
+            f'<tr><td><a class="stats-group-link" href="/?{urlencode({"provider": provider, "session": session.get("id", "")})}">{esc(session.get("id") or "Unavailable")}</a></td><td>{esc(session.get("name") or session.get("id"))}</td><td>{esc(PROVIDERS.get(provider, provider))}</td><td>{esc(session.get("pricingModel") or session.get("model") or "Unavailable")}</td><td>{fmt(sum(value or 0 for value in session.get("tokens", {}).values()))}</td><td>{fmt_cost(session.get("costUsd"))}</td></tr>'
+            for provider, summary, session in groups[selected_group]["items"]
+        )
+        related = f'<section class="stats-related"><div class="section-heading"><div><span class="section-kicker">SELECTED GROUP</span><h2>Sessions in {esc(selected_group)}</h2></div></div><div class="stats-table-wrap"><table class="stats-table related-table"><thead><tr><th>Session ID</th><th>Session name</th><th>Provider</th><th>Model</th><th>Total tokens</th><th>Total cost</th></tr></thead><tbody>{session_rows}</tbody></table></div></section>'
+    timeline_markup = f'<section class="timeline-section"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Tokens and cost over time</h2></div></div>{render_timeline_svg(timeline_points)}</section>'
+    table_markup = f'<section class="stats-table-section"><div class="section-heading"><div><span class="section-kicker">BREAKDOWN</span><h2>By {heading.lower()}</h2></div></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>{heading}</th><th>Sessions</th>{"".join(f"<th>{esc(TOKEN_LABELS[key])}</th>" for key in TOKEN_KEYS)}{"".join(f"<th>{esc(TOKEN_LABELS[key])} cost</th>" for key in TOKEN_KEYS)}<th>Total tokens</th><th>Total cost</th></tr></thead><tbody>{rows}</tbody></table></div></section>{related}'
+    return f'''<main class="detail statistics"><style>.stats-toolbar{{display:flex;align-items:center;gap:16px;margin:28px 0 18px;padding:12px 14px;border:1px solid #223753;border-radius:9px;background:#101d30}}.stats-filters{{display:flex;gap:7px;flex-wrap:wrap}}.stats-filter{{padding:7px 11px;border:1px solid #315479;border-radius:7px;color:#a9c9e9;text-decoration:none;font-size:12px}}.stats-filter:hover,.stats-filter.selected{{background:#24558a;color:#fff}}.stats-table-section,.stats-related,.timeline-section{{width:100%;max-width:1500px;margin:30px auto 0}}.stats-table-wrap{{width:100%;overflow:auto;border:1px solid #223753;border-radius:9px}}.stats-table{{width:100%;min-width:0;table-layout:fixed;border-collapse:collapse;background:#101a2a}}.stats-table th,.stats-table td{{width:auto;padding:11px 8px;border-bottom:1px solid #22304a;text-align:right;font-size:11px;white-space:normal;overflow-wrap:anywhere}}.stats-table th:first-child,.stats-table td:first-child{{text-align:left}}.stats-table th{{color:#91a8c7;font-size:10px;text-transform:uppercase;letter-spacing:.5px}}.stats-table td{{color:#cbd8e8}}.stats-table tr:last-child td{{border-bottom:0}}.stats-group-link{{color:#9ed1ff;text-decoration:none}}.stats-group-link:hover{{color:#fff;text-decoration:underline}}.timeline-chart{{padding:16px;border:1px solid #223753;border-radius:9px;background:#101a2a}}.timeline-chart svg{{display:block;width:100%;height:auto}}.timeline-axis{{stroke:#34445c;stroke-width:1}}.timeline-chart text{{fill:#7e8ea5;font-size:11px}}.timeline-tokens,.timeline-cost{{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}}.timeline-tokens{{stroke:#54c99f}}.timeline-cost{{stroke:#f07878}}.tokens-axis-label,.tokens-axis-title{{fill:#54c99f!important}}.cost-axis-label,.cost-axis-title{{fill:#f07878!important}}.timeline-legend{{display:flex;gap:18px;margin:0 0 8px;font-size:11px}}.timeline-key:before{{display:inline-block;width:9px;height:9px;margin-right:6px;border-radius:50%;content:""}}.tokens-key:before{{background:#54c99f}}.cost-key:before{{background:#f07878}}.timeline-empty{{padding:28px;border:1px dashed #34445c;border-radius:9px;color:#7e8ea5;text-align:center}}.statistics-link{{margin-top:8px;border-top:1px solid #223451}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>All providers</div><h1>Statistics</h1><p class="muted">Aggregate token and cost information across loaded sessions.</p></div></header>
+        <section class="overview"><div class="section-heading"><div><span class="section-kicker">TOTAL</span><h2>All providers</h2></div><div class="overview-stats"><span><b>{session_count:,}</b> sessions</span><span><b>{fmt_unit(sum(totals.values()))}</b> tokens</span><span><b>{fmt_unit(total_cost, True)}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/session</span><span><b>{fmt_cost(average_cost)}</b> avg cost/session</span></div></div><div class="metrics">{token_cards(totals, costs=total_costs)}</div></section>
+        {timeline_markup if group == "timeline" else table_markup}</main>'''
 def session_tool(summary: dict, provider: str) -> str:
     """Return the product surface reported by the owning provider."""
     return PROVIDER_ADAPTERS[provider].tool(summary)
 
 
-def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False, selected_raw: bool = False) -> str:
+def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False, selected_raw: bool = False, view: str = "sessions", group: str = "day", selected_group: str | None = None, time_range: str = "all", import_error: str | None = None) -> str:
     sessions = load_session_index(root, provider, show_empty)
     chosen_summary = next((item for item in sessions if item["id"] == selected), None) if selected else None
     chosen = load_session_details(chosen_summary, provider) if chosen_summary else None
@@ -885,23 +1138,33 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             invocation_markup = ""
             show_invocation_breakdown = len(invocations) > 1 or tools_are_nested
             if show_invocation_breakdown:
-                invocation_markup = '<details class="turn-invocations" open><summary><span>Model invocations</span><span class="summary-count">' + str(len(invocations)) + '</span></summary><div class="invocations-list">' + "".join(
+                invocation_markup = '<details class="turn-invocations"><summary><span><span class="invocation-icon" aria-hidden="true">I</span> Invocations</span><span class="summary-count">' + str(len(invocations)) + '</span></summary><div class="invocations-list">' + "".join(
                     f'<div class="turn-invocation"><span class="invocation-name"><i></i>Invocation {esc(invocation.get("index", invocation_index))}'
                     f'{" <span class=\"turn-kind\">Usage summary</span>" if invocation.get("kind") == "usage_summary" else ""}'
-                    f'</span><div class="invocation-content">{invocation_tools(invocation)}{invocation_token_cards(invocation.get("tokens", {}))}</div></div>'
+                    f'</span><div class="invocation-content">{invocation_tools(invocation)}{invocation_token_cards(invocation.get("tokens", {}), turn.get("model") or chosen.get("model"))}</div></div>'
                     for invocation_index, invocation in enumerate(invocations, 1) if isinstance(invocation, dict)
                 ) + '</div></details>'
             invocation_label = f'{len(invocations)} {"invocation" if len(invocations) == 1 else "invocations"}'
             tool_label = f'{len(tools)} {"tool" if len(tools) == 1 else "tools"}'
-            turns += f'''<article class="turn" id="turn-{index}"><header><div class="turn-number"><span>{index:02d}</span><div><b>Turn {esc(turn_label)}</b><small>{tool_label} · {invocation_label}</small></div></div><div class="turn-badges">{f'<span class="invocation-count">{invocation_label}</span>' if show_invocation_breakdown else ""}{kind_label}</div></header>
-                <div class="message user"><div class="role"><span aria-hidden="true">U</span><label>User</label></div><p>{esc(turn["user"] or "(no user message)")}</p></div>
-                <div class="message assistant"><div class="role"><span aria-hidden="true">AI</span><label>Assistant</label></div><p>{esc(assistant)}</p></div>
+            turn_token_total = sum(turn.get("tokens", {}).get(key) or 0 for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens"))
+            turn_model = turn.get("model") or chosen.get("model")
+            turn_price = pricing.find_model(turn_model)
+            turn_model_label = turn_price["model"] if turn_price else (turn_model or "Unavailable")
+            turn_total_badges = f'<span class="invocation-count">Model {esc(turn_model_label)}</span><span class="invocation-count">Invocations {len(invocations)}</span><span class="invocation-count">Tools {len(tools)}</span><span class="invocation-count">Tokens {fmt_unit(turn_token_total)}</span><span class="invocation-count">Cost {fmt_cost(turn.get("costUsd"))}</span>'
+            turns += f'''<article class="turn" id="turn-{index}"><header><div class="turn-number"><span>{index:02d}</span><div><b>Turn {esc(turn_label)}</b><small>Turn activity</small></div></div><div class="turn-badges">{turn_total_badges}{kind_label}</div></header>
+                <details class="message user turn-message user-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">U</span><label>User</label></summary><p>{esc(turn["user"] or "(no user message)")}</p></details>
+                <details class="message assistant turn-message assistant-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">AI</span><label>Assistant</label></summary><p>{esc(assistant)}</p></details>
                 {tool_markup}
                 {invocation_markup}
-                <div class="turn-footer"><div class="turn-metrics">{turn_token_cards(turn["tokens"], chosen["id"], provider, index, selected_turn, selected_metric, show_empty)}</div>
+                <div class="turn-footer"><div class="turn-metrics">{turn_token_cards(turn["tokens"], turn_model, chosen["id"], provider, index, selected_turn, selected_metric, show_empty)}</div>
                 <a class="show-raw clickable" href="{raw_url}"><span aria-hidden="true">&lt;/&gt;</span>View raw event data <span class="raw-arrow" aria-hidden="true">→</span></a></div></article>'''
-    detail = ""
-    if chosen:
+    all_statistics_sessions = [
+        (provider_key, summary)
+        for provider_key in PROVIDERS
+        for summary in load_session_index(root, provider_key, show_empty)
+    ] if view == "statistics" else []
+    detail = render_statistics(all_statistics_sessions, group, selected_group, time_range) if view == "statistics" else ""
+    if view != "statistics" and chosen:
         turn_note = " · input/cache/reasoning values estimated from session totals" if provider == "copilot" and len(chosen["turns"]) > 1 else ""
         refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"]}), quote=True)
         selected_content_turn = chosen["turns"][selected_turn - 1] if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else {}
@@ -910,25 +1173,38 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         else:
             explorer_title, explorer_text, explorer_raw = explorer_content(selected_content_turn, selected_metric)
         invocation_total = sum(len(turn.get("invocations", [])) for turn in chosen["turns"] if isinstance(turn.get("invocations"), list))
+        tool_total = sum(len(turn.get("tools", [])) for turn in chosen["turns"] if isinstance(turn.get("tools"), list))
         # Reasoning tokens are already included in output tokens, so they are
         # not added again in the headline total.
         token_total = sum(
             chosen["tokens"].get(key) or 0
             for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens")
         )
+        turn_count = len(chosen["turns"])
+        average_tokens = token_total / turn_count if turn_count else 0
+        average_cost = (chosen.get("costUsd") or 0) / turn_count if turn_count else 0
+        subagents = chosen.get("subagents") if isinstance(chosen.get("subagents"), list) else []
+        subagent_markup = ""
+        if subagents:
+            subagent_rows = "".join(
+                f'<tr><td>{esc(agent.get("name") or agent.get("id"))}</td><td>{fmt(sum((agent.get("tokens", {}).get(key) or 0) for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens")))}</td><td>{fmt_cost(agent.get("costUsd"))}</td></tr>'
+                for agent in subagents
+            )
+            subagent_markup = f'<section class="subagents-section"><div class="section-heading"><div><span class="section-kicker">DELEGATED WORK</span><h2>Sub-agents</h2></div><span class="muted">Parent and delegated usage are included in the session total</span></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>Agent</th><th>Total tokens</th><th>Cost</th></tr></thead><tbody>{subagent_rows}</tbody></table></div></section>'
+        session_expand_buttons = '<span class="session-expand-controls"><button type="button" class="invocation-count session-toggle" data-target="user">User</button><button type="button" class="invocation-count session-toggle" data-target="assistant">Assistant</button><button type="button" class="invocation-count session-toggle" data-target="invocations">Invocations</button><button type="button" class="invocation-count session-toggle" data-target="all">All</button></span>'
         close_explorer_url = refresh_conversation_url
         detail = f'''<main class="detail"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>{esc(PROVIDERS.get(provider, provider))}</div><h1>{esc(chosen["name"])}</h1>
-            <div class="header-chips"><span>{esc(session_tool(chosen_summary, provider))}</span><span>{esc(chosen["model"] or "Model unavailable")}</span><span>{esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span></div>
+            <div class="header-chips"><span>{esc(session_tool(chosen_summary, provider))}</span><span>{esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span><span>Model: {esc(chosen.get("pricingModel") or chosen.get("model") or "Unavailable")}</span></div>
             </div><div class="detail-actions"><a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a><a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
             <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
             <button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form></div></header>
             <section class="session-facts"><div><span>Session ID</span><code>{esc(chosen["id"])}</code></div><div><span>Project</span><code>{esc(chosen.get("project") or "Unavailable")}</code></div><div><span>Source</span><code>{esc(chosen.get("source") or "Unknown")}</code></div></section>
             {f'<div class="provider-note"><b>Provider note</b>{esc(chosen["_db_issue"])}</div>' if chosen.get("_db_issue") else ""}
-            <section class="overview"><div class="section-heading"><div><span class="section-kicker">OVERVIEW</span><h2>Session usage</h2></div><div class="overview-stats"><span><b>{len(chosen["turns"])}</b> turns</span><span><b>{invocation_total}</b> invocations</span><span><b>{fmt(token_total)}</b> tokens</span></div></div><div class="metrics">{token_cards(chosen["tokens"])}</div></section>
+            <section class="overview"><div class="section-heading"><div><span class="section-kicker">OVERVIEW</span><h2>Session usage</h2>{session_expand_buttons}</div><div class="overview-stats"><span><b>{len(chosen["turns"])}</b> turns</span><span><b>{invocation_total}</b> invocations</span><span><b>{tool_total}</b> tools</span><span><b>{fmt_unit(token_total)}</b> tokens</span><span><b>{fmt_cost(chosen.get("costUsd"))}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/turn</span><span><b>{fmt_cost(average_cost)}</b> avg cost/turn</span></div></div><div class="metrics">{token_cards(chosen["tokens"], chosen.get("model"))}</div></section>{subagent_markup}
             <section class="conversation"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Conversation turns</h2></div><span class="muted">{len(chosen["turns"])} turns{esc(turn_note)}</span></div>
             <div class="content-layout"><div class="turns">{turns or '<div class="empty"><b>No turns yet</b><span>No conversation events were found for this session.</span></div>'}</div>
             <aside class="explorer {"is-active" if selected_turn else ""}"><div class="explorer-header"><div><span class="section-kicker">INSPECTOR</span><h2>{esc(explorer_title)}</h2></div><a href="{close_explorer_url}" class="explorer-close" aria-label="Close inspector">×</a></div><div class="explorer-body">{f'<p>{esc(explorer_text)}</p>' if explorer_text else ''}{f'<pre>{esc(explorer_raw)}</pre>' if explorer_raw and selected_raw else ''}</div></aside></div></section></main>'''
-    else:
+    elif view != "statistics":
         if sessions:
             detail = '<main class="detail no-sessions"><div class="empty-hero"><span class="hero-icon">↗</span><span class="section-kicker">__APP_NAME__</span><h1>Select a session</h1><p>Choose a conversation to inspect its turns, model invocations, token usage, tools, and raw events.</p></div></main>'
         else:
@@ -944,7 +1220,29 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     )
     toggle = f'<a class="empty-toggle" href="{toggle_url}" title="{toggle_label}" aria-label="{toggle_label}">{toggle_icon}</a>'
     import_form = f'<form class="import-inline" method="post" action="/import" enctype="multipart/form-data"><input id="source-archive" name="archive" type="file" accept=".zip" required onchange="this.form.submit()"><input type="hidden" name="provider" value="{esc(provider)}"><label class="import-button" for="source-archive" title="Import one session archive" aria-label="Import one session archive">⇧</label></form>'
-    return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__PROVIDER_MENU__", provider_menu).replace("__SESSION_ROWS__", session_rows).replace("__SESSION_COUNT__", str(len(sessions))).replace("__DETAIL__", detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", toggle).replace("__ROOT__", esc(provider_path(root, provider))).replace("__IMPORT_FORM__", import_form)
+    view_tabs = f'<style>.detail .message p{{font-size:12px}}.detail .muted{{font-size:11px}}.detail .section-kicker{{font-size:10px}}.detail .section-heading h2{{font-size:17px}}.detail .metric span{{font-size:10px}}.detail .metric strong{{font-size:20px}}.assistant .role>span{{width:22px;height:22px;border-radius:7px}}.view-tabs{{display:flex;gap:5px;margin:10px 0 16px;padding:3px;background:#0c1627;border:1px solid #223451;border-radius:8px}}.view-tab{{flex:1;padding:7px 8px;border-radius:6px;color:#8fa8c5;text-align:center;text-decoration:none;font-size:11px}}.view-tab:hover,.view-tab.selected{{background:#24558a;color:#fff}}.stats-group-menu{{padding:4px;background:#0c1627;border:1px solid #223451;border-radius:11px}}.stats-sidebar-title{{margin:4px 8px 8px;color:#91a8c7;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase}}.stats-sidebar-links{{display:grid;gap:4px}}.stats-sidebar-link{{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid transparent;border-radius:8px;color:#b8c9df;text-decoration:none;font-size:13px}}.stats-sidebar-link .provider-mark{{width:7px;height:7px;flex:none;border-radius:50%;background:#5ca8ff;box-shadow:0 0 0 3px rgba(92,168,255,.12)}}.stats-sidebar-link:hover,.stats-sidebar-link.selected{{border-color:#3b6b9d;background:#2c6aa5;box-shadow:0 4px 12px rgba(24,91,151,.25);color:#fff}}.stats-sidebar .provider-menu:empty,.stats-sidebar .sessions-area{{display:none}}.timeline-point{{cursor:pointer;stroke:#101a2a;stroke-width:2}}.tokens-point{{fill:#54c99f}}.cost-point{{fill:#f07878}}.timeline-hint{{margin-left:auto;color:#687990;font-size:10px}}.import-error{{position:fixed;z-index:30;top:20px;left:calc(var(--sidebar) + 24px);right:24px;width:auto;max-width:none;margin:0;padding:12px 16px;border:1px solid #8f3e4b;border-radius:9px;background:#351923;color:#ffb4c0;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.3)}}@media(max-width:700px){{.import-error{{left:20px;right:20px}}}}</style><nav class="view-tabs"><a class="view-tab {"selected" if view != "statistics" else ""}" href="/?{urlencode({"provider": provider, "show_empty": int(show_empty)})}">Operational</a><a class="view-tab {"selected" if view == "statistics" else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "range": time_range})}">Statistics</a></nav>'
+    view_tabs += '<style>.session-expand-controls{display:flex;gap:4px;margin-top:8px}.session-toggle{border:1px solid #40516c;background:#182538;color:#a9c9e9;cursor:pointer}.session-toggle:hover{border-color:#6c7fe2;background:#26365a;color:#fff}.turn-message{display:block!important;margin:12px 14px;width:auto;box-sizing:border-box;padding:0;border:1px solid var(--line);border-bottom:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-message>summary{display:flex;align-items:center;gap:7px;padding:10px 12px;border:0;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-message>summary::-webkit-details-marker{display:none}.turn-message>summary:after{margin-left:auto;color:#6f82a0;content:"▾"}.turn-message:not([open])>summary:after{content:"▸"}.turn-message>p{margin:0;padding:14px 16px;border-top:1px solid var(--line);background:rgba(15,23,34,.6)}.turn-invocations{width:auto;box-sizing:border-box;margin-left:14px;margin-right:14px}.turn-invocations>summary{justify-content:flex-start;gap:7px}.turn-invocations>summary>span:first-child{display:flex;align-items:center;gap:7px}.turn-invocations>summary .summary-count{margin-left:auto}.turn-invocations>summary:after{margin-left:4px;color:#6f82a0;content:"▾"}.turn-invocations:not([open])>summary:after{content:"▸"}.invocation-icon{display:grid;place-items:center;width:22px;height:22px;flex:0 0 22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800;letter-spacing:-.03em}</style><script>(function(){document.addEventListener("click",function(event){var summary=event.target.closest(".turn-message > summary");if(summary){event.preventDefault();summary.parentElement.open=!summary.parentElement.open;return;}var button=event.target.closest(".session-toggle");if(!button)return;var detail=button.closest(".detail");if(!detail)return;var target=button.getAttribute("data-target");var selectors=target==="all"?"details":target==="user"?"details.user-content":target==="assistant"?"details.assistant-content":"details.turn-invocations";var details=detail.querySelectorAll(selectors);var shouldOpen=Array.prototype.some.call(details,function(item){return !item.open});details.forEach(function(item){item.open=shouldOpen});});})();</script>'
+    view_tabs += '<style>.turn-message>summary,.turn-invocations>summary{min-height:44px;box-sizing:border-box}</style>'
+    stats_sidebar = (
+        '<div class="stats-group-menu"><div class="stats-sidebar-title">Group by</div><nav class="stats-sidebar-links">'
+        + "".join(
+            f'<a class="stats-sidebar-link {"selected" if group == option else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": option, "range": time_range})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
+            for option, label in (("day", "Day"), ("week", "Week"), ("month", "Month"), ("year", "Year"), ("project", "Project"), ("tool", "Provider"), ("model", "Model"), ("timeline", "Timeline"))
+        )
+        + '</nav>'
+        + (
+            '<div class="stats-sidebar-title">Time range</div><nav class="stats-sidebar-links">'
+            + "".join(
+                f'<a class="stats-sidebar-link {"selected" if time_range == option else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "range": option})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
+                for option, label in (("all", "All time"), ("7d", "Last 7 days"), ("30d", "Last 30 days"), ("90d", "Last 90 days"), ("365d", "Last year"))
+            )
+            + '</nav>'
+            if group == "timeline" else ""
+        )
+        + '</div>'
+    ) if view == "statistics" else ""
+    message = f'<div class="import-error" role="alert">{esc(import_error)}</div>' if import_error else ""
+    return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__SIDEBAR_CLASS__", "stats-sidebar" if view == "statistics" else "").replace("__PROVIDER_MENU__", "" if view == "statistics" else provider_menu).replace("__VIEW_TABS__", view_tabs).replace("__STATS_SIDEBAR__", stats_sidebar).replace("__SESSION_ROWS__", "" if view == "statistics" else session_rows).replace("__SESSION_COUNT__", str(len(sessions))).replace("__DETAIL__", message + detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", toggle).replace("__ROOT__", esc(provider_path(root, provider))).replace("__IMPORT_FORM__", import_form)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -987,7 +1285,11 @@ class Handler(BaseHTTPRequestHandler):
                 import_session_sources(provider, temporary, self.root)
             except (OSError, ValueError, KeyError) as error:
                 LOGGER.warning("Unable to import %s source archive: %s", provider, error)
-                self.send_error(400, "Unable to import source archive")
+                message = str(error) if isinstance(error, ValueError) else "Unable to import source archive"
+                self.send_response(303)
+                self.send_header("Location", f"/?{urlencode({'provider': provider, 'import_error': message})}")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
                 return
             finally:
                 temporary.unlink(missing_ok=True)
@@ -1060,10 +1362,15 @@ class Handler(BaseHTTPRequestHandler):
         turn_value = query.get("turn", [None])[0]
         selected_turn = int(turn_value) if turn_value and turn_value.isdigit() else None
         selected_metric = query.get("metric", [None])[0]
+        view = query.get("view", ["sessions"])[0]
+        group = query.get("group", ["day"])[0]
+        selected_group = query.get("group_value", [None])[0]
+        time_range = query.get("range", ["all"])[0]
+        import_error = query.get("import_error", [None])[0]
         selected_raw = query.get("raw", ["0"])[0] in {"1", "true", "yes"}
         show_empty = query.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
         try:
-            body = render(self.root, selected, selected_turn, selected_metric, provider, show_empty, selected_raw).encode("utf-8")
+            body = render(self.root, selected, selected_turn, selected_metric, provider, show_empty, selected_raw, view, group, selected_group, time_range, import_error).encode("utf-8")
         except OSError:
             self.send_error(500, "Unable to read session files")
             return
@@ -1201,7 +1508,7 @@ PAGE = r'''<!doctype html>
     --bg:#080b12;--surface:#0e131d;--surface-2:#131a27;--surface-3:#182233;
     --line:#202a3a;--line-strong:#2d3a50;--text:#f1f5fb;--muted:#8c9bb0;
     --subtle:#65748a;--accent:#7c8cff;--accent-2:#57d4b2;--blue:#63b3ff;
-    --danger:#ff7285;--sidebar:330px;--radius:14px;--shadow:0 18px 50px rgba(0,0,0,.28);
+    --danger:#ff7285;--sidebar:300px;--radius:14px;--shadow:0 18px 50px rgba(0,0,0,.28);
     font-family:Inter,"Segoe UI",system-ui,-apple-system,sans-serif;color:var(--text);background:var(--bg);
 }
 *{box-sizing:border-box}[hidden]{display:none!important}html{scroll-behavior:smooth}body{margin:0;min-width:320px;background:radial-gradient(circle at 72% -20%,rgba(70,83,170,.13),transparent 36%),var(--bg);color:var(--text)}
@@ -1228,10 +1535,12 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
 <body>
 <div class="mobile-bar"><button class="menu-button" type="button" aria-label="Open sessions" aria-controls="sidebar">☰</button><b>__APP_NAME__</b><span style="width:34px"></span></div>
 <div class="app">
-    <aside class="sidebar" id="sidebar">
+    <aside class="sidebar __SIDEBAR_CLASS__" id="sidebar">
         <div class="sidebar-top">
             <div class="brand-row"><span class="brand-mark">AI</span><div><div class="brand">__APP_NAME__</div><div class="brand-subtitle">Local AI activity</div></div></div>
+            __VIEW_TABS__
             <nav class="provider-menu" aria-label="AI providers">__PROVIDER_MENU__</nav>
+            __STATS_SIDEBAR__
         </div>
         <div class="sessions-area">
             <div class="sessions-heading">

@@ -62,9 +62,51 @@ def _files() -> list[Path]:
     return list(dict.fromkeys(files))
 
 
+def _is_subagent(path: Path) -> bool:
+    return path.parent.name == "subagents" and path.name.startswith("agent-")
+
+
+def _parent_id(records: list[dict]) -> str | None:
+    keys = ("parentSessionId", "parent_session_id", "parentConversationId", "parent_conversation_id")
+    for record in records:
+        for container in (record, record.get("payload", {}), record.get("message", {})):
+            if isinstance(container, dict):
+                for key in keys:
+                    value = container.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+    return None
+
+
+def _children_for(parent: Path, files: list[Path]) -> list[Path]:
+    """Find verified subagent siblings without treating every agent as global."""
+    children = []
+    for path in files:
+        if not _is_subagent(path) or path.parent.parent != parent.parent:
+            continue
+        parent_id = _parent_id(_viewer().safe_json_lines(path))
+        if parent_id and parent_id not in {parent.stem, parent.name}:
+            continue
+        children.append(path)
+    # A project directory with one root transcript is a safe fallback for
+    # agent files that omit parent metadata.
+    roots = [item for item in files if item.parent == parent.parent and not _is_subagent(item)]
+    if len(roots) == 1:
+        return [path for path in files if _is_subagent(path) and path.parent.parent == parent.parent]
+    return children
+
+
 def index(root: Path) -> list[dict]:
     viewer = _viewer()
-    entries = [viewer.session_summary(path, "claude", "external") for path in _files()]
+    files = _files()
+    entries = []
+    for path in files:
+        if _is_subagent(path):
+            continue
+        entry = viewer.session_summary(path, "claude", "external")
+        children = _children_for(path, files)
+        entry["_children"] = [viewer.session_summary(child, "claude", "external") for child in children]
+        entries.append(entry)
     for entry in entries:
         entry["_has_data"] = _has_data(entry["_source"])
         # Keep the sidebar flag consistent with the surface shown in the
@@ -179,6 +221,9 @@ def details(summary: dict) -> dict:
             current_turn = turns.setdefault(logical_id, viewer.new_turn(logical_id))
 
         turn = current_turn
+        turn_model = viewer.model_from_records([record])
+        if turn_model:
+            turn["model"] = turn_model
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
         message_id_value = message.get("id") if isinstance(message, dict) else None
         message_id = str(message_id_value) if message_id_value else None
@@ -228,21 +273,60 @@ def details(summary: dict) -> dict:
         if result["name"] == result["id"]:
             result["name"] = viewer.derived_conversation_name(records, result["id"])
     result["turns"] = list(turns.values())
-    result["model"] = result["model"] or "claude"
+    result["model"] = viewer.model_from_records(records) or result["model"] or "claude"
+    result["deployment"] = viewer.deployment_from_records(records)
     for key in viewer.TOKEN_KEYS:
         values = [turn["tokens"][key] for turn in result["turns"] if turn["tokens"][key] is not None]
         if values:
             result["tokens"][key] = sum(values)
     result["source"] = str(summary.get("_source", ""))
+    children = summary.get("_children") if isinstance(summary.get("_children"), list) else []
+    subagents = []
+    subagent_tokens = viewer.blank_tokens()
+    for child_summary in children:
+        if not isinstance(child_summary, dict) or not isinstance(child_summary.get("_source"), Path):
+            continue
+        child = viewer.pricing.apply_costs(details(child_summary))
+        child["relation"] = "subagent"
+        subagents.append(child)
+        for key in viewer.TOKEN_KEYS:
+            value = child.get("tokens", {}).get(key)
+            if isinstance(value, int):
+                subagent_tokens[key] = (subagent_tokens[key] or 0) + value
+    result["ownTokens"] = dict(result["tokens"])
+    result["subagents"] = subagents
+    result["subagentTokens"] = subagent_tokens
+    for key in viewer.TOKEN_KEYS:
+        if subagent_tokens[key] is not None:
+            result["tokens"][key] = (result["tokens"][key] or 0) + subagent_tokens[key]
     return result
 
 
 def delete(summary: dict) -> None:
-    summary["_source"].unlink()
+    source = summary["_source"]
+    if summary.get("relation") == "subagent":
+        source.unlink()
+        return
+    for child in summary.get("_children", []):
+        child_source = child.get("_source") if isinstance(child, dict) else None
+        if isinstance(child_source, Path):
+            child_source.unlink(missing_ok=True)
+    source.unlink()
+    subagents_dir = source.parent / "subagents"
+    try:
+        if subagents_dir.is_dir() and not any(subagents_dir.iterdir()):
+            subagents_dir.rmdir()
+    except OSError:
+        pass
 
 
 def export_source_files(summary: dict, archive: Path) -> Path:
-    return create_archive("claude", archive, [(summary["_source"], ".")])
+    files = [(summary["_source"], ".")]
+    for child in summary.get("_children", []):
+        source = child.get("_source") if isinstance(child, dict) else None
+        if isinstance(source, Path):
+            files.append((source, "subagents"))
+    return create_archive("claude", archive, files)
 
 
 def import_source_files(archive: Path, root: Path) -> list[Path]:

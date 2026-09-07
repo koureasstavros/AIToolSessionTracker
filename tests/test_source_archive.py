@@ -30,6 +30,16 @@ class SourceArchiveTests(unittest.TestCase):
                     self.assertEqual(manifest["files"][0]["target"], "transcript.jsonl")
                     adapter.import_source_files(archive, base / "viewer-root")
 
+    def test_rejects_archive_for_the_wrong_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "transcript.jsonl"
+            source.write_text('{"role":"user","content":"hello"}\n', encoding="utf-8")
+            archive = base / "codex.zip"
+            openai_codex_provider.export_source_files({"_source": source}, archive)
+            with self.assertRaisesRegex(ValueError, "different provider"):
+                anthropic_claude_provider.import_source_files(archive, base / "claude-root")
+
     def test_copilot_exports_session_state_and_injects_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

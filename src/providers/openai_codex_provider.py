@@ -56,7 +56,16 @@ def index(root: Path) -> list[dict]:
         files = list(location.rglob("*.jsonl")) if location.exists() else []
     except OSError:
         files = []
-    entries = [viewer.session_summary(path, "codex", "external") for path in files]
+    entries = []
+    for path in files:
+        if viewer.is_subagent_path(path):
+            continue
+        entry = viewer.session_summary(path, "codex", "external")
+        entry["_children"] = [
+            viewer.session_summary(child, "codex", "external")
+            for child in viewer.related_subagent_paths(path, files)
+        ]
+        entries.append(entry)
     for entry in entries:
         entry["_has_data"] = _has_data(entry["_source"])
     return entries
@@ -126,6 +135,9 @@ def details(summary: dict) -> dict:
         if not relevant or (not current_turn_id and not turn_id):
             continue
         turn = get_turn(str(turn_id) if turn_id else None)
+        turn_model = viewer.model_from_records([record])
+        if turn_model:
+            turn["model"] = turn_model
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
         info = payload.get("info") or {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or (info.get("last_token_usage") if isinstance(info, dict) else {})
@@ -188,21 +200,50 @@ def details(summary: dict) -> dict:
             result["name"] = viewer.derived_conversation_name(records, result["id"])
     result["turns"] = list(turns.values())
     result["model"] = result["model"] or "codex"
+    result["deployment"] = viewer.deployment_from_records(records)
     for key in viewer.TOKEN_KEYS:
         values = [turn["tokens"][key] for turn in result["turns"] if turn["tokens"][key] is not None]
         if values:
             result["tokens"][key] = sum(values)
     viewer.subtract_cached_input(result)
+    children = summary.get("_children") if isinstance(summary.get("_children"), list) else []
+    result["subagents"] = []
+    result["ownTokens"] = dict(result["tokens"])
+    result["subagentTokens"] = viewer.blank_tokens()
+    for child_summary in children:
+        if not isinstance(child_summary, dict) or not isinstance(child_summary.get("_source"), Path):
+            continue
+        child = details(child_summary)
+        child["relation"] = "subagent"
+        result["subagents"].append(child)
+        for key in viewer.TOKEN_KEYS:
+            value = child.get("tokens", {}).get(key)
+            if isinstance(value, int):
+                result["subagentTokens"][key] = (result["subagentTokens"][key] or 0) + value
+                result["tokens"][key] = (result["tokens"][key] or 0) + value
     result["source"] = str(summary.get("_source", ""))
     return result
 
 
 def delete(summary: dict) -> None:
+    if summary.get("relation") == "subagent":
+        summary["_source"].unlink()
+        return
+    for child in summary.get("_children", []):
+        source = child.get("_source") if isinstance(child, dict) else None
+        if isinstance(source, Path):
+            source.unlink(missing_ok=True)
     summary["_source"].unlink()
 
 
 def export_source_files(summary: dict, archive: Path) -> Path:
-    return create_archive("codex", archive, [(summary["_source"], ".")])
+    files = [(summary["_source"], ".")]
+    files.extend(
+        (child["_source"], "subagents")
+        for child in summary.get("_children", [])
+        if isinstance(child, dict) and isinstance(child.get("_source"), Path)
+    )
+    return create_archive("codex", archive, files)
 
 
 def import_source_files(archive: Path, root: Path) -> list[Path]:

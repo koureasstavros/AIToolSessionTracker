@@ -68,7 +68,17 @@ def _files(root: Path) -> list[Path]:
 
 def index(root: Path) -> list[dict]:
     viewer = _viewer()
-    entries = [viewer.session_summary(path, "m365_copilot", "external") for path in _files(default_root())]
+    files = _files(default_root())
+    entries = []
+    for path in files:
+        if viewer.is_subagent_path(path):
+            continue
+        entry = viewer.session_summary(path, "m365_copilot", "external")
+        entry["_children"] = [
+            viewer.session_summary(child, "m365_copilot", "external")
+            for child in viewer.related_subagent_paths(path, files)
+        ]
+        entries.append(entry)
     for entry in entries:
         entry["_has_data"] = _has_data(entry["_source"])
     return sorted(entries, key=lambda item: item["updated"], reverse=True)
@@ -77,16 +87,43 @@ def index(root: Path) -> list[dict]:
 def details(summary: dict) -> dict:
     viewer = _viewer()
     result = viewer.read_external_session(summary["_source"], "m365_copilot")
+    result["ownTokens"] = dict(result.get("tokens", {}))
+    result["subagents"] = []
+    result["subagentTokens"] = viewer.blank_tokens()
+    for child_summary in summary.get("_children", []):
+        if not isinstance(child_summary, dict) or not isinstance(child_summary.get("_source"), Path):
+            continue
+        child = viewer.read_external_session(child_summary["_source"], "m365_copilot")
+        child["relation"] = "subagent"
+        result["subagents"].append(child)
+        for key in viewer.TOKEN_KEYS:
+            value = child.get("tokens", {}).get(key)
+            if isinstance(value, int):
+                result["subagentTokens"][key] = (result["subagentTokens"][key] or 0) + value
+                result["tokens"][key] = (result["tokens"][key] or 0) + value
     result["source"] = str(summary.get("_source", ""))
     return result
 
 
 def delete(summary: dict) -> None:
+    if summary.get("relation") == "subagent":
+        summary["_source"].unlink()
+        return
+    for child in summary.get("_children", []):
+        source = child.get("_source") if isinstance(child, dict) else None
+        if isinstance(source, Path):
+            source.unlink(missing_ok=True)
     summary["_source"].unlink()
 
 
 def export_source_files(summary: dict, archive: Path) -> Path:
-    return create_archive("m365_copilot", archive, [(summary["_source"], ".")])
+    files = [(summary["_source"], ".")]
+    files.extend(
+        (child["_source"], "subagents")
+        for child in summary.get("_children", [])
+        if isinstance(child, dict) and isinstance(child.get("_source"), Path)
+    )
+    return create_archive("m365_copilot", archive, files)
 
 
 def import_source_files(archive: Path, root: Path) -> list[Path]:

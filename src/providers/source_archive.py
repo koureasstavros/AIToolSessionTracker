@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -17,7 +18,7 @@ def create_archive(
     exclude_names: set[str] | None = None,
 ) -> Path:
     """Archive source files and directories with their provider-relative targets."""
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, object]] = []
     archive.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
         for source, target in sources:
@@ -36,7 +37,11 @@ def create_archive(
                 relative = path.relative_to(base).as_posix()
                 member = f"sources/{len(entries):06d}-{Path(relative).name}"
                 output.write(path, member)
-                entries.append({"member": member, "target": (PurePosixPath(target) / relative).as_posix()})
+                entries.append({
+                    "member": member,
+                    "target": (PurePosixPath(target) / relative).as_posix(),
+                    "mtime": path.stat().st_mtime,
+                })
         output.writestr(MANIFEST, json.dumps({"version": 1, "provider": provider, "files": entries}, indent=2))
     return archive
 
@@ -65,5 +70,8 @@ def inject_archive(provider: str, archive: Path, destination: Path) -> list[Path
                 target_path = target_path.with_name(f"{target_path.stem}-{uuid.uuid4().hex[:8]}{target_path.suffix}")
             with source.open(member) as input_file, target_path.open("wb") as output_file:
                 output_file.write(input_file.read())
+            mtime = entry.get("mtime")
+            if isinstance(mtime, (int, float)):
+                os.utime(target_path, (mtime, mtime))
             written.append(target_path)
         return written

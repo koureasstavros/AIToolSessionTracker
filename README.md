@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "model", "llm", "slm", "session", "tracker", "turn", "invocation"]
 license: "apache-2.0"
-version: v0.0.14
+version: v0.0.15
 ---
 
 # AI Tool Session Explorer
@@ -109,6 +109,8 @@ Every provider returns conversations using the same normalized fields:
 	- `cacheWriteTokens`
 	- `outputTokens`
 	- `reasoningTokens`
+- `costUsd` at session, turn, and model-invocation levels when the extracted
+	model is present in [`src/model_costs.json`](src/model_costs.json).
 
 The main application normalizes provider results before passing them to the
 interface. Rendering therefore does not need to understand each provider's
@@ -189,6 +191,18 @@ Provider formats expose different token information:
 - For GitHub Copilot and OpenAI Codex, the displayed Input value excludes `cacheReadTokens` and `cacheWriteTokens`; cached input remains shown separately.
 
 When a provider only stores input, cache, or reasoning usage at session level, the viewer estimates per-turn values using each turn's output-token share. The estimates preserve the exact session total and are labelled in the interface.
+
+## Model cost calculation
+
+The adapters extract the public model identifier from transcript fields such as
+`model`, `modelId`, provider message metadata, and Copilot `modelMetrics` keys;
+deployment/display aliases are only used when no model identifier is available.
+Pricing is stored locally in `src/model_costs.json` as USD per one million
+tokens. The calculated cost uses uncached input, cache-read input,
+cache-write input, regular output, and output reasoning tokens. Reasoning tokens
+are included in output totals but are charged at the separate reasoning rate,
+so they are not counted twice. A model absent from the table displays an
+unavailable cost instead of guessing a rate.
 
 ## Raw content and privacy
 
