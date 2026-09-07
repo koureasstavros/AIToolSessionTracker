@@ -41,9 +41,25 @@ def _read_session_state(folder: Path) -> dict:
     turns: dict[str, dict] = {}
     turn_interactions: dict[str, str] = {}
     output_total = 0
+    internal_context: list[tuple[str, str]] = []
+    for record in records:
+        if record.get("type") == "system.message":
+            data = record.get("data") if isinstance(record.get("data"), dict) else {}
+            content = data.get("content")
+            if isinstance(content, str) and content.strip():
+                internal_context.append(("Copilot system instructions", content))
+        elif record.get("type") == "session.start":
+            data = record.get("data") if isinstance(record.get("data"), dict) else {}
+            context = data.get("context")
+            if isinstance(context, dict) and context:
+                internal_context.append(("Copilot session context", json.dumps(context, indent=2, ensure_ascii=False)))
 
     def get_turn(key: str) -> dict:
-        return turns.setdefault(key, viewer.new_turn(key))
+        turn = turns.setdefault(key, viewer.new_turn(key))
+        if len(turns) == 1:
+            for name, content in internal_context:
+                viewer.add_internal_instruction(turn, name, content)
+        return turn
 
     def get_invocation(turn: dict, index: int) -> dict:
         invocations = turn.setdefault("invocations", [])
@@ -78,6 +94,8 @@ def _read_session_state(folder: Path) -> dict:
             turn = get_turn(interaction_id)
             if not turn["user"]:
                 turn["user"] = str(data.get("content", ""))
+            viewer.add_attached_files(turn, viewer.mentioned_files(data.get("content")))
+            viewer.add_attached_files(turn, viewer.files_from_content(data.get("attachments")))
         elif event_type == "assistant.message":
             turn = get_turn(interaction_id)
             if isinstance(data.get("model"), str) and data["model"]:
@@ -169,6 +187,7 @@ def _read_chat(path: Path) -> dict:
     if not session["project"]:
         session["project"] = viewer.workspace_project_path(path.parent.parent)
     requests = [dict(item) for item in metadata.get("requests", []) if isinstance(item, dict)]
+    context_blocks = viewer.context_instruction_blocks(records, "Copilot")
     positions = {item.get("requestId"): index for index, item in enumerate(requests) if item.get("requestId")}
     for record in records:
         if record.get("k") == ["customTitle"]:
@@ -189,6 +208,9 @@ def _read_chat(path: Path) -> dict:
             requests[key[1]][str(key[2])] = value
     for index, request in enumerate(requests, 1):
         turn = viewer.new_turn(str(request.get("requestId") or index))
+        if index == 1:
+            for block_name, block_content in context_blocks:
+                viewer.add_internal_instruction(turn, block_name, block_content)
         if isinstance(request.get("modelId"), str) and request["modelId"]:
             turn["model"] = request["modelId"]
         message = request.get("message") or {}
@@ -199,6 +221,30 @@ def _read_chat(path: Path) -> dict:
             turn["assistant"] = [str(item["value"]) for item in response if isinstance(item, dict) and item.get("value")]
         result = request.get("result") if isinstance(request.get("result"), dict) else {}
         metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        for instruction_key in ("renderedGlobalContext", "renderedSystemMessage", "internalInstructions", "toolInstructions"):
+            value = metadata.get(instruction_key) or request.get(instruction_key)
+            if isinstance(value, list):
+                value = "\n\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in value)
+            if isinstance(value, str) and value.strip():
+                viewer.add_internal_instruction(turn, f"Copilot {instruction_key}", value)
+        attached = []
+        variable_data = request.get("variableData") if isinstance(request.get("variableData"), dict) else {}
+        for variable in variable_data.get("variables", []) if isinstance(variable_data.get("variables"), list) else []:
+            if not isinstance(variable, dict):
+                continue
+            value = variable.get("value") if isinstance(variable.get("value"), dict) else {}
+            item = viewer.attached_file(
+                variable.get("name"),
+                value.get("fsPath") or value.get("path") or variable.get("filePath"),
+                value.get("content") or variable.get("content"),
+            )
+            if item:
+                attached.append(item)
+        rendered = metadata.get("renderedUserMessage") if isinstance(metadata.get("renderedUserMessage"), list) else []
+        for item in rendered:
+            if isinstance(item, dict):
+                attached.extend(viewer.mentioned_files(item.get("text")))
+        viewer.add_attached_files(turn, attached)
         turn["tokens"]["inputTokens"] = viewer.number(request.get("promptTokens") or metadata.get("promptTokens"))
         turn["tokens"]["outputTokens"] = viewer.number(
             request.get("completionTokens") or metadata.get("outputTokens") or metadata.get("completionTokens")

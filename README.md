@@ -2,14 +2,14 @@
 language: ["en"]
 tags: ["ai", "tool", "model", "llm", "slm", "session", "tracker", "turn", "invocation"]
 license: "apache-2.0"
-version: v0.0.16
+version: v0.0.17
 ---
 
 # AI Tool Session Explorer
 
 A local, read-only browser app for exploring AI coding-agent sessions, turns, content, raw events, and token usage.
 
-![AI Tool Session Tracker](material/ai_tool_session_tracker.png)
+![AI Tool Session Tracker](material/readme/ai_tool_session_tracker.png)
 
 ## Run
 
@@ -147,7 +147,7 @@ the session directory, and Copilot CLI removes related database rows.
 
 The left-hand provider menu selects the data source. The session list then shows sessions for that provider.
 
-![AI Tool Session Tracker](material/sessions_invocations.png)
+![AI Tool Session Tracker](material/readme/sessions_invocations.png)
 
 ### Interface
 
@@ -191,6 +191,22 @@ Provider formats expose different token information:
 - For GitHub Copilot and OpenAI Codex, the displayed Input value excludes `cacheReadTokens` and `cacheWriteTokens`; cached input remains shown separately.
 
 When a provider only stores input, cache, or reasoning usage at session level, the viewer estimates per-turn values using each turn's output-token share. The estimates preserve the exact session total and are labelled in the interface.
+
+## Provider data availability
+
+The amount of readable session content depends on what each provider persists
+locally. Prompts, assistant responses, attached files, internal tool
+instructions, agent definitions, skill definitions, raw events, and model
+metadata may be present for one provider but absent or incomplete for another.
+The viewer does not reconstruct content that was only available in a provider's
+runtime prompt and was never written to the local transcript or debug source.
+
+Token usage is handled separately: when a provider persists the API usage
+response, the viewer includes the returned input, cache, output, and reasoning
+token values even when the corresponding readable prompt or internal context
+is unavailable. Missing content therefore does not imply missing token usage;
+it only means that the provider did not store that content in a readable local
+form.
 
 ## Model cost calculation
 

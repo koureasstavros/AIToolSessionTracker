@@ -173,12 +173,20 @@ def derived_conversation_name(records: list[dict], fallback: str) -> str:
 def clean_session_prompt(text: str) -> str:
     """Remove generated command boilerplate and unwrap a leading prompt tag."""
     text = " ".join(text.split()).strip()
+    request_marker = "## My request:"
+    if "# Files mentioned by the user:" in text and request_marker in text:
+        text = text.split(request_marker, 1)[1].strip()
+    # Claude CLI/Desktop may prefix a prompt with one or more @"path" file
+    # references. The path is attachment metadata, not part of the title.
+    text = re.sub(r'^(?:@(?:"[^"]+"|\S+)\s*)+', "", text).strip()
     lowered = text.lower()
     skipped_prefixes = (
         "<environment_context>", "<system>", "<developer>",
         "<local-command-caveat>", "<local-command-stdout>",
         "<command-name>", "<command-message>", "<command-args>",
         "<skill>", "skill launch:", "launching skill:",
+        "<recommended_plugins>", "<available_plugins>", "<available_skills>",
+        "<workspace_info>", "<instructions>",
     )
     if lowered.startswith(skipped_prefixes):
         return ""
@@ -190,6 +198,20 @@ def clean_session_prompt(text: str) -> str:
     if wrapper:
         text = " ".join(wrapper.group(2).split()).strip()
     return text
+
+
+def explicit_conversation_name(records: list[dict], fallback: str) -> str | None:
+    """Return the latest provider-supplied conversation title, if present."""
+    for record in reversed(records):
+        if not isinstance(record, dict):
+            continue
+        for key in ("customTitle", "conversationTitle", "title", "name"):
+            value = record.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+                if value and value != fallback and not value.lstrip("# ").startswith("rollout-"):
+                    return value
+    return None
 
 
 def is_slash_command(text: str) -> bool:
@@ -315,7 +337,124 @@ def project_path(value: object) -> str | None:
             value = f"//{parsed.netloc}{value}"
         if os.name == "nt":
             value = value.replace("/", "\\")
+    elif os.name == "nt" and re.match(r"^/[A-Za-z]:/", value):
+        value = value[1:].replace("/", "\\")
     return os.path.normpath(value)
+
+
+def attached_file(name: object, path: object = None, content: object = None) -> dict | None:
+    """Normalize an attached text file without failing on stale local paths."""
+    normalized_path = project_path(path)
+    normalized_name = str(name or (Path(normalized_path).name if normalized_path else "Attached file")).strip()
+    text = content if isinstance(content, str) else None
+    if text is None and normalized_path:
+        try:
+            candidate = Path(normalized_path)
+            if candidate.is_file() and candidate.stat().st_size <= 2_000_000:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    if not normalized_path and text is None:
+        return None
+    return {"name": normalized_name, "path": normalized_path, "content": text}
+
+
+def mentioned_files(text: object) -> list[dict]:
+    """Parse Codex-style file mentions and XML attachment wrappers."""
+    if not isinstance(text, str):
+        return []
+    files: list[dict] = []
+    markdown_section = ""
+    marker = "# Files mentioned by the user:"
+    if marker in text:
+        markdown_section = text.split(marker, 1)[1]
+        markdown_section = re.split(r"\n(?:Distinguish instructions|##\s+My request:)", markdown_section, maxsplit=1)[0]
+    for name, path in re.findall(r"^##\s+([^:\r\n]+):\s+([^\r\n]+)$", markdown_section, re.MULTILINE):
+        item = attached_file(name, path.strip())
+        if item:
+            files.append(item)
+    for attributes, content in re.findall(r"<attachment\b([^>]*)>(.*?)</attachment>", text, re.IGNORECASE | re.DOTALL):
+        file_path = next((value for value in re.findall(r'(?:filePath|path)=["\']([^"\']+)', attributes, re.IGNORECASE)), None)
+        name = next((value for value in re.findall(r'(?:id|name)=["\']([^"\']+)', attributes, re.IGNORECASE)), None)
+        item = attached_file(name, file_path, content.strip())
+        if item:
+            files.append(item)
+    unique: dict[tuple[str, str | None], dict] = {}
+    for item in files:
+        unique[(item["name"], item.get("path"))] = item
+    return list(unique.values())
+
+
+def add_attached_files(turn: dict, files: list[dict]) -> None:
+    existing = turn.setdefault("files", [])
+    known = {(item.get("name"), item.get("path")) for item in existing if isinstance(item, dict)}
+    for item in files:
+        key = (item.get("name"), item.get("path"))
+        if key not in known:
+            existing.append(item)
+            known.add(key)
+
+
+def add_internal_instruction(turn: dict, name: str, content: object) -> None:
+    if not isinstance(content, str) or not content.strip():
+        return
+    instructions = turn.setdefault("internalInstructions", [])
+    key = (name, content)
+    if not any((item.get("name"), item.get("content")) == key for item in instructions if isinstance(item, dict)):
+        instructions.append({"name": name, "content": content.strip()})
+
+
+def context_instruction_blocks(value: object, provider: str) -> list[tuple[str, str]]:
+    """Extract visible agent/skill/tool context without exposing unrelated metadata."""
+    keys = {"agent", "agents", "agentDefinitions", "skills", "skill", "slashCommands", "toolInstructions", "tools", "mcpInstructions"}
+    found: list[tuple[str, str]] = []
+
+    def visit(item: object, path: str = "") -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                child_path = f"{path}.{key}" if path else key
+                if key in keys and isinstance(child, (dict, list, str)):
+                    text = child if isinstance(child, str) else json.dumps(child, indent=2, ensure_ascii=False)
+                    if text.strip() and len(text) <= 2_000_000:
+                        found.append((f"{provider} {key}", text))
+                visit(child, child_path)
+        elif isinstance(item, list):
+            for child in item[:100]:
+                visit(child, path)
+
+    visit(value)
+    unique: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for block in found:
+        if block not in seen:
+            unique.append(block)
+            seen.add(block)
+    return unique
+
+
+def files_from_content(content: object) -> list[dict]:
+    files = mentioned_files(content)
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return files
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = str(part.get("type") or "").lower()
+        if part_type not in {"file", "document", "attachment", "input_file"}:
+            continue
+        source = part.get("source") if isinstance(part.get("source"), dict) else {}
+        nested_content = part.get("content") if isinstance(part.get("content"), dict) else {}
+        file_data = nested_content.get("file") if isinstance(nested_content.get("file"), dict) else {}
+        item = attached_file(
+            part.get("displayPath") or part.get("name") or part.get("filename") or source.get("name") or file_data.get("name"),
+            part.get("filePath") or part.get("path") or source.get("path") or file_data.get("filePath"),
+            file_data.get("content") or (part.get("content") if isinstance(part.get("content"), str) else None) or part.get("text") or source.get("data") or source.get("content"),
+        )
+        if item:
+            files.append(item)
+    return files
 
 
 def project_from_records(records: list[dict]) -> str | None:
@@ -701,6 +840,7 @@ def parse_export_session(path: Path, provider: str) -> dict:
         role = payload.get("role") or message.get("role") or item.get("role") or author.get("role")
         content = (payload.get("content") or message.get("content") or item.get("content")
                    or payload.get("text") or item.get("text") or payload.get("last_agent_message"))
+        content_files = files_from_content(content)
         if isinstance(content, list):
             content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
         if content and role == "user":
@@ -709,6 +849,9 @@ def parse_export_session(path: Path, provider: str) -> dict:
             # user-role records. Keep the latest actual prompt in the turn;
             # all records remain available through the raw explorer.
             turn["user"] = str(content)
+            add_attached_files(turn, content_files)
+        elif content and role in {"system", "developer", "tool"}:
+            add_internal_instruction(turn, str(role).title() + " instructions", str(content))
         elif content and role in {"assistant", "model"}:
             turn["assistant"].append(str(content))
         info = payload.get("info") or {}
@@ -906,6 +1049,31 @@ def invocation_tools(invocation: dict) -> str:
 
 def invocation_subagent_badge(invocation: dict) -> str:
     return ""
+
+
+def user_files_markup(turn: dict) -> str:
+    files = turn.get("files") if isinstance(turn.get("files"), list) else []
+    instructions = turn.get("internalInstructions") if isinstance(turn.get("internalInstructions"), list) else []
+    if not files and not instructions:
+        return ""
+    panels = []
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or "Attached file"
+        path = item.get("path") or "Stored in transcript"
+        content = item.get("content")
+        panels.append(
+            f'<details class="attached-file"><summary><span class="attached-file-icon">F</span><span><b>{esc(name)}</b><small>{esc(path)}</small></span><span class="attached-file-arrow"></span></summary>'
+            f'<pre>{esc(content if isinstance(content, str) else "File content is unavailable at the stored path.")}</pre></details>'
+        )
+    instruction_panels = "".join(
+        f'<details class="attached-file internal-instruction"><summary><span class="attached-file-icon">I</span><span><b>{esc(item.get("name") or "Internal instructions")}</b><small>Provider-generated tool instructions</small></span><span class="attached-file-arrow"></span></summary><pre>{esc(item.get("content") or "")}</pre></details>'
+        for item in instructions if isinstance(item, dict)
+    )
+    file_block = f'<div class="attached-files"><div class="attached-files-title">Attached files <span>{len(panels)}</span></div>{"".join(panels)}</div>' if panels else ""
+    instruction_block = f'<div class="attached-files internal-instructions"><div class="attached-files-title">Internal tool instructions <span>{len(instructions)}</span></div>{instruction_panels}</div>' if instruction_panels else ""
+    return file_block + instruction_block
 
 
 def explorer_content(turn: dict, metric: str | None) -> tuple[str, str, str]:
@@ -1117,6 +1285,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     if chosen:
         for index, turn in enumerate(chosen["turns"], start=1):
             assistant = "\n\n".join(turn["assistant"]) or "(no assistant text)"
+            files_markup = user_files_markup(turn)
             tools = turn.get("tools") if isinstance(turn.get("tools"), list) else []
             invocations = turn.get("invocations") if isinstance(turn.get("invocations"), list) else []
             tools_are_nested = any(
@@ -1161,7 +1330,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             turn_model_label = turn_price["model"] if turn_price else (turn_model or "Unavailable")
             turn_total_badges = f'<span class="invocation-count">Model {esc(turn_model_label)}</span><span class="invocation-count">Invocations {len(invocations)}</span><span class="invocation-count">Tools {len(tools)}</span><span class="invocation-count">Tokens {fmt_unit(turn_token_total)}</span><span class="invocation-count">Cost {fmt_cost(turn.get("costUsd"))}</span>'
             turns += f'''<article class="turn" id="turn-{index}"><header><div class="turn-number"><span>{index:02d}</span><div><b>Turn {esc(turn_label)}</b><small>Turn activity</small></div></div><div class="turn-badges">{turn_total_badges}{kind_label}</div></header>
-                <details class="message user turn-message user-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">U</span><label>User</label></summary><p>{esc(turn["user"] or "(no user message)")}</p></details>
+                <details class="message user turn-message user-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">U</span><label>User</label></summary><p>{esc(turn["user"] or "(no user message)")}</p>{files_markup}</details>
                 <details class="message assistant turn-message assistant-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">AI</span><label>Assistant</label></summary><p>{esc(assistant)}</p></details>
                 {tool_markup}
                 {invocation_markup}
@@ -1233,6 +1402,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     view_tabs += '<style>.session-expand-controls{display:flex;gap:4px;margin-top:8px}.session-toggle{border:1px solid #40516c;background:#182538;color:#a9c9e9;cursor:pointer}.session-toggle:hover{border-color:#6c7fe2;background:#26365a;color:#fff}.turn-message{display:block!important;margin:12px 14px;width:auto;box-sizing:border-box;padding:0;border:1px solid var(--line);border-bottom:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-message>summary{display:flex;align-items:center;gap:7px;padding:10px 12px;border:0;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-message>summary::-webkit-details-marker{display:none}.turn-message>summary:after{margin-left:auto;color:#6f82a0;content:"▾"}.turn-message:not([open])>summary:after{content:"▸"}.turn-message>p{margin:0;padding:14px 16px;border-top:1px solid var(--line);background:rgba(15,23,34,.6)}.turn-invocations{width:auto;box-sizing:border-box;margin-left:14px;margin-right:14px}.turn-invocations>summary{justify-content:flex-start;gap:7px}.turn-invocations>summary>span:first-child{display:flex;align-items:center;gap:7px}.turn-invocations>summary .summary-count{margin-left:auto}.turn-invocations>summary:after{margin-left:4px;color:#6f82a0;content:"▾"}.turn-invocations:not([open])>summary:after{content:"▸"}.invocation-icon{display:grid;place-items:center;width:22px;height:22px;flex:0 0 22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800;letter-spacing:-.03em}</style><script>(function(){document.addEventListener("click",function(event){var summary=event.target.closest(".turn-message > summary");if(summary){event.preventDefault();summary.parentElement.open=!summary.parentElement.open;return;}var button=event.target.closest(".session-toggle");if(!button)return;var detail=button.closest(".detail");if(!detail)return;var target=button.getAttribute("data-target");var selectors=target==="all"?"details":target==="user"?"details.user-content":target==="assistant"?"details.assistant-content":"details.turn-invocations";var details=detail.querySelectorAll(selectors);var shouldOpen=Array.prototype.some.call(details,function(item){return !item.open});details.forEach(function(item){item.open=shouldOpen});});})();</script>'
     view_tabs += '<style>.turn-message>summary,.turn-invocations>summary{min-height:44px;box-sizing:border-box}</style>'
     view_tabs += '<style>.timeline-date-link{cursor:pointer}.timeline-date-link:hover{fill:#fff!important}.timeline-point:hover{stroke:#fff;stroke-width:3}</style>'
+    view_tabs += '<style>.attached-files{padding:0 12px 12px;border-top:1px solid var(--line);background:#0b1018}.attached-files-title{display:flex;align-items:center;gap:7px;padding:10px 2px;color:#708198;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.attached-files-title span{padding:2px 6px;border-radius:999px;background:#222d3d;color:#9babc0}.attached-file{margin-top:6px;border:1px solid #263247;border-radius:8px;background:#111925;overflow:hidden}.attached-file>summary{display:flex;align-items:center;gap:9px;padding:8px 10px;cursor:pointer;list-style:none}.attached-file>summary::-webkit-details-marker{display:none}.attached-file-icon{display:grid;place-items:center;width:22px;height:22px;flex:0 0 22px;border-radius:6px;background:#293151;color:#c1c8ff;font-size:8px;font-weight:800}.attached-file summary b{display:block;color:#b8c5d7;font-size:10px}.attached-file summary small{display:block;max-width:700px;margin-top:2px;overflow:hidden;color:#63748b;font:8px ui-monospace,monospace;text-overflow:ellipsis;white-space:nowrap}.attached-file-arrow{margin-left:auto}.attached-file-arrow:after{color:#708198;content:"▸"}.attached-file[open] .attached-file-arrow:after{content:"▾"}.attached-file pre{max-height:420px;margin:0;padding:12px;border-top:1px solid #263247;background:#090e16;color:#a9b7ca;font:10px/1.55 ui-monospace,monospace;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}</style>'
     stats_sidebar = (
         '<div class="stats-group-menu"><div class="stats-sidebar-title">Group by</div><nav class="stats-sidebar-links">'
         + "".join(

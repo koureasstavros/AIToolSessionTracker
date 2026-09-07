@@ -85,11 +85,25 @@ def details(summary: dict) -> dict:
     tool_calls: dict[str, tuple[dict, dict]] = {}
     current_turn_id = ""
     current_invocation: dict | None = None
+    session_context_blocks = viewer.context_instruction_blocks(records, "Codex")
+    session_instructions = ""
+    if records and isinstance(records[0].get("payload"), dict):
+        base = records[0]["payload"].get("base_instructions")
+        if isinstance(base, dict):
+            session_instructions = str(base.get("text") or "")
+        elif isinstance(base, str):
+            session_instructions = base
 
     def get_turn(turn_id: str | None = None) -> dict:
         nonlocal current_turn_id
         current_turn_id = str(turn_id or current_turn_id or f"turn-{len(turns) + 1}")
-        return turns.setdefault(current_turn_id, viewer.new_turn(current_turn_id))
+        turn = turns.setdefault(current_turn_id, viewer.new_turn(current_turn_id))
+        if session_instructions and len(turns) == 1:
+            viewer.add_internal_instruction(turn, "Codex base instructions", session_instructions)
+        if len(turns) == 1:
+            for block_name, block_content in session_context_blocks:
+                viewer.add_internal_instruction(turn, block_name, block_content)
+        return turn
 
     def get_invocation(turn: dict) -> dict:
         nonlocal current_invocation
@@ -175,6 +189,7 @@ def details(summary: dict) -> dict:
             content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
         if content and role == "user":
             turn["user"] = str(content)
+            viewer.add_attached_files(turn, viewer.mentioned_files(content))
         elif content and role in {"assistant", "model"}:
             turn["assistant"].append(str(content))
             if invocation is not None:

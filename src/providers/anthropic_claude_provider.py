@@ -109,6 +109,10 @@ def index(root: Path) -> list[dict]:
         entries.append(entry)
     for entry in entries:
         entry["_has_data"] = _has_data(entry["_source"])
+        records = viewer.safe_json_lines(entry["_source"])
+        explicit_name = viewer.explicit_conversation_name(records, entry["id"])
+        if explicit_name:
+            entry["name"] = explicit_name
         # Keep the sidebar flag consistent with the surface shown in the
         # conversation header. Shared .claude paths intentionally retain both
         # possible labels.
@@ -198,6 +202,8 @@ def details(summary: dict) -> dict:
             current_turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
             if content:
                 current_turn["user"] = str(content)
+            viewer.add_attached_files(current_turn, viewer.files_from_content(raw_content))
+            viewer.add_attached_files(current_turn, viewer.mentioned_files(content))
             continue
 
         if is_tool_result:
@@ -225,6 +231,13 @@ def details(summary: dict) -> dict:
         if turn_model:
             turn["model"] = turn_model
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
+        attachment = record.get("attachment") if isinstance(record.get("attachment"), dict) else None
+        if attachment:
+            viewer.add_attached_files(turn, viewer.files_from_content(attachment))
+            attachment_type = str(attachment.get("type") or "internal instructions")
+            if attachment_type != "file":
+                instruction = json.dumps(attachment, indent=2, ensure_ascii=False)
+                viewer.add_internal_instruction(turn, f"Claude {attachment_type}", instruction)
         message_id_value = message.get("id") if isinstance(message, dict) else None
         message_id = str(message_id_value) if message_id_value else None
         invocation = new_invocation(turn, message_id) if role in {"assistant", "model"} or is_tool_use else None
@@ -269,7 +282,7 @@ def details(summary: dict) -> dict:
     if records and isinstance(records[0], dict):
         first = records[0]
         result["id"] = str(first.get("sessionId") or first.get("session_id") or first.get("conversationId") or first.get("conversation_id") or result["id"])
-        result["name"] = str(first.get("title") or first.get("name") or first.get("summary") or first.get("conversationTitle") or result["id"])
+        result["name"] = viewer.explicit_conversation_name(records, result["id"]) or str(first.get("title") or first.get("name") or first.get("summary") or first.get("conversationTitle") or result["id"])
         if result["name"] == result["id"]:
             result["name"] = viewer.derived_conversation_name(records, result["id"])
     result["turns"] = list(turns.values())
