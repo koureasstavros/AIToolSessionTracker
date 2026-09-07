@@ -951,7 +951,7 @@ def render_session_row(item: dict, provider: str, selected: bool, show_empty: bo
     )
 
 
-def statistics_group_key(session: dict, group: str, provider: str, summary: dict) -> str:
+def statistics_group_key(session: dict, group: str, provider: str, summary: dict, time_range: str = "all") -> str:
     if group == "tool":
         return PROVIDERS.get(provider, provider)
     if group == "model":
@@ -967,6 +967,10 @@ def statistics_group_key(session: dict, group: str, provider: str, summary: dict
     if not timestamp:
         return "Unknown date"
     date = datetime.fromtimestamp(timestamp).date()
+    if group == "timeline":
+        return datetime.fromtimestamp(timestamp).strftime("%H:00") if time_range == "today" else date.isoformat()
+    if group == "today":
+        return datetime.fromtimestamp(timestamp).strftime("%H:00")
     if group == "month":
         return date.strftime("%Y-%m")
     if group == "year":
@@ -977,7 +981,7 @@ def statistics_group_key(session: dict, group: str, provider: str, summary: dict
     return date.isoformat()
 
 
-def render_timeline_svg(points: dict[str, dict[str, float]]) -> str:
+def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "all") -> str:
     """Render a compact dual-line timeline for tokens and USD cost."""
     ordered = sorted(points.items())
     if not ordered:
@@ -1000,12 +1004,12 @@ def render_timeline_svg(points: dict[str, dict[str, float]]) -> str:
     def markers(key: str, maximum: float, css_class: str) -> str:
         denominator = max(len(ordered) - 1, 1)
         return "".join(
-            f'<circle class="timeline-point {css_class}" cx="{left + chart_width * index / denominator:.1f}" cy="{top + chart_height * (1 - item[key] / maximum):.1f}" r="5"><title>{esc(label)} · {"Tokens" if key == "tokens" else "Cost"}: {fmt_unit(item[key], key == "cost")}</title></circle>'
+            f'<a href="/?{urlencode({"provider": "copilot", "view": "statistics", "group": "timeline", "range": time_range, "group_value": label})}"><circle class="timeline-point {css_class}" cx="{left + chart_width * index / denominator:.1f}" cy="{top + chart_height * (1 - item[key] / maximum):.1f}" r="5"><title>{esc(label)} · {"Tokens" if key == "tokens" else "Cost"}: {fmt_unit(item[key], key == "cost")}</title></circle></a>'
             for index, (label, item) in enumerate(ordered)
         )
 
     labels = "".join(
-        f'<text x="{left + chart_width * index / max(len(ordered) - 1, 1):.1f}" y="{height - 22}" text-anchor="middle">{esc(label)}</text>'
+        f'<a href="/?{urlencode({"provider": "copilot", "view": "statistics", "group": "timeline", "range": time_range, "group_value": label})}"><text class="timeline-date-link" x="{left + chart_width * index / max(len(ordered) - 1, 1):.1f}" y="{height - 22}" text-anchor="middle">{esc(label)}</text></a>'
         for index, (label, _) in enumerate(ordered)
     )
     token_ticks = "".join(
@@ -1021,11 +1025,12 @@ def render_timeline_svg(points: dict[str, dict[str, float]]) -> str:
 
 def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_group: str | None = None, time_range: str = "all") -> str:
     """Render aggregate token and cost information across all providers."""
-    if group not in {"project", "day", "week", "month", "year", "tool", "model", "timeline"}:
+    if group not in {"project", "today", "day", "week", "month", "year", "tool", "model", "timeline"}:
         group = "day"
     range_days = {"7d": 7, "30d": 30, "90d": 90, "365d": 365}.get(time_range)
-    cutoff = datetime.now().timestamp() - range_days * 86400 if range_days else None
-    if cutoff is not None and group == "timeline":
+    start_of_today = datetime.combine(datetime.now().date(), datetime.min.time()).timestamp()
+    cutoff = start_of_today if time_range == "today" or group == "today" else (datetime.now().timestamp() - range_days * 86400 if range_days else None)
+    if cutoff is not None and (group in {"timeline", "today"}):
         summaries = [
             (provider, summary) for provider, summary in summaries
             if (summary.get("updated") or 0) >= cutoff
@@ -1034,10 +1039,13 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
     total_costs = {key: 0.0 for key in TOKEN_KEYS}
     total_cost = 0.0
     groups: dict[str, dict] = {}
-    timeline_points: dict[str, dict[str, float]] = {}
+    timeline_points: dict[str, dict[str, float]] = (
+        {f"{hour:02d}:00": {"tokens": 0.0, "cost": 0.0} for hour in range(24)}
+        if group == "timeline" and time_range == "today" else {}
+    )
     for provider, summary in summaries:
         session = load_session_details(summary, provider)
-        bucket = groups.setdefault(statistics_group_key(session, group, provider, summary), {
+        bucket = groups.setdefault(statistics_group_key(session, group, provider, summary, time_range), {
             "sessions": 0,
             "tokens": {key: 0 for key in TOKEN_KEYS},
             "costs": {key: 0.0 for key in TOKEN_KEYS},
@@ -1057,14 +1065,15 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
             total_cost += cost
         timestamp = session.get("updated") or 0
         if timestamp:
-            timeline_bucket = timeline_points.setdefault(datetime.fromtimestamp(timestamp).date().isoformat(), {"tokens": 0.0, "cost": 0.0})
+            timeline_label = datetime.fromtimestamp(timestamp).strftime("%H:00") if time_range == "today" else datetime.fromtimestamp(timestamp).date().isoformat()
+            timeline_bucket = timeline_points.setdefault(timeline_label, {"tokens": 0.0, "cost": 0.0})
             timeline_bucket["tokens"] += sum(value or 0 for value in session.get("tokens", {}).values())
             timeline_bucket["cost"] += cost if isinstance(cost, (int, float)) else 0
         for key, value in pricing.cost_breakdown(session.get("tokens", {}), session.get("model")).items():
             bucket["costs"][key] += value
             total_costs[key] += value
     ordered_groups = sorted(groups.items(), key=lambda item: item[0], reverse=True)
-    heading = {"project": "Project", "day": "Day", "week": "Week", "month": "Month", "year": "Year", "tool": "Provider", "model": "Model", "timeline": "Timeline"}[group]
+    heading = {"project": "Project", "today": "Hour", "day": "Day", "week": "Week", "month": "Month", "year": "Year", "tool": "Provider", "model": "Model", "timeline": "Timeline"}[group]
     session_count = len(summaries)
     average_tokens = sum(totals.values()) / session_count if session_count else 0
     average_cost = total_cost / session_count if session_count else 0
@@ -1082,7 +1091,7 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
             for provider, summary, session in groups[selected_group]["items"]
         )
         related = f'<section class="stats-related"><div class="section-heading"><div><span class="section-kicker">SELECTED GROUP</span><h2>Sessions in {esc(selected_group)}</h2></div></div><div class="stats-table-wrap"><table class="stats-table related-table"><thead><tr><th>Session ID</th><th>Session name</th><th>Provider</th><th>Model</th><th>Total tokens</th><th>Total cost</th></tr></thead><tbody>{session_rows}</tbody></table></div></section>'
-    timeline_markup = f'<section class="timeline-section"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Tokens and cost over time</h2></div></div>{render_timeline_svg(timeline_points)}</section>'
+    timeline_markup = f'<section class="timeline-section"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Tokens and cost over time</h2></div></div>{render_timeline_svg(timeline_points, time_range)}</section>{related}'
     table_markup = f'<section class="stats-table-section"><div class="section-heading"><div><span class="section-kicker">BREAKDOWN</span><h2>By {heading.lower()}</h2></div></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>{heading}</th><th>Sessions</th>{"".join(f"<th>{esc(TOKEN_LABELS[key])}</th>" for key in TOKEN_KEYS)}{"".join(f"<th>{esc(TOKEN_LABELS[key])} cost</th>" for key in TOKEN_KEYS)}<th>Total tokens</th><th>Total cost</th></tr></thead><tbody>{rows}</tbody></table></div></section>{related}'
     return f'''<main class="detail statistics"><style>.stats-toolbar{{display:flex;align-items:center;gap:16px;margin:28px 0 18px;padding:12px 14px;border:1px solid #223753;border-radius:9px;background:#101d30}}.stats-filters{{display:flex;gap:7px;flex-wrap:wrap}}.stats-filter{{padding:7px 11px;border:1px solid #315479;border-radius:7px;color:#a9c9e9;text-decoration:none;font-size:12px}}.stats-filter:hover,.stats-filter.selected{{background:#24558a;color:#fff}}.stats-table-section,.stats-related,.timeline-section{{width:100%;max-width:1500px;margin:30px auto 0}}.stats-table-wrap{{width:100%;overflow:auto;border:1px solid #223753;border-radius:9px}}.stats-table{{width:100%;min-width:0;table-layout:fixed;border-collapse:collapse;background:#101a2a}}.stats-table th,.stats-table td{{width:auto;padding:11px 8px;border-bottom:1px solid #22304a;text-align:right;font-size:11px;white-space:normal;overflow-wrap:anywhere}}.stats-table th:first-child,.stats-table td:first-child{{text-align:left}}.stats-table th{{color:#91a8c7;font-size:10px;text-transform:uppercase;letter-spacing:.5px}}.stats-table td{{color:#cbd8e8}}.stats-table tr:last-child td{{border-bottom:0}}.stats-group-link{{color:#9ed1ff;text-decoration:none}}.stats-group-link:hover{{color:#fff;text-decoration:underline}}.timeline-chart{{padding:16px;border:1px solid #223753;border-radius:9px;background:#101a2a}}.timeline-chart svg{{display:block;width:100%;height:auto}}.timeline-axis{{stroke:#34445c;stroke-width:1}}.timeline-chart text{{fill:#7e8ea5;font-size:11px}}.timeline-tokens,.timeline-cost{{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}}.timeline-tokens{{stroke:#54c99f}}.timeline-cost{{stroke:#f07878}}.tokens-axis-label,.tokens-axis-title{{fill:#54c99f!important}}.cost-axis-label,.cost-axis-title{{fill:#f07878!important}}.timeline-legend{{display:flex;gap:18px;margin:0 0 8px;font-size:11px}}.timeline-key:before{{display:inline-block;width:9px;height:9px;margin-right:6px;border-radius:50%;content:""}}.tokens-key:before{{background:#54c99f}}.cost-key:before{{background:#f07878}}.timeline-empty{{padding:28px;border:1px dashed #34445c;border-radius:9px;color:#7e8ea5;text-align:center}}.statistics-link{{margin-top:8px;border-top:1px solid #223451}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>All providers</div><h1>Statistics</h1><p class="muted">Aggregate token and cost information across loaded sessions.</p></div></header>
         <section class="overview"><div class="section-heading"><div><span class="section-kicker">TOTAL</span><h2>All providers</h2></div><div class="overview-stats"><span><b>{session_count:,}</b> sessions</span><span><b>{fmt_unit(sum(totals.values()))}</b> tokens</span><span><b>{fmt_unit(total_cost, True)}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/session</span><span><b>{fmt_cost(average_cost)}</b> avg cost/session</span></div></div><div class="metrics">{token_cards(totals, costs=total_costs)}</div></section>
@@ -1092,7 +1101,7 @@ def session_tool(summary: dict, provider: str) -> str:
     return PROVIDER_ADAPTERS[provider].tool(summary)
 
 
-def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False, selected_raw: bool = False, view: str = "sessions", group: str = "day", selected_group: str | None = None, time_range: str = "all", import_error: str | None = None) -> str:
+def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False, selected_raw: bool = False, view: str = "sessions", group: str = "today", selected_group: str | None = None, time_range: str = "all", import_error: str | None = None) -> str:
     sessions = load_session_index(root, provider, show_empty)
     chosen_summary = next((item for item in sessions if item["id"] == selected), None) if selected else None
     chosen = load_session_details(chosen_summary, provider) if chosen_summary else None
@@ -1220,26 +1229,26 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     )
     toggle = f'<a class="empty-toggle" href="{toggle_url}" title="{toggle_label}" aria-label="{toggle_label}">{toggle_icon}</a>'
     import_form = f'<form class="import-inline" method="post" action="/import" enctype="multipart/form-data"><input id="source-archive" name="archive" type="file" accept=".zip" required onchange="this.form.submit()"><input type="hidden" name="provider" value="{esc(provider)}"><label class="import-button" for="source-archive" title="Import one session archive" aria-label="Import one session archive">⇧</label></form>'
-    view_tabs = f'<style>.detail .message p{{font-size:12px}}.detail .muted{{font-size:11px}}.detail .section-kicker{{font-size:10px}}.detail .section-heading h2{{font-size:17px}}.detail .metric span{{font-size:10px}}.detail .metric strong{{font-size:20px}}.assistant .role>span{{width:22px;height:22px;border-radius:7px}}.view-tabs{{display:flex;gap:5px;margin:10px 0 16px;padding:3px;background:#0c1627;border:1px solid #223451;border-radius:8px}}.view-tab{{flex:1;padding:7px 8px;border-radius:6px;color:#8fa8c5;text-align:center;text-decoration:none;font-size:11px}}.view-tab:hover,.view-tab.selected{{background:#24558a;color:#fff}}.stats-group-menu{{padding:4px;background:#0c1627;border:1px solid #223451;border-radius:11px}}.stats-sidebar-title{{margin:4px 8px 8px;color:#91a8c7;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase}}.stats-sidebar-links{{display:grid;gap:4px}}.stats-sidebar-link{{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid transparent;border-radius:8px;color:#b8c9df;text-decoration:none;font-size:13px}}.stats-sidebar-link .provider-mark{{width:7px;height:7px;flex:none;border-radius:50%;background:#5ca8ff;box-shadow:0 0 0 3px rgba(92,168,255,.12)}}.stats-sidebar-link:hover,.stats-sidebar-link.selected{{border-color:#3b6b9d;background:#2c6aa5;box-shadow:0 4px 12px rgba(24,91,151,.25);color:#fff}}.stats-sidebar .provider-menu:empty,.stats-sidebar .sessions-area{{display:none}}.timeline-point{{cursor:pointer;stroke:#101a2a;stroke-width:2}}.tokens-point{{fill:#54c99f}}.cost-point{{fill:#f07878}}.timeline-hint{{margin-left:auto;color:#687990;font-size:10px}}.import-error{{position:fixed;z-index:30;top:20px;left:calc(var(--sidebar) + 24px);right:24px;width:auto;max-width:none;margin:0;padding:12px 16px;border:1px solid #8f3e4b;border-radius:9px;background:#351923;color:#ffb4c0;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.3)}}@media(max-width:700px){{.import-error{{left:20px;right:20px}}}}</style><nav class="view-tabs"><a class="view-tab {"selected" if view != "statistics" else ""}" href="/?{urlencode({"provider": provider, "show_empty": int(show_empty)})}">Operational</a><a class="view-tab {"selected" if view == "statistics" else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "range": time_range})}">Statistics</a></nav>'
+    view_tabs = f'<style>.detail .message p{{font-size:12px}}.detail .muted{{font-size:11px}}.detail .section-kicker{{font-size:10px}}.detail .section-heading h2{{font-size:17px}}.detail .metric span{{font-size:10px}}.detail .metric strong{{font-size:20px}}.assistant .role>span{{width:22px;height:22px;border-radius:7px}}.view-tabs{{display:flex;gap:5px;margin:10px 0 16px;padding:3px;background:#0c1627;border:1px solid #223451;border-radius:8px}}.view-tab{{flex:1;padding:7px 8px;border-radius:6px;color:#8fa8c5;text-align:center;text-decoration:none;font-size:11px}}.view-tab:hover,.view-tab.selected{{background:#24558a;color:#fff}}.stats-group-menu,.stats-time-menu{{padding:4px;background:#0c1627;border:1px solid #223451;border-radius:11px}}.stats-time-menu{{margin-top:12px}}.stats-sidebar-title{{margin:4px 8px 8px;color:#91a8c7;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase}}.stats-sidebar-links{{display:grid;gap:4px}}.stats-sidebar-link{{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid transparent;border-radius:8px;color:#b8c9df;text-decoration:none;font-size:13px}}.stats-sidebar-link .provider-mark{{width:7px;height:7px;flex:none;border-radius:50%;background:#5ca8ff;box-shadow:0 0 0 3px rgba(92,168,255,.12)}}.stats-sidebar-link:hover,.stats-sidebar-link.selected{{border-color:#3b6b9d;background:#2c6aa5;box-shadow:0 4px 12px rgba(24,91,151,.25);color:#fff}}.stats-sidebar .provider-menu:empty,.stats-sidebar .sessions-area{{display:none}}.timeline-point{{cursor:pointer;stroke:#101a2a;stroke-width:2}}.tokens-point{{fill:#54c99f}}.cost-point{{fill:#f07878}}.timeline-hint{{margin-left:auto;color:#687990;font-size:10px}}.import-error{{position:fixed;z-index:30;top:20px;left:calc(var(--sidebar) + 24px);right:24px;width:auto;max-width:none;margin:0;padding:12px 16px;border:1px solid #8f3e4b;border-radius:9px;background:#351923;color:#ffb4c0;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.3)}}@media(max-width:700px){{.import-error{{left:20px;right:20px}}}}</style><nav class="view-tabs"><a class="view-tab {"selected" if view != "statistics" else ""}" href="/?{urlencode({"provider": provider, "show_empty": int(show_empty)})}">Operational</a><a class="view-tab {"selected" if view == "statistics" else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "range": time_range})}">Statistics</a></nav>'
     view_tabs += '<style>.session-expand-controls{display:flex;gap:4px;margin-top:8px}.session-toggle{border:1px solid #40516c;background:#182538;color:#a9c9e9;cursor:pointer}.session-toggle:hover{border-color:#6c7fe2;background:#26365a;color:#fff}.turn-message{display:block!important;margin:12px 14px;width:auto;box-sizing:border-box;padding:0;border:1px solid var(--line);border-bottom:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-message>summary{display:flex;align-items:center;gap:7px;padding:10px 12px;border:0;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-message>summary::-webkit-details-marker{display:none}.turn-message>summary:after{margin-left:auto;color:#6f82a0;content:"▾"}.turn-message:not([open])>summary:after{content:"▸"}.turn-message>p{margin:0;padding:14px 16px;border-top:1px solid var(--line);background:rgba(15,23,34,.6)}.turn-invocations{width:auto;box-sizing:border-box;margin-left:14px;margin-right:14px}.turn-invocations>summary{justify-content:flex-start;gap:7px}.turn-invocations>summary>span:first-child{display:flex;align-items:center;gap:7px}.turn-invocations>summary .summary-count{margin-left:auto}.turn-invocations>summary:after{margin-left:4px;color:#6f82a0;content:"▾"}.turn-invocations:not([open])>summary:after{content:"▸"}.invocation-icon{display:grid;place-items:center;width:22px;height:22px;flex:0 0 22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800;letter-spacing:-.03em}</style><script>(function(){document.addEventListener("click",function(event){var summary=event.target.closest(".turn-message > summary");if(summary){event.preventDefault();summary.parentElement.open=!summary.parentElement.open;return;}var button=event.target.closest(".session-toggle");if(!button)return;var detail=button.closest(".detail");if(!detail)return;var target=button.getAttribute("data-target");var selectors=target==="all"?"details":target==="user"?"details.user-content":target==="assistant"?"details.assistant-content":"details.turn-invocations";var details=detail.querySelectorAll(selectors);var shouldOpen=Array.prototype.some.call(details,function(item){return !item.open});details.forEach(function(item){item.open=shouldOpen});});})();</script>'
     view_tabs += '<style>.turn-message>summary,.turn-invocations>summary{min-height:44px;box-sizing:border-box}</style>'
+    view_tabs += '<style>.timeline-date-link{cursor:pointer}.timeline-date-link:hover{fill:#fff!important}.timeline-point:hover{stroke:#fff;stroke-width:3}</style>'
     stats_sidebar = (
         '<div class="stats-group-menu"><div class="stats-sidebar-title">Group by</div><nav class="stats-sidebar-links">'
         + "".join(
             f'<a class="stats-sidebar-link {"selected" if group == option else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": option, "range": time_range})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
-            for option, label in (("day", "Day"), ("week", "Week"), ("month", "Month"), ("year", "Year"), ("project", "Project"), ("tool", "Provider"), ("model", "Model"), ("timeline", "Timeline"))
+            for option, label in (("today", "Today"), ("day", "Day"), ("week", "Week"), ("month", "Month"), ("year", "Year"), ("project", "Project"), ("tool", "Provider"), ("model", "Model"), ("timeline", "Timeline"))
         )
-        + '</nav>'
+        + '</nav></div>'
         + (
-            '<div class="stats-sidebar-title">Time range</div><nav class="stats-sidebar-links">'
+            '<div class="stats-time-menu"><div class="stats-sidebar-title">Time range</div><nav class="stats-sidebar-links">'
             + "".join(
                 f'<a class="stats-sidebar-link {"selected" if time_range == option else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "range": option})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
-                for option, label in (("all", "All time"), ("7d", "Last 7 days"), ("30d", "Last 30 days"), ("90d", "Last 90 days"), ("365d", "Last year"))
+                for option, label in (("all", "All time"), ("today", "Today"), ("7d", "Last 7 days"), ("30d", "Last 30 days"), ("90d", "Last 90 days"), ("365d", "Last year"))
             )
-            + '</nav>'
+            + '</nav></div>'
             if group == "timeline" else ""
         )
-        + '</div>'
     ) if view == "statistics" else ""
     message = f'<div class="import-error" role="alert">{esc(import_error)}</div>' if import_error else ""
     return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__SIDEBAR_CLASS__", "stats-sidebar" if view == "statistics" else "").replace("__PROVIDER_MENU__", "" if view == "statistics" else provider_menu).replace("__VIEW_TABS__", view_tabs).replace("__STATS_SIDEBAR__", stats_sidebar).replace("__SESSION_ROWS__", "" if view == "statistics" else session_rows).replace("__SESSION_COUNT__", str(len(sessions))).replace("__DETAIL__", message + detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", toggle).replace("__ROOT__", esc(provider_path(root, provider))).replace("__IMPORT_FORM__", import_form)
@@ -1363,7 +1372,7 @@ class Handler(BaseHTTPRequestHandler):
         selected_turn = int(turn_value) if turn_value and turn_value.isdigit() else None
         selected_metric = query.get("metric", [None])[0]
         view = query.get("view", ["sessions"])[0]
-        group = query.get("group", ["day"])[0]
+        group = query.get("group", ["today"])[0]
         selected_group = query.get("group_value", [None])[0]
         time_range = query.get("range", ["all"])[0]
         import_error = query.get("import_error", [None])[0]
