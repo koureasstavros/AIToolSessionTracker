@@ -152,6 +152,34 @@ class GoogleAntigravityProviderTests(unittest.TestCase):
         self.assertEqual(entries[0]["name"], "My prompt title")
         self.assertTrue(entries[0]["_has_data"])
 
+    def test_index_discovers_cli_sessions_and_labels_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cli_root = Path(directory) / "antigravity-cli"
+            session_dir = cli_root / "sessions" / "cli-session"
+            session_dir.mkdir(parents=True)
+            transcript = session_dir / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps({
+                    "type": "USER_INPUT",
+                    "content": "<USER_REQUEST>CLI session</USER_REQUEST>",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            with patch("src.providers.google_antigravity_provider._candidate_roots", return_value=[cli_root]):
+                entries = google_antigravity_provider.index(cli_root)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["name"], "CLI session")
+        self.assertEqual(entries[0]["_source_label"], "CLI")
+
+    def test_source_labels_ide_transcripts_as_ide(self) -> None:
+        source = Path.home() / ".gemini" / "antigravity-ide" / "brain" / "session" / ".system_generated" / "logs" / "transcript.jsonl"
+        self.assertEqual(google_antigravity_provider.tool({"_source": source}), "IDE")
+
+    def test_source_labels_desktop_transcripts_as_desktop(self) -> None:
+        source = Path.home() / ".gemini" / "antigravity" / "brain" / "session" / ".system_generated" / "logs" / "transcript.jsonl"
+        self.assertEqual(google_antigravity_provider.tool({"_source": source}), "Desktop")
+
     def test_delete_removes_session_directory_and_db(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

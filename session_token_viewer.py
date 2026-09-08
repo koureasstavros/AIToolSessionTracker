@@ -46,16 +46,59 @@ PROVIDERS = {
     "copilot": "GitHub Copilot",
     "codex": "OpenAI Codex",
     "claude": "Anthropic Claude Code",
-    "m365_copilot": "Microsoft 365 Copilot",
     "antigravity": "Google Antigravity",
+    "m365_copilot": "Microsoft 365 Copilot",
 }
+TOKEN_ACCOUNTING_NOTES = {
+    "copilot": (
+        "GitHub Copilot",
+        "Session totals come from shutdown usage, while output tokens are summed from assistant messages. Input and cache values are not normally attached to each turn; in multi-turn sessions they are allocated using each turn's output-token share, so those per-turn values are estimates while the session total remains exact.",
+    ),
+    "codex": (
+        "OpenAI Codex",
+        "Token counts come from token_count event records for each completed turn. The viewer aggregates those exact records and does not infer missing values or copy one invocation's usage onto its tools.",
+    ),
+    "claude": (
+        "Anthropic Claude Code",
+        "Token counts come from model-response usage fields, including input, cache, output, and reasoning values when provided. Missing values remain unavailable; tool calls do not receive separate token counts.",
+    ),
+    "antigravity": (
+        "Google Antigravity",
+        "Native token usage is not consistently present in the local transcript. When usage is absent, the viewer estimates token counts from transcript content and prices them with the matching Gemini model rate. These values are estimates.",
+    ),
+    "m365_copilot": (
+        "Microsoft 365 Copilot",
+        "Token values are read from exported usage metadata when present and aggregated from the parsed turns. Missing values are left unavailable rather than fabricated.",
+    ),
+}
+
+
+def token_accounting_note(provider: str, turn_count: int) -> str:
+    """Render the provider-specific explanation shown above session usage."""
+    provider_name, description = TOKEN_ACCOUNTING_NOTES.get(
+        provider,
+        (PROVIDERS.get(provider, provider), "Token values are read from the provider export when available; missing values are not inferred."),
+    )
+    if provider == "copilot" and turn_count <= 1:
+        description = "Session totals come from shutdown usage. For a single-turn session, those totals can be assigned directly to the turn. Output tokens are also summed from assistant messages."
+    common_intro = f"Usage is read from persisted {provider_name} data when available. "
+    description = common_intro + description
+    return (
+        '<section class="token-accounting-note" aria-labelledby="token-accounting-title">'
+        '<div class="token-accounting-icon" aria-hidden="true">↔</div>'
+        '<div><span class="section-kicker">TOKEN ACCOUNTING</span>'
+        f'<h2 id="token-accounting-title">How {esc(provider_name)} usage is calculated</h2>'
+        f'<p>{esc(description)}</p></div></section>'
+    )
+
+
 APP_NAME = "AI Tool Session Explorer"
 PROVIDER_ADAPTERS = {
     "copilot": github_copilot_provider,
     "codex": openai_codex_provider,
     "claude": anthropic_claude_provider,
-    "m365_copilot": m365_copilot_provider,
     "antigravity": google_antigravity_provider,
+    "m365_copilot": m365_copilot_provider,
 }
 LOGGER = logging.getLogger(__name__)
 TOKEN_ALIASES = {
@@ -897,12 +940,13 @@ def read_external_session(path: Path, provider: str) -> dict:
 
 
 def load_session_index(root: Path, provider: str, show_empty: bool = False) -> list[dict]:
-    """Load inexpensive provider summaries for the sidebar."""
+    """Load provider summaries without parsing full transcripts or pricing."""
     adapter = PROVIDER_ADAPTERS[provider]
     normalized = []
     for item in adapter.index(root):
         item["provider"] = provider
-        normalized.append(normalize_session_data(item))
+        summary = normalize_session_data(item)
+        normalized.append(summary)
     normalized.sort(key=lambda item: item.get("updated", 0), reverse=True)
     if show_empty:
         return normalized
@@ -972,6 +1016,12 @@ def format_timestamp(value: float) -> str:
     if not value:
         return "Unknown time"
     return datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def display_model_name(model: object) -> str:
+    """Show the public model name instead of a provider deployment path."""
+    price = pricing.find_model(model)
+    return str(price["model"] if price else model or "Unavailable")
 
 
 def esc(value: object, quote: bool = True) -> str:
@@ -1320,17 +1370,16 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             show_invocation_breakdown = len(invocations) > 1 or tools_are_nested
             if show_invocation_breakdown:
                 invocation_markup = '<details class="turn-invocations"><summary><span><span class="invocation-icon" aria-hidden="true">I</span> Invocations</span><span class="summary-count">' + str(len(invocations)) + '</span></summary><div class="invocations-list">' + "".join(
-                    f'<div class="turn-invocation"><span class="invocation-name"><i></i>Invocation {esc(invocation.get("index", invocation_index))}'
+                    f'<div class="turn-invocation"><div class="invocation-name"><span><i></i>Invocation {esc(invocation.get("index", invocation_index))}</span>'
                     f'{" <span class=\"turn-kind\">Usage summary</span>" if invocation.get("kind") == "usage_summary" else ""}'
-                    f'</span><div class="invocation-content">{invocation_tools(invocation)}{invocation_token_cards(invocation.get("tokens", {}), turn.get("model") or chosen.get("model"))}</div></div>'
+                    f'<span class="invocation-model"><small>Model</small><b>{esc(display_model_name(invocation.get("model") or turn.get("model") or chosen.get("model")))}</b></span></div><div class="invocation-content">{invocation_tools(invocation)}{invocation_token_cards(invocation.get("tokens", {}), invocation.get("model") or turn.get("model") or chosen.get("model"))}</div></div>'
                     for invocation_index, invocation in enumerate(invocations, 1) if isinstance(invocation, dict)
                 ) + '</div></details>'
             invocation_label = f'{len(invocations)} {"invocation" if len(invocations) == 1 else "invocations"}'
             tool_label = f'{len(tools)} {"tool" if len(tools) == 1 else "tools"}'
             turn_token_total = sum(turn.get("tokens", {}).get(key) or 0 for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens"))
             turn_model = turn.get("model") or chosen.get("model")
-            turn_price = pricing.find_model(turn_model)
-            turn_model_label = turn_price["model"] if turn_price else (turn_model or "Unavailable")
+            turn_model_label = display_model_name(turn_model)
             turn_total_badges = f'<span class="invocation-count">Model {esc(turn_model_label)}</span><span class="invocation-count">Invocations {len(invocations)}</span><span class="invocation-count">Tools {len(tools)}</span><span class="invocation-count">Tokens {fmt_unit(turn_token_total)}</span><span class="invocation-count">Cost {fmt_cost(turn.get("costUsd"))}</span>'
             turns += f'''<article class="turn" id="turn-{index}"><header><div class="turn-number"><span>{index:02d}</span><div><b>Turn {esc(turn_label)}</b><small>Turn activity</small></div></div><div class="turn-badges">{turn_total_badges}{kind_label}</div></header>
                 <details class="message user turn-message user-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">U</span><label>User</label></summary><p>{esc(turn["user"] or "(no user message)")}</p>{files_markup}</details>
@@ -1346,7 +1395,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     ] if view == "statistics" else []
     detail = render_statistics(all_statistics_sessions, group, selected_group, time_range) if view == "statistics" else ""
     if view != "statistics" and chosen:
-        turn_note = " · input/cache/reasoning values estimated from session totals" if provider == "copilot" and len(chosen["turns"]) > 1 else (" · token metrics estimated from transcript content" if provider == "antigravity" else "")
+        turn_note = ""
         refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"]}), quote=True)
         selected_content_turn = chosen["turns"][selected_turn - 1] if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else {}
         if selected_raw:
@@ -1364,6 +1413,11 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         turn_count = len(chosen["turns"])
         average_tokens = token_total / turn_count if turn_count else 0
         average_cost = (chosen.get("costUsd") or 0) / turn_count if turn_count else 0
+        overview_costs = {key: 0.0 for key in TOKEN_KEYS}
+        for turn in chosen["turns"]:
+            turn_costs = pricing.cost_breakdown(turn.get("tokens", {}), turn.get("model") or chosen.get("pricingModel") or chosen.get("model"))
+            for key, value in turn_costs.items():
+                overview_costs[key] += value
         subagents = chosen.get("subagents") if isinstance(chosen.get("subagents"), list) else []
         subagent_markup = ""
         if subagents:
@@ -1380,8 +1434,9 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
             <button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form></div></header>
             <section class="session-facts"><div><span>Session ID</span><code>{esc(chosen["id"])}</code><button type="button" class="copy-value" data-copy="{esc(chosen["id"], quote=True)}">Copy</button></div><div><span>Project</span><code>{esc(chosen.get("project") or "Unavailable")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("project") or "Unavailable", quote=True)}">Copy</button></div><div><span>Source</span><code>{esc(chosen.get("source") or "Unknown")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("source") or "Unknown", quote=True)}">Copy</button></div></section>
+            {token_accounting_note(provider, len(chosen["turns"]))}
             {f'<div class="provider-note"><b>Provider note</b>{esc(chosen["_db_issue"])}</div>' if chosen.get("_db_issue") else ""}
-            <section class="overview"><div class="section-heading"><div><span class="section-kicker">OVERVIEW</span><h2>Session usage</h2>{session_expand_buttons}</div><div class="overview-stats"><span><b>{len(chosen["turns"])}</b> turns</span><span><b>{invocation_total}</b> invocations</span><span><b>{tool_total}</b> tools</span><span><b>{fmt_unit(token_total)}</b> tokens</span><span><b>{fmt_cost(chosen.get("costUsd"))}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/turn</span><span><b>{fmt_cost(average_cost)}</b> avg cost/turn</span></div></div><div class="metrics">{token_cards(chosen["tokens"], chosen.get("model"))}</div></section>{subagent_markup}
+            <section class="overview"><div class="section-heading"><div><span class="section-kicker">OVERVIEW</span><h2>Session usage</h2>{session_expand_buttons}</div><div class="overview-stats"><span><b>{len(chosen["turns"])}</b> turns</span><span><b>{invocation_total}</b> invocations</span><span><b>{tool_total}</b> tools</span><span><b>{fmt_unit(token_total)}</b> tokens</span><span><b>{fmt_cost(chosen.get("costUsd"))}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/turn</span><span><b>{fmt_cost(average_cost)}</b> avg cost/turn</span></div></div><div class="metrics">{token_cards(chosen["tokens"], chosen.get("pricingModel") or chosen.get("model"), costs=overview_costs)}</div></section>{subagent_markup}
             <section class="conversation"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Conversation turns</h2></div><span class="muted">{len(chosen["turns"])} turns{esc(turn_note)}</span></div>
             <div class="content-layout"><div class="turns">{turns or '<div class="empty"><b>No turns yet</b><span>No conversation events were found for this session.</span></div>'}</div>
             <aside class="explorer {"is-active" if selected_turn else ""}"><div class="explorer-header"><div><span class="section-kicker">INSPECTOR</span><h2>{esc(explorer_title)}</h2></div><a href="{close_explorer_url}" class="explorer-close" aria-label="Close inspector">×</a></div><div class="explorer-body">{f'<p>{esc(explorer_text)}</p>' if explorer_text else ''}{f'<pre>{esc(explorer_raw)}</pre>' if explorer_raw and selected_raw else ''}</div></aside></div></section></main>'''
@@ -1703,7 +1758,7 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
 .search-wrap{position:relative;margin-top:10px}.search-wrap svg{position:absolute;left:10px;top:9px;width:14px;color:#66758a}.session-search{width:100%;height:34px;padding:0 30px 0 31px;border:1px solid var(--line);border-radius:9px;outline:none;background:#090d15;color:var(--text);font-size:11px}.session-search::placeholder{color:#58677a}.session-search:focus{border-color:#5968bd;box-shadow:0 0 0 3px rgba(89,104,189,.12)}.search-key{position:absolute;right:8px;top:8px;color:#56657a;font:10px ui-monospace,monospace}
 .session-list{flex:1;min-height:0;overflow:auto;padding:0 10px 18px;scrollbar-width:thin;scrollbar-color:#344056 transparent}.empty-search{margin:24px 10px;padding:20px;border:1px dashed var(--line-strong);border-radius:10px;color:#6f7f95;text-align:center;font-size:11px}.session-row{position:relative;display:flex;align-items:center;margin:2px 0}.session{display:flex;align-items:flex-start;gap:10px;min-width:0;flex:1;padding:10px 34px 10px 10px;border:1px solid transparent;border-radius:11px;color:#b9c4d3;text-decoration:none}.session:hover{background:#131a26}.session.selected{border-color:#293750;background:linear-gradient(100deg,#182235,#131a27);color:#fff}.session-glyph{display:grid;place-items:center;width:27px;height:27px;flex:none;border:1px solid #29354a;border-radius:8px;background:#171f2e;color:#8396b2;font-size:10px;font-weight:800}.session.selected .session-glyph{border-color:#5362ad;background:#2a335b;color:#cdd3ff}.session-copy{min-width:0;flex:1}.session b{display:block;overflow:hidden;color:inherit;font-size:12px;font-weight:650;line-height:1.35;text-overflow:ellipsis;white-space:nowrap}.session small{display:block;overflow:hidden;margin-top:3px;color:#647389;font:9px/1.3 ui-monospace,monospace;text-overflow:ellipsis;white-space:nowrap}.session .session-meta{color:#73829a;font-family:inherit}.session-row form{position:absolute;right:8px;top:9px}.delete-session{display:grid;place-items:center;width:25px;height:25px;padding:0;border:0;border-radius:7px;background:transparent;color:#56657a;cursor:pointer;font-size:16px;opacity:0}.session-row:hover .delete-session,.delete-session:focus{opacity:1}.delete-session:hover{background:#331923;color:var(--danger)}
 .detail{width:calc(100% - var(--sidebar));min-height:100vh;margin-left:var(--sidebar);padding:42px clamp(24px,4vw,64px) 90px}.detail-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;max-width:1500px;margin:auto}.heading-copy{min-width:0}.eyebrow{display:flex;align-items:center;gap:7px;color:#8c9bb0;font-size:10px;font-weight:750;letter-spacing:.13em;text-transform:uppercase}.eyebrow>span{width:6px;height:6px;border-radius:50%;background:var(--accent-2);box-shadow:0 0 0 4px rgba(87,212,178,.09)}h1{max-width:900px;margin:8px 0 11px;font-size:clamp(25px,3vw,39px);font-weight:720;letter-spacing:-.035em;line-height:1.08;overflow-wrap:anywhere}.header-chips{display:flex;flex-wrap:wrap;gap:6px}.header-chips span{padding:5px 8px;border:1px solid var(--line);border-radius:7px;background:rgba(18,24,35,.7);color:#8090a6;font-size:10px}.detail-actions{display:flex;gap:7px}.icon-button{display:grid;place-items:center;width:34px;height:34px;padding:0;border:1px solid var(--line-strong);border-radius:9px;background:var(--surface-2);color:#a9b5c7;text-decoration:none;cursor:pointer}.icon-button:hover{background:var(--surface-3);color:#fff}.icon-button.danger:hover{border-color:#713243;background:#351721;color:var(--danger)}.detail-refresh{width:34px;height:34px;padding:0}
-.session-facts{display:grid;grid-template-columns:minmax(160px,.7fr) minmax(220px,1fr) minmax(220px,1.3fr);max-width:1500px;margin:27px auto 0;border:1px solid var(--line);border-radius:12px;background:rgba(13,18,27,.72);overflow:hidden}.session-facts>div{min-width:0;padding:11px 14px;border-right:1px solid var(--line)}.session-facts>div:last-child{border:0}.session-facts span{display:block;margin-bottom:4px;color:#59687d;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.session-facts code{display:block;overflow:hidden;color:#8595aa;font:10px ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.provider-note{max-width:1500px;margin:10px auto 0;padding:10px 13px;border:1px solid #39452e;border-radius:9px;background:#171d13;color:#aeb99e;font-size:11px}.provider-note b{margin-right:8px;color:#c9d3ba}
+.session-facts{display:grid;grid-template-columns:minmax(160px,.7fr) minmax(220px,1fr) minmax(220px,1.3fr);max-width:1500px;margin:27px auto 0;border:1px solid var(--line);border-radius:12px;background:rgba(13,18,27,.72);overflow:hidden}.session-facts>div{min-width:0;padding:11px 14px;border-right:1px solid var(--line)}.session-facts>div:last-child{border:0}.session-facts span{display:block;margin-bottom:4px;color:#59687d;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.session-facts code{display:block;overflow:hidden;color:#8595aa;font:10px ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.token-accounting-note{display:flex;align-items:flex-start;gap:13px;max-width:1500px;margin:14px auto 0;padding:15px 17px;border:1px solid #3f4c8c;border-radius:12px;background:linear-gradient(105deg,rgba(38,43,83,.9),rgba(24,31,53,.86));box-shadow:0 8px 24px rgba(26,35,82,.16);color:#b9c5e4}.token-accounting-icon{display:grid;place-items:center;width:28px;height:28px;flex:none;border:1px solid #6976c1;border-radius:8px;background:#303866;color:#d9ddff;font-size:15px;font-weight:800}.token-accounting-note .section-kicker{margin-bottom:4px;color:#93a2e8}.token-accounting-note h2{margin:0 0 6px;color:#edf0ff;font-size:13px;font-weight:700;letter-spacing:0}.token-accounting-note p{max-width:1000px;margin:0;color:#aeb9d5;font-size:11px;line-height:1.6}.provider-note{max-width:1500px;margin:10px auto 0;padding:10px 13px;border:1px solid #39452e;border-radius:9px;background:#171d13;color:#aeb99e;font-size:11px}.provider-note b{margin-right:8px;color:#c9d3ba}
 .overview,.conversation{max-width:1500px;margin:38px auto 0}.section-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:13px}.section-kicker{display:block;margin-bottom:4px;color:#5f7088;font-size:9px;font-weight:800;letter-spacing:.16em}.section-heading h2,.explorer-header h2{margin:0;font-size:16px;font-weight:680;letter-spacing:-.01em}.overview-stats{display:flex;align-items:center;gap:8px}.overview-stats span{padding:6px 9px;border:1px solid var(--line);border-radius:8px;color:#6f7e92;font-size:10px}.overview-stats b{color:#cbd4e1;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.metric{position:relative;display:flex;min-width:0;min-height:70px;flex-direction:column;align-items:center;justify-content:center;padding:14px 15px;border:1px solid var(--line);border-radius:11px;background:linear-gradient(145deg,#121925,#0f151f);text-align:center;overflow:hidden}.metric:before{content:"";position:absolute;inset:auto 0 0;height:2px;background:#6676d8;opacity:.5}.metric[data-metric="cacheReadTokens"]:before{background:#42b8c4}.metric[data-metric="cacheWriteTokens"]:before{background:#b985e5}.metric[data-metric="outputTokens"]:before{background:#54c99f}.metric[data-metric="reasoningTokens"]:before{background:#e4a35f}.metric span{display:block;width:100%;overflow:hidden;color:#697a91;font-size:9px;font-weight:700;letter-spacing:.06em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.metric strong{display:block;margin-top:8px;color:#e9eef7;font:600 19px/1 ui-monospace,SFMono-Regular,Consolas,monospace}.metric.compact{min-height:52px;padding:9px 10px;border-radius:8px;text-decoration:none}.metric.compact strong{margin-top:5px;font-size:12px}.metric.clickable{transition:transform .15s,border-color .15s,background .15s}.metric.clickable:hover{transform:translateY(-1px);border-color:#42516a;background:#182131}.metric.clickable.active{border-color:#6878db;background:#202843;box-shadow:0 0 0 2px rgba(104,120,219,.11)}
 .muted{color:#687990;font-size:10px}.content-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,340px);align-items:start;gap:14px}.turns{display:grid;gap:12px;min-width:0}.turn{min-width:0;border:1px solid var(--line);border-radius:var(--radius);background:rgba(14,19,29,.82);box-shadow:0 12px 36px rgba(0,0,0,.08);overflow:hidden}.turn>header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line);background:#111722}.turn-number{display:flex;align-items:center;gap:10px}.turn-number>span{display:grid;place-items:center;width:29px;height:29px;border:1px solid #2c3950;border-radius:8px;background:#182131;color:#8191aa;font:10px ui-monospace,monospace}.turn-number b{display:block;font-size:12px}.turn-number small{display:block;margin-top:2px;color:#5f6e83;font-size:9px}.turn-badges{display:flex;gap:5px}.step-count,.turn-kind,.summary-count{padding:4px 7px;border:1px solid #34425a;border-radius:999px;background:#1a2332;color:#8fa0b8;font-size:8px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}.message{display:grid;grid-template-columns:72px minmax(0,1fr);gap:10px;padding:14px 16px;border-bottom:1px solid rgba(32,42,58,.7)}.message.assistant{background:rgba(15,23,34,.6)}.role{display:flex;align-items:center;gap:7px;height:24px}.role>span{display:grid;place-items:center;width:22px;height:22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800}.assistant .role>span{background:#15372f;color:#8ee4c9}.message label{color:#7f8ea4;font-size:9px;font-weight:750;text-transform:uppercase}.message p{min-width:0;margin:2px 0 0;color:#b9c5d5;font:11px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;white-space:pre-wrap}.message.user p{color:#d8e0eb}.message.tool{display:block;background:#101722}.message.tool label{display:block;margin-bottom:4px}.message.tool code{display:inline-block;max-width:100%;margin-top:5px;color:#8ba0ba;white-space:pre-wrap;overflow-wrap:anywhere}
 .turn-steps{margin:12px 14px;border:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-steps>summary{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-steps summary::-webkit-details-marker{display:none}.steps-list{padding:0 12px 6px}.turn-step{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-top:1px solid #1b2432}.step-name{display:flex;align-items:center;gap:7px;width:90px;flex:none;padding-top:8px;color:#8292a8;font-size:9px}.step-name i{width:5px;height:5px;border-radius:50%;background:#5869cb}.step-content{display:grid;min-width:0;flex:1;gap:8px}.step-tools{display:grid;grid-template-columns:minmax(0,1fr);gap:6px}.step-tool{width:100%;min-width:0;border:1px solid #263247;border-radius:7px;background:#111925;overflow:hidden}.step-tool>summary{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;cursor:pointer;list-style:none}.tool-name{min-width:0;overflow:hidden;color:#aebcd0;font:9px ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.tool-status{padding:2px 5px;border-radius:999px;background:#252e3d;color:#8392a7;font-size:7px;font-weight:750;text-transform:uppercase}.tool-status.completed{background:#15352d;color:#7ed7bc}.tool-status.failed{background:#3a1c25;color:#ff91a0}.step-tool-body{padding:8px 9px;border-top:1px solid #263247;color:#75869d;font-size:9px}.tool-payload+ .tool-payload{margin-top:8px}.tool-payload b{display:block;margin-bottom:4px;color:#788ba4;font-size:8px;letter-spacing:.06em;text-transform:uppercase}.tool-payload pre{max-height:180px;margin:0;padding:7px;border-radius:6px;background:#090e16;color:#9cacbf;font:8px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}.step-no-tools{padding:6px 8px;border:1px dashed #263247;border-radius:7px;color:#64758a;font-size:9px}.step-usage{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:6px}.step-metric-group{min-width:0;padding:7px;border:1px solid #202a3a;border-radius:8px;background:#0d131d}.step-group-title{display:flex;align-items:center;gap:6px;margin:0 2px 6px;color:#74849b;font-size:8px;font-weight:750;letter-spacing:.06em;text-transform:uppercase}.step-group-title span{display:grid;place-items:center;width:16px;height:16px;border-radius:5px;background:#272d50;color:#bec6ff;font-size:6px}.output-group .step-group-title span{background:#15372f;color:#8ee4c9}.step-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;min-width:0}.output-group .step-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.step-metrics .metric{padding:6px 7px;background:#0f1621}.step-metrics .metric span{font-size:7px}.step-metrics .metric strong{margin-top:4px;font-size:9px}.turn-footer{padding:10px 14px 14px}.turn-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}.show-raw{display:flex;align-items:center;justify-content:center;gap:8px;min-height:34px;margin-top:9px;padding:8px 12px;border:1px solid #2d3b53;border-radius:8px;background:#131b28;color:#a9b7ca;text-decoration:none;font-size:10px;font-weight:650;letter-spacing:.01em}.show-raw>span:first-child{color:#8292ff;font:9px ui-monospace,monospace}.show-raw .raw-arrow{margin-left:2px;color:#71829a;font:12px system-ui,sans-serif;transition:transform .15s}.show-raw:hover{border-color:#5262b1;background:#1c2540;color:#fff}.show-raw:hover .raw-arrow{transform:translateX(2px);color:#aeb7ff}
@@ -1769,8 +1824,12 @@ PAGE = PAGE.replace('</style>\n</head>', '''<style>
 .turn-invocations{margin:12px 14px;padding:0;border:1px solid #263247;border-radius:11px;background:#0b1018;overflow:hidden}
 .turn-invocations>summary{padding:11px 13px;background:#111925}
 .invocations-list{display:grid;gap:8px;padding:8px}
-.turn-invocation{display:grid;grid-template-columns:92px minmax(0,1fr);align-items:start;gap:10px;padding:10px;border:1px solid #263247;border-radius:9px;background:#101722}
-.invocation-name{width:auto;padding-top:5px;color:#91a2b9;font-size:9px;font-weight:700;letter-spacing:.03em}
+.turn-invocation{display:grid;grid-template-columns:150px minmax(0,1fr);align-items:start;gap:10px;padding:10px;border:1px solid #263247;border-radius:9px;background:#101722}
+.invocation-name{display:grid;width:auto;padding-top:5px;color:#91a2b9;font-size:9px;font-weight:700;letter-spacing:.03em}
+.invocation-name>span:first-child{display:flex;align-items:center;gap:7px}
+.invocation-model{display:grid;gap:2px;margin-top:8px;padding:7px 8px;border:1px solid #30415a;border-radius:7px;background:#0b121d;box-shadow:inset 3px 0 #4f8cff}
+.invocation-model small{color:#6f829d;font-size:7px;line-height:1;text-transform:uppercase;letter-spacing:.12em}
+.invocation-model b{overflow-wrap:anywhere;color:#c7d7ec;font-size:9px;line-height:1.35;letter-spacing:0}
 .invocation-content{gap:8px}
 .invocation-tools{gap:5px}
 .invocation-tool{border-color:#2b3850;background:#131d2b;box-shadow:0 2px 8px rgba(0,0,0,.12)}

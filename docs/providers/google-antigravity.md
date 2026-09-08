@@ -4,13 +4,13 @@
 
 The provider scans:
 
-- Antigravity IDE: `%USERPROFILE%\.gemini\antigravity-ide\brain\*\.system_generated\logs\transcript.jsonl`
-- Antigravity 2.0 (Desktop): `%USERPROFILE%\.gemini\antigravity\brain\*\.system_generated\logs\transcript.jsonl`
-- Antigravity CLI: `%USERPROFILE%\.gemini\antigravity-cli`
+- Antigravity IDE: `%USERPROFILE%\.gemini\antigravity-ide\brain\*\.system_generated\logs\transcript.jsonl` (reported in the viewer as **IDE**)
+- Antigravity (Desktop): `%USERPROFILE%\.gemini\antigravity\brain\*\.system_generated\logs\transcript.jsonl`
+- Antigravity CLI: `%USERPROFILE%\.gemini\antigravity-cli\**\*.jsonl` (reported in the viewer as **CLI**)
 - Imported archives: `%USERPROFILE%\.gemini\antigravity-ide\brain\imported\**\*.jsonl`
 - Custom storage roots configured via `--root` or the `ANTIGRAVITY_ROOT` environment variable.
 
-The exact transcript path is retained as `_source` and displayed as the information source. The tool surface is reported as `IDE`, `Desktop / 2.0`, or `CLI` based on the path. Companion SQLite databases in `~/.gemini/antigravity-ide/conversations/<id>.db` or `~/.gemini/antigravity/conversations/<id>.db` are read to extract authoritative project roots and active model names.
+The exact transcript path is retained as `_source` and displayed as the information source. The tool surface is reported as `IDE`, `Desktop`, or `CLI` based on the path, so sessions discovered below `antigravity-ide` are identified as **IDE**, while sessions below `antigravity-cli` are identified as **CLI**. Companion SQLite databases in `~/.gemini/antigravity-ide/conversations/<id>.db` or `~/.gemini/antigravity/conversations/<id>.db` are read to extract authoritative project roots and active model names.
 
 ## Actions
 
@@ -23,7 +23,7 @@ The exact transcript path is retained as `_source` and displayed as the informat
 - **GUID / ID:** Uses the conversation UUID folder name under `brain/` or the transcript filename stem.
 - **Name:** Prefers user prompt extracted from `<USER_REQUEST>` tags in the first `USER_INPUT` step, or top headers from `task.md` / `implementation_plan.md`. Falls back to the conversation ID.
 - **Datetime:** Uses the transcript file modification time.
-- **Model:** Extracted from `gen_metadata` in companion SQLite databases or settings change records in the transcript (e.g. `gemini-3.8-flash`, `gemini-3.8-pro`, `gemini-2.5-pro`, `Gemini 3.8 Flash (High)`). Falls back to `gemini-3.8-flash`.
+- **Model:** Extracted from `gen_metadata` in companion SQLite databases or settings change records in the transcript (e.g. `gemini-3.8-flash`, `gemini-3.8-pro`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite`, `gemini-2.5-pro`, `Gemini 3.8 Flash (High)`). Falls back to `gemini-3.8-flash`.
 - **Project:** Extracted from `trajectory_metadata_blob` in companion SQLite databases or workspace markers in the initial user turn.
 - **Source:** The exact transcript JSONL path.
 
@@ -45,7 +45,7 @@ Antigravity executes against Google backend APIs that stream conversation states
 - **Output tokens**: Model planner responses, tool arguments, and reasoning/thinking steps.
 - **Reasoning tokens**: Extracted directly from model `thinking` properties.
 
-Token counts are priced using Google Gemini model rates defined in `src/model_costs.json` (such as `gemini-3.8-flash`, `gemini-3.8-pro`, and `gemini-2.5-pro`). In the timeline header, turns show the explanatory footnote `· token metrics estimated from transcript content`. In aggregate views (Statistics by Tool, Model, Project, Day, and Timeline), these estimates allow complete cross-provider comparison, cost tracking, and activity analysis.
+Token counts are priced using Google Gemini model rates defined in `src/model_costs.json` (including Flash, Flash-Lite, and Pro variants from Gemini 2.5 through 3.8). In the timeline header, turns show the explanatory footnote `· token metrics estimated from transcript content`. In aggregate views (Statistics by Tool, Model, Project, Day, and Timeline), these estimates allow complete cross-provider comparison, cost tracking, and activity analysis.
 
 ## Empty-session rule
 

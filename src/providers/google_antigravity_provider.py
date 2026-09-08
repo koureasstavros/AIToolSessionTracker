@@ -2,8 +2,8 @@
 
 Supports sessions created by:
 - Antigravity IDE (~/.gemini/antigravity-ide/brain)
-- Antigravity 2.0 Desktop (~/.gemini/antigravity/brain)
 - Antigravity CLI (~/.gemini/antigravity-cli)
+- Antigravity Desktop (~/.gemini/antigravity/brain)
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def tool(summary: dict) -> str:
     if "antigravity-cli" in source_str:
         return "CLI"
     if "/antigravity/" in source_str or source_str.endswith("/antigravity"):
-        return "Desktop / 2.0"
+        return "Desktop"
     return "IDE"
 
 
@@ -102,6 +102,10 @@ def _files(root: Path | None = None) -> list[Path]:
                 continue
             # Look for standard brain/<id>/.system_generated/logs/transcript.jsonl
             files.extend(candidate.glob("*/.system_generated/logs/transcript.jsonl"))
+            # The CLI stores its session transcripts below antigravity-cli;
+            # unlike IDE/Desktop sessions, it does not require a brain layout.
+            if candidate.name == "antigravity-cli":
+                files.extend(candidate.glob("**/*.jsonl"))
             # Also support imported or flat session transcripts
             files.extend(candidate.glob("imported/**/*.jsonl"))
             files.extend(candidate.glob("imported/**/*.json"))

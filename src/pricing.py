@@ -28,6 +28,8 @@ def find_model(model: object) -> dict[str, Any] | None:
 
 def cost_for_tokens(tokens: dict[str, object], model: object) -> float | None:
     """Return USD cost; reasoning output is charged at its separate rate."""
+    if _canonical(model) == "synthetic":
+        return 0.0
     if find_model(model) is None:
         return None
     return sum(cost_breakdown(tokens, model).values())
@@ -35,6 +37,14 @@ def cost_for_tokens(tokens: dict[str, object], model: object) -> float | None:
 
 def cost_breakdown(tokens: dict[str, object], model: object) -> dict[str, float]:
     """Return USD cost by normalized token category."""
+    if _canonical(model) == "synthetic":
+        return {
+            "inputTokens": 0.0,
+            "cacheReadTokens": 0.0,
+            "cacheWriteTokens": 0.0,
+            "outputTokens": 0.0,
+            "reasoningTokens": 0.0,
+        }
     price = find_model(model)
     if price is None:
         return {}
@@ -69,6 +79,13 @@ def apply_costs(session: dict) -> dict:
             invocation["model"] = invocation_model
             invocation["costUsd"] = cost_for_tokens(invocation.get("tokens", {}), invocation_model)
         turn["costUsd"] = cost_for_tokens(turn.get("tokens", {}), turn_model)
+    # Some providers use placeholders such as ``<synthetic>`` at session
+    # level while storing the real model on each turn. Promote a single
+    # priced turn model so aggregate cards and sessions without turns can be
+    # priced consistently as well.
+    if find_model(model) is None and len(pricing_models) == 1:
+        model = next(iter(pricing_models))
+        session["model"] = model
     if session.get("turns"):
         costs = [turn.get("costUsd") for turn in session["turns"]]
         session["costUsd"] = sum(value for value in costs if isinstance(value, (int, float))) if any(value is not None for value in costs) else None
