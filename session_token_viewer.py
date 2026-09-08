@@ -288,6 +288,69 @@ def new_turn(turn_id: str) -> dict:
     return {"id": turn_id, "user": "", "assistant": [], "tokens": blank_tokens(), "raw": []}
 
 
+def raw_event_kind(raw: str, previous_was_tool_result: bool = False) -> tuple[str, str]:
+    """Classify raw provider records for the event inspector."""
+    try:
+        record = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return "Raw event", "raw"
+    if not isinstance(record, dict):
+        return "Raw event", "raw"
+
+    message = record.get("message") if isinstance(record.get("message"), dict) else {}
+    content = message.get("content")
+    if not isinstance(content, list):
+        content = [content] if content is not None else []
+    content_types = {
+        part.get("type") for part in content if isinstance(part, dict)
+    }
+    role = message.get("role") or record.get("role")
+    if "tool_result" in content_types:
+        return "Tool result", "tool-result"
+    if previous_was_tool_result and role == "user" and content:
+        return "Provider instructions", "instructions"
+    if role in {"assistant", "model"}:
+        return "Assistant output", "assistant"
+    if role == "user" and ("text" in content_types or content):
+        origin = record.get("origin") if isinstance(record.get("origin"), dict) else {}
+        if origin.get("kind") == "human" or record.get("promptSource"):
+            return "Human input", "human"
+        return "User-role context", "context"
+    if record.get("type") in {
+        "attachment", "file-history-snapshot", "queue-operation", "ai-title",
+        "atis-latch", "last-prompt",
+    }:
+        return "Provider metadata", "metadata"
+    if record.get("attachment") or record.get("internal_chat_message_metadata_passthrough"):
+        return "Provider instructions", "instructions"
+    return "Provider event", "metadata"
+
+
+def raw_events_markup(raw_events: list[str]) -> str:
+    """Render raw records with semantic role labels instead of one raw blob."""
+    panels = []
+    previous_was_tool_result = False
+    for index, raw in enumerate(raw_events, 1):
+        label, css_class = raw_event_kind(raw, previous_was_tool_result)
+        try:
+            parsed = json.loads(raw)
+            message = parsed.get("message", {}) if isinstance(parsed, dict) else {}
+            content = message.get("content") if isinstance(message, dict) else None
+            parts = content if isinstance(content, list) else []
+            previous_was_tool_result = bool(parts) and all(
+                isinstance(part, dict) and part.get("type") == "tool_result" for part in parts
+            )
+        except (TypeError, json.JSONDecodeError):
+            previous_was_tool_result = False
+        panels.append(
+            f'<details class="raw-event raw-event-{css_class}">'
+            f'<summary><span class="raw-event-index">{index:02d}</span>'
+            f'<span class="raw-event-label">{esc(label)}</span></summary>'
+            f'<pre>{esc(raw)}</pre></details>'
+        )
+    return "".join(panels)
+
+
 def add_token_usage(tokens: dict[str, int | None], source: dict) -> None:
     for key in TOKEN_KEYS:
         value = number(source.get(key))
@@ -1399,7 +1462,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"]}), quote=True)
         selected_content_turn = chosen["turns"][selected_turn - 1] if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else {}
         if selected_raw:
-            explorer_title, explorer_text, explorer_raw = "Raw event data", "", "\n\n".join(selected_content_turn.get("raw", []))
+            explorer_title, explorer_text, explorer_raw = "Classified event data", "", raw_events_markup(selected_content_turn.get("raw", []))
         else:
             explorer_title, explorer_text, explorer_raw = explorer_content(selected_content_turn, selected_metric)
         invocation_total = sum(len(turn.get("invocations", [])) for turn in chosen["turns"] if isinstance(turn.get("invocations"), list))
@@ -1439,7 +1502,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             <section class="overview"><div class="section-heading"><div><span class="section-kicker">OVERVIEW</span><h2>Session usage</h2>{session_expand_buttons}</div><div class="overview-stats"><span><b>{len(chosen["turns"])}</b> turns</span><span><b>{invocation_total}</b> invocations</span><span><b>{tool_total}</b> tools</span><span><b>{fmt_unit(token_total)}</b> tokens</span><span><b>{fmt_cost(chosen.get("costUsd"))}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/turn</span><span><b>{fmt_cost(average_cost)}</b> avg cost/turn</span></div></div><div class="metrics">{token_cards(chosen["tokens"], chosen.get("pricingModel") or chosen.get("model"), costs=overview_costs)}</div></section>{subagent_markup}
             <section class="conversation"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Conversation turns</h2></div><span class="muted">{len(chosen["turns"])} turns{esc(turn_note)}</span></div>
             <div class="content-layout"><div class="turns">{turns or '<div class="empty"><b>No turns yet</b><span>No conversation events were found for this session.</span></div>'}</div>
-            <aside class="explorer {"is-active" if selected_turn else ""}"><div class="explorer-header"><div><span class="section-kicker">INSPECTOR</span><h2>{esc(explorer_title)}</h2></div><a href="{close_explorer_url}" class="explorer-close" aria-label="Close inspector">×</a></div><div class="explorer-body">{f'<p>{esc(explorer_text)}</p>' if explorer_text else ''}{f'<pre>{esc(explorer_raw)}</pre>' if explorer_raw and selected_raw else ''}</div></aside></div></section></main>'''
+            <aside class="explorer {"is-active" if selected_turn else ""}"><div class="explorer-header"><div><span class="section-kicker">INSPECTOR</span><h2>{esc(explorer_title)}</h2></div><a href="{close_explorer_url}" class="explorer-close" aria-label="Close inspector">×</a></div><div class="explorer-body">{f'<p>{esc(explorer_text)}</p>' if explorer_text else ''}{explorer_raw if explorer_raw and selected_raw else ''}</div></aside></div></section></main>'''
     elif view != "statistics":
         if sessions:
             detail = '<main class="detail no-sessions"><div class="empty-hero"><span class="hero-icon">↗</span><span class="section-kicker">__APP_NAME__</span><h1>Select a session</h1><p>Choose a conversation to inspect its turns, model invocations, token usage, tools, and raw events.</p></div></main>'
@@ -1839,6 +1902,21 @@ PAGE = PAGE.replace('</style>\n</head>', '''<style>
 .invocation-metric-group{padding:7px;background:#0d141f}
 .invocation-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
 .output-group .invocation-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+.raw-event{margin:0 0 10px;border:1px solid #263247;border-radius:9px;background:#101722;overflow:hidden}
+.raw-event>summary{display:flex;align-items:center;gap:8px;padding:9px 10px;cursor:pointer;list-style:none;color:#b7c5d9}
+.raw-event>summary::-webkit-details-marker{display:none}
+.raw-event-index{display:grid;place-items:center;min-width:28px;height:22px;padding:0 6px;border:1px solid #34425a;border-radius:999px;background:#1a2332;color:#8fa0b8;font:9px ui-monospace,monospace}
+.raw-event-label{font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
+.raw-event pre{margin:0;padding:10px;border-top:1px solid #263247;background:#0d141f}
+.raw-event-human{border-color:#35506d}
+.raw-event-human>summary{background:#13202f}
+.raw-event-assistant{border-color:#24483e}
+.raw-event-assistant>summary{background:#10211d}
+.raw-event-tool-result{border-color:#5a4330}
+.raw-event-tool-result>summary{background:#24180f}
+.raw-event-context{border-color:#3d355f}
+.raw-event-context>summary{background:#171327}
+.raw-event-metadata,.raw-event-instructions,.raw-event-raw{border-color:#263247}
 @media(max-width:620px){.turn-invocation{display:block}.invocation-name{margin-bottom:7px}.invocation-usage{grid-template-columns:1fr}}
 </style></head>''')
 

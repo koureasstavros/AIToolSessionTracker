@@ -172,6 +172,33 @@ class GoogleAntigravityProviderTests(unittest.TestCase):
         self.assertEqual(entries[0]["name"], "CLI session")
         self.assertEqual(entries[0]["_source_label"], "CLI")
 
+    def test_index_ignores_cli_session_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cli_root = Path(directory) / "antigravity-cli"
+            session_dir = cli_root / "brain" / "session-id" / ".system_generated" / "logs"
+            chunks_dir = session_dir / "chunks" / "transcript"
+            chunks_dir.mkdir(parents=True)
+            (session_dir / "transcript.jsonl").write_text(
+                json.dumps({
+                    "type": "USER_INPUT",
+                    "content": "<USER_REQUEST>One CLI session</USER_REQUEST>",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            (chunks_dir / "00000000.jsonl").write_text(
+                json.dumps({
+                    "type": "USER_INPUT",
+                    "content": "<USER_REQUEST>Duplicate chunk</USER_REQUEST>",
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            with patch("src.providers.google_antigravity_provider._candidate_roots", return_value=[cli_root]):
+                entries = google_antigravity_provider.index(cli_root)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["id"], "session-id")
+
     def test_source_labels_ide_transcripts_as_ide(self) -> None:
         source = Path.home() / ".gemini" / "antigravity-ide" / "brain" / "session" / ".system_generated" / "logs" / "transcript.jsonl"
         self.assertEqual(google_antigravity_provider.tool({"_source": source}), "IDE")

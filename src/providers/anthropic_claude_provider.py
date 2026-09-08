@@ -146,6 +146,7 @@ def details(summary: dict) -> dict:
     message_invocations: dict[str, tuple[dict, dict]] = {}
     seen_usage_records: set[str] = set()
     current_turn: dict | None = None
+    previous_was_tool_result = False
 
     def new_invocation(turn: dict, message_id: str | None) -> dict:
         if message_id and message_id in message_invocations:
@@ -201,9 +202,13 @@ def details(summary: dict) -> dict:
             current_turn = turns.setdefault(logical_id, viewer.new_turn(logical_id))
             current_turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
             if content:
-                current_turn["user"] = str(content)
-            viewer.add_attached_files(current_turn, viewer.files_from_content(raw_content))
-            viewer.add_attached_files(current_turn, viewer.mentioned_files(content))
+                if previous_was_tool_result:
+                    viewer.add_internal_instruction(current_turn, "Claude provider instructions", str(content))
+                else:
+                    current_turn["user"] = str(content)
+                    viewer.add_attached_files(current_turn, viewer.files_from_content(raw_content))
+                    viewer.add_attached_files(current_turn, viewer.mentioned_files(content))
+            previous_was_tool_result = False
             continue
 
         if is_tool_result:
@@ -218,10 +223,12 @@ def details(summary: dict) -> dict:
                     owner_turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
                 tool["status"] = "completed"
                 tool["result"] = part.get("content", "")
+            previous_was_tool_result = True
             continue
 
         if current_turn is None:
             if role not in {"assistant", "model"}:
+                previous_was_tool_result = False
                 continue
             logical_id = str(turn_id or record.get("timestamp") or f"turn-{len(turns) + 1}")
             current_turn = turns.setdefault(logical_id, viewer.new_turn(logical_id))
@@ -286,6 +293,7 @@ def details(summary: dict) -> dict:
                             invocation["tokens"][key] = (invocation["tokens"][key] or 0) + value
         if not result["model"] and payload.get("model"):
             result["model"] = payload["model"]
+        previous_was_tool_result = False
     if records and isinstance(records[0], dict):
         first = records[0]
         result["id"] = str(first.get("sessionId") or first.get("session_id") or first.get("conversationId") or first.get("conversation_id") or result["id"])

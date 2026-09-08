@@ -102,10 +102,12 @@ def _files(root: Path | None = None) -> list[Path]:
                 continue
             # Look for standard brain/<id>/.system_generated/logs/transcript.jsonl
             files.extend(candidate.glob("*/.system_generated/logs/transcript.jsonl"))
-            # The CLI stores its session transcripts below antigravity-cli;
-            # unlike IDE/Desktop sessions, it does not require a brain layout.
+            # The CLI stores its session transcripts below antigravity-cli.
+            # Restrict discovery to transcript files: chunk files such as
+            # .system_generated/logs/chunks/transcript/00000000.jsonl are
+            # parts of the same session, not separate sessions.
             if candidate.name == "antigravity-cli":
-                files.extend(candidate.glob("**/*.jsonl"))
+                files.extend(candidate.glob("**/transcript.jsonl"))
             # Also support imported or flat session transcripts
             files.extend(candidate.glob("imported/**/*.jsonl"))
             files.extend(candidate.glob("imported/**/*.json"))
