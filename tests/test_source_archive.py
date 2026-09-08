@@ -5,7 +5,13 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from src.providers import anthropic_claude_provider, github_copilot_provider, m365_copilot_provider, openai_codex_provider
+from src.providers import (
+    anthropic_claude_provider,
+    github_copilot_provider,
+    google_antigravity_provider,
+    m365_copilot_provider,
+    openai_codex_provider,
+)
 
 
 class SourceArchiveTests(unittest.TestCase):
@@ -14,6 +20,7 @@ class SourceArchiveTests(unittest.TestCase):
             ("codex", openai_codex_provider),
             ("claude", anthropic_claude_provider),
             ("m365_copilot", m365_copilot_provider),
+            ("antigravity", google_antigravity_provider),
         )
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

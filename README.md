@@ -55,6 +55,7 @@ documented separately:
 - [OpenAI Codex](docs/providers/openai-codex.md)
 - [Anthropic Claude Code](docs/providers/claude-code.md)
 - [Microsoft 365 Copilot](docs/providers/microsoft-365-copilot.md)
+- [Google Antigravity](docs/providers/google-antigravity.md)
 - [Provider storage and viewer support matrix](docs/provider-storage-matrix.md)
 
 The viewer only reads local transcripts or user-provided exports. It does not
@@ -78,6 +79,8 @@ Imports are provider-specific:
 - Anthropic Claude Code injects transcripts into `~/.claude/projects/imported`.
 - Microsoft 365 Copilot injects transcripts into the `imported` subfolder of
 	`M365_COPILOT_ROOT` or its default local export directory.
+- Google Antigravity injects transcripts into the `imported` subfolder of
+	`ANTIGRAVITY_ROOT` or `~/.gemini/antigravity-ide/brain/imported`.
 
 Archives are validated for provider ownership and path traversal before any
 file is written.
@@ -124,6 +127,7 @@ Provider-specific behavior is implemented in:
 - `src/providers/openai_codex_provider.py`
 - `src/providers/anthropic_claude_provider.py`
 - `src/providers/m365_copilot_provider.py`
+- `src/providers/google_antigravity_provider.py`
 
 Each provider adapter under `src/providers/` exposes the same operations:
 

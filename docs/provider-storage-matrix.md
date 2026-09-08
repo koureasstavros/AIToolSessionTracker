@@ -10,6 +10,7 @@ This matrix describes where each provider normally stores conversations and what
 | Anthropic Claude | Chat | Desktop | Primarily cloud-backed; local application cache is not a stable transcript interface | No supported local transcript source | **Not supported from cache** |
 | Anthropic Claude | Code | Extension, CLI, Desktop | Local JSONL project transcripts and audit/session files for the desktop coding agent | `%USERPROFILE%\\.claude\\projects\\**\\*.jsonl`; `%LOCALAPPDATA%\\Claude-3p\\local-agent-mode-sessions\\**\\audit.jsonl` | **Supported** |
 | Microsoft 365 Copilot | Chat | Microsoft 365 web, Teams, or Office | Cloud-backed | User-provided local JSON/JSONL exports only; `%USERPROFILE%\\m365-copilot\\sessions` by default | **Supported for exports only** |
+| Google Antigravity | Code / Chat | IDE, Desktop (2.0), CLI | Local JSONL transcripts, brain artifacts, and local SQLite trajectory databases | `%USERPROFILE%\\.gemini\\antigravity-ide\\brain\\*\\.system_generated\\logs\\transcript.jsonl`; `%USERPROFILE%\\.gemini\\antigravity\\brain\\*\\.system_generated\\logs\\transcript.jsonl`; `%USERPROFILE%\\.gemini\\antigravity-ide\\conversations\\*.db`; `%USERPROFILE%\\.gemini\\antigravity\\conversations\\*.db` | **Supported** |
 
 ## Storage categories
 
