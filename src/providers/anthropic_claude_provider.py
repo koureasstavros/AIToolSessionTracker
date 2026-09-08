@@ -227,9 +227,12 @@ def details(summary: dict) -> dict:
             current_turn = turns.setdefault(logical_id, viewer.new_turn(logical_id))
 
         turn = current_turn
-        turn_model = viewer.model_from_records([record])
-        if turn_model:
-            turn["model"] = turn_model
+        record_model = viewer.model_from_records([record])
+        # Claude writes locally generated API errors as assistant messages
+        # whose model is ``<synthetic>``. Preserve that marker on the
+        # invocation, but never let it replace a real model used by the turn.
+        if record_model and record_model != "<synthetic>":
+            turn["model"] = record_model
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
         attachment = record.get("attachment") if isinstance(record.get("attachment"), dict) else None
         if attachment:
@@ -241,6 +244,10 @@ def details(summary: dict) -> dict:
         message_id_value = message.get("id") if isinstance(message, dict) else None
         message_id = str(message_id_value) if message_id_value else None
         invocation = new_invocation(turn, message_id) if role in {"assistant", "model"} or is_tool_use else None
+        if invocation is not None and record_model:
+            existing_model = invocation.get("model")
+            if not existing_model or (existing_model == "<synthetic>" and record_model != "<synthetic>"):
+                invocation["model"] = record_model
         if is_tool_use:
             for part in content_parts:
                 if isinstance(part, dict) and part.get("type") == "tool_use":

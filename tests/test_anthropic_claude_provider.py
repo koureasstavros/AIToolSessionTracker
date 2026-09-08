@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from src import pricing
 from src.providers import anthropic_claude_provider
 
 
@@ -30,6 +31,25 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(turn["invocations"][0]["tokens"]["outputTokens"], 12)
         self.assertEqual(turn["invocations"][1]["tokens"]["outputTokens"], 30)
         self.assertEqual(turn["tokens"]["outputTokens"], 42)
+
+    def test_synthetic_error_does_not_replace_or_inherit_real_model_for_pricing(self) -> None:
+        records = [
+            {"type": "user", "uuid": "user-1", "sessionId": "session-1", "message": {"role": "user", "content": "Run the task"}},
+            {"type": "assistant", "uuid": "assistant-1", "message": {"id": "message-1", "model": "claude-sonnet-4-5", "role": "assistant", "content": "Working", "usage": {"input_tokens": 10, "output_tokens": 5}}},
+            {"type": "assistant", "uuid": "error-1", "isApiErrorMessage": True, "error": "server_error", "message": {"id": "error-message", "model": "<synthetic>", "role": "assistant", "content": "API Error", "usage": {"input_tokens": 0, "output_tokens": 0}}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session-1.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+            session = pricing.apply_costs(anthropic_claude_provider.details({"_source": path}))
+
+        turn = session["turns"][0]
+        self.assertEqual(turn["model"], "claude-sonnet-4-5")
+        self.assertIsNotNone(turn["costUsd"])
+        self.assertEqual(turn["invocations"][0]["model"], "claude-sonnet-4-5")
+        self.assertIsNotNone(turn["invocations"][0]["costUsd"])
+        self.assertEqual(turn["invocations"][1]["model"], "<synthetic>")
+        self.assertEqual(turn["invocations"][1]["costUsd"], 0.0)
 
 
 if __name__ == "__main__":
