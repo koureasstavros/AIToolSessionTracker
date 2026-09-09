@@ -1265,7 +1265,7 @@ def statistics_group_key(session: dict, group: str, provider: str, summary: dict
     return date.isoformat()
 
 
-def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "all") -> str:
+def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "all", provider: str = "copilot") -> str:
     """Render a compact dual-line timeline for tokens and USD cost."""
     ordered = sorted(points.items())
     if not ordered:
@@ -1288,12 +1288,12 @@ def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "
     def markers(key: str, maximum: float, css_class: str) -> str:
         denominator = max(len(ordered) - 1, 1)
         return "".join(
-            f'<a href="/?{urlencode({"provider": "copilot", "view": "statistics", "group": "timeline", "range": time_range, "group_value": label})}"><circle class="timeline-point {css_class}" cx="{left + chart_width * index / denominator:.1f}" cy="{top + chart_height * (1 - item[key] / maximum):.1f}" r="5"><title>{esc(label)} · {"Tokens" if key == "tokens" else "Cost"}: {fmt_unit(item[key], key == "cost")}</title></circle></a>'
+            f'<a class="stats-navigation" href="/?{urlencode({"provider": provider, "view": "statistics", "group": "timeline", "range": time_range, "group_value": label})}"><circle class="timeline-point {css_class}" cx="{left + chart_width * index / denominator:.1f}" cy="{top + chart_height * (1 - item[key] / maximum):.1f}" r="5"><title>{esc(label)} · {"Tokens" if key == "tokens" else "Cost"}: {fmt_unit(item[key], key == "cost")}</title></circle></a>'
             for index, (label, item) in enumerate(ordered)
         )
 
     labels = "".join(
-        f'<a href="/?{urlencode({"provider": "copilot", "view": "statistics", "group": "timeline", "range": time_range, "group_value": label})}"><text class="timeline-date-link" x="{left + chart_width * index / max(len(ordered) - 1, 1):.1f}" y="{height - 22}" text-anchor="middle">{esc(label)}</text></a>'
+        f'<a class="stats-navigation" href="/?{urlencode({"provider": provider, "view": "statistics", "group": "timeline", "range": time_range, "group_value": label})}"><text class="timeline-date-link" x="{left + chart_width * index / max(len(ordered) - 1, 1):.1f}" y="{height - 22}" text-anchor="middle">{esc(label)}</text></a>'
         for index, (label, _) in enumerate(ordered)
     )
     token_ticks = "".join(
@@ -1307,7 +1307,7 @@ def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "
     return f'''<div class="timeline-chart"><div class="timeline-legend"><span class="timeline-key tokens-key">Tokens</span><span class="timeline-key cost-key">Cost</span><span class="timeline-hint">Hover points for details</span></div><svg viewBox="0 0 {width} {height}" role="img" aria-label="Token and cost timeline"><line class="timeline-axis" x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}"/><line class="timeline-axis" x1="{cost_axis}" y1="{top}" x2="{cost_axis}" y2="{height - bottom}"/><line class="timeline-axis" x1="{left}" y1="{height - bottom}" x2="{cost_axis}" y2="{height - bottom}"/>{token_ticks}{cost_ticks}<text class="tokens-axis-title" x="12" y="{top + chart_height / 2}" text-anchor="middle" transform="rotate(-90 12 {top + chart_height / 2})">Tokens</text><text class="cost-axis-title" x="{cost_axis + 22}" y="{top + chart_height / 2}" text-anchor="middle" transform="rotate(90 {cost_axis + 22} {top + chart_height / 2})">Cost</text><polyline class="timeline-tokens" points="{coordinates("tokens", max_tokens)}"/><polyline class="timeline-cost" points="{coordinates("cost", max_cost)}"/>{markers("tokens", max_tokens, "tokens-point")}{markers("cost", max_cost, "cost-point")}{labels}</svg></div>'''
 
 
-def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_group: str | None = None, time_range: str = "all") -> str:
+def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_group: str | None = None, time_range: str = "all", provider: str = "copilot") -> str:
     """Render aggregate token and cost information across all providers."""
     if group not in {"project", "today", "day", "week", "month", "year", "tool", "model", "timeline"}:
         group = "day"
@@ -1362,7 +1362,7 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
     average_tokens = sum(totals.values()) / session_count if session_count else 0
     average_cost = total_cost / session_count if session_count else 0
     rows = "".join(
-        f'<tr><td><a class="stats-group-link" href="/?{urlencode({"provider": "copilot", "view": "statistics", "group": group, "group_value": label})}">{esc(label)}</a></td><td>{bucket["sessions"]:,}</td>'
+        f'<tr><td><a class="stats-group-link stats-navigation" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "group_value": label})}">{esc(label)}</a></td><td>{bucket["sessions"]:,}</td>'
         + "".join(f'<td>{fmt(bucket["tokens"][key])}</td>' for key in TOKEN_KEYS)
         + "".join(f'<td>{fmt_cost(bucket["costs"][key])}</td>' for key in TOKEN_KEYS)
         + f'<td>{fmt(sum(bucket["tokens"].values()))}</td><td>{fmt_cost(bucket["cost"])}</td></tr>'
@@ -1371,11 +1371,11 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
     related = ""
     if selected_group in groups:
         session_rows = "".join(
-            f'<tr><td><a class="stats-group-link" href="/?{urlencode({"provider": provider, "session": session.get("id", "")})}">{esc(session.get("id") or "Unavailable")}</a></td><td>{esc(session.get("name") or session.get("id"))}</td><td>{esc(PROVIDERS.get(provider, provider))}</td><td>{esc(session.get("pricingModel") or session.get("model") or "Unavailable")}</td><td>{fmt(sum(value or 0 for value in session.get("tokens", {}).values()))}</td><td>{fmt_cost(session.get("costUsd"))}</td></tr>'
+            f'<tr><td><a class="stats-group-link stats-navigation" href="/?{urlencode({"provider": provider, "session": session.get("id", "")})}">{esc(session.get("id") or "Unavailable")}</a></td><td>{esc(session.get("name") or session.get("id"))}</td><td>{esc(PROVIDERS.get(provider, provider))}</td><td>{esc(session.get("pricingModel") or session.get("model") or "Unavailable")}</td><td>{fmt(sum(value or 0 for value in session.get("tokens", {}).values()))}</td><td>{fmt_cost(session.get("costUsd"))}</td></tr>'
             for provider, summary, session in groups[selected_group]["items"]
         )
         related = f'<section class="stats-related"><div class="section-heading"><div><span class="section-kicker">SELECTED GROUP</span><h2>Sessions in {esc(selected_group)}</h2></div></div><div class="stats-table-wrap"><table class="stats-table related-table"><thead><tr><th>Session ID</th><th>Session name</th><th>Provider</th><th>Model</th><th>Total tokens</th><th>Total cost</th></tr></thead><tbody>{session_rows}</tbody></table></div></section>'
-    timeline_markup = f'<section class="timeline-section"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Tokens and cost over time</h2></div></div>{render_timeline_svg(timeline_points, time_range)}</section>{related}'
+    timeline_markup = f'<section class="timeline-section"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Tokens and cost over time</h2></div></div>{render_timeline_svg(timeline_points, time_range, provider)}</section>{related}'
     table_markup = f'<section class="stats-table-section"><div class="section-heading"><div><span class="section-kicker">BREAKDOWN</span><h2>By {heading.lower()}</h2></div></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>{heading}</th><th>Sessions</th>{"".join(f"<th>{esc(TOKEN_LABELS[key])}</th>" for key in TOKEN_KEYS)}{"".join(f"<th>{esc(TOKEN_LABELS[key])} cost</th>" for key in TOKEN_KEYS)}<th>Total tokens</th><th>Total cost</th></tr></thead><tbody>{rows}</tbody></table></div></section>{related}'
     return f'''<main class="detail statistics"><style>.stats-toolbar{{display:flex;align-items:center;gap:16px;margin:28px 0 18px;padding:12px 14px;border:1px solid #223753;border-radius:9px;background:#101d30}}.stats-filters{{display:flex;gap:7px;flex-wrap:wrap}}.stats-filter{{padding:7px 11px;border:1px solid #315479;border-radius:7px;color:#a9c9e9;text-decoration:none;font-size:12px}}.stats-filter:hover,.stats-filter.selected{{background:#24558a;color:#fff}}.stats-table-section,.stats-related,.timeline-section{{width:100%;max-width:1500px;margin:30px auto 0}}.stats-table-wrap{{width:100%;overflow:auto;border:1px solid #223753;border-radius:9px}}.stats-table{{width:100%;min-width:0;table-layout:fixed;border-collapse:collapse;background:#101a2a}}.stats-table th,.stats-table td{{width:auto;padding:11px 8px;border-bottom:1px solid #22304a;text-align:right;font-size:11px;white-space:normal;overflow-wrap:anywhere}}.stats-table th:first-child,.stats-table td:first-child{{text-align:left}}.stats-table th{{color:#91a8c7;font-size:10px;text-transform:uppercase;letter-spacing:.5px}}.stats-table td{{color:#cbd8e8}}.stats-table tr:last-child td{{border-bottom:0}}.stats-group-link{{color:#9ed1ff;text-decoration:none}}.stats-group-link:hover{{color:#fff;text-decoration:underline}}.timeline-chart{{padding:16px;border:1px solid #223753;border-radius:9px;background:#101a2a}}.timeline-chart svg{{display:block;width:100%;height:auto}}.timeline-axis{{stroke:#34445c;stroke-width:1}}.timeline-chart text{{fill:#7e8ea5;font-size:11px}}.timeline-tokens,.timeline-cost{{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}}.timeline-tokens{{stroke:#54c99f}}.timeline-cost{{stroke:#f07878}}.tokens-axis-label,.tokens-axis-title{{fill:#54c99f!important}}.cost-axis-label,.cost-axis-title{{fill:#f07878!important}}.timeline-legend{{display:flex;gap:18px;margin:0 0 8px;font-size:11px}}.timeline-key:before{{display:inline-block;width:9px;height:9px;margin-right:6px;border-radius:50%;content:""}}.tokens-key:before{{background:#54c99f}}.cost-key:before{{background:#f07878}}.timeline-empty{{padding:28px;border:1px dashed #34445c;border-radius:9px;color:#7e8ea5;text-align:center}}.statistics-link{{margin-top:8px;border-top:1px solid #223451}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>All providers</div><h1>Statistics</h1><p class="muted">Aggregate token and cost information across loaded sessions.</p></div></header>
         <section class="overview"><div class="section-heading"><div><span class="section-kicker">TOTAL</span><h2>All providers</h2></div><div class="overview-stats"><span><b>{session_count:,}</b> sessions</span><span><b>{fmt_unit(sum(totals.values()))}</b> tokens</span><span><b>{fmt_unit(total_cost, True)}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/session</span><span><b>{fmt_cost(average_cost)}</b> avg cost/session</span></div></div><div class="metrics">{token_cards(totals, costs=total_costs)}</div></section>
@@ -1456,7 +1456,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         for provider_key in PROVIDERS
         for summary in load_session_index(root, provider_key, show_empty)
     ] if view == "statistics" else []
-    detail = render_statistics(all_statistics_sessions, group, selected_group, time_range) if view == "statistics" else ""
+    detail = render_statistics(all_statistics_sessions, group, selected_group, time_range, provider) if view == "statistics" else ""
     if view != "statistics" and chosen:
         turn_note = ""
         refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"]}), quote=True)
@@ -1528,14 +1528,14 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     stats_sidebar = (
         '<div class="stats-group-menu"><div class="stats-sidebar-title">Group by</div><nav class="stats-sidebar-links">'
         + "".join(
-            f'<a class="stats-sidebar-link {"selected" if group == option else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": option, "range": time_range})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
+                f'<a class="stats-sidebar-link stats-navigation {"selected" if group == option else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": option, "range": time_range})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
             for option, label in (("today", "Today"), ("day", "Day"), ("week", "Week"), ("month", "Month"), ("year", "Year"), ("project", "Project"), ("tool", "Provider"), ("model", "Model"), ("timeline", "Timeline"))
         )
         + '</nav></div>'
         + (
             '<div class="stats-time-menu"><div class="stats-sidebar-title">Time range</div><nav class="stats-sidebar-links">'
             + "".join(
-                f'<a class="stats-sidebar-link {"selected" if time_range == option else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "range": option})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
+                f'<a class="stats-sidebar-link stats-navigation {"selected" if time_range == option else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "range": option})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
                 for option, label in (("all", "All time"), ("today", "Today"), ("7d", "Last 7 days"), ("30d", "Last 30 days"), ("90d", "Last 90 days"), ("365d", "Last year"))
             )
             + '</nav></div>'
@@ -1874,7 +1874,7 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
     list.addEventListener('scroll',function(){sessionStorage.setItem(scrollKey,String(list.scrollTop))},{passive:true});
     var detailKey='session-detail:'+(params.get('session')||'');var position=sessionStorage.getItem(detailKey);if(position)requestAnimationFrame(function(){scrollTo(0,Number(position))});
     function loading(text){if(document.querySelector('.loading'))return;var layer=document.createElement('div');layer.className='loading';layer.innerHTML='<div class="loading-card"><span class="spinner"></span><span>'+text+'</span></div>';body.appendChild(layer);}
-    document.querySelectorAll('a.session-link,a.provider,a.clickable,a.refresh-sessions,a.empty-toggle').forEach(function(link){link.addEventListener('click',function(){sessionStorage.setItem(detailKey,String(scrollY));loading('Loading session data…');});});
+    document.querySelectorAll('a.session-link,a.provider,a.view-tab,a.clickable,a.stats-navigation,a.refresh-sessions,a.empty-toggle').forEach(function(link){link.addEventListener('click',function(){sessionStorage.setItem(detailKey,String(scrollY));loading('Loading session data…');});});
     document.querySelectorAll('form[action="/delete"]').forEach(function(form){form.addEventListener('submit',function(event){if(event.defaultPrevented)return;loading('Deleting conversation…');var button=form.querySelector('button');if(button)button.disabled=true;});});
     if(sidebar){sidebar.addEventListener('click',function(event){if(event.target.closest('.session-link')&&innerWidth<=900)closeNav();});}
 })();
