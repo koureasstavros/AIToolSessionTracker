@@ -7,6 +7,33 @@ from src.providers import github_copilot_provider
 
 
 class CopilotInvocationGroupingTests(unittest.TestCase):
+    def test_session_state_client_name_identifies_desktop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "session-1"
+            folder.mkdir()
+            (folder / "workspace.yaml").write_text(
+                "client_name: github/autopilot\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                github_copilot_provider._surface_from_session_state(folder),
+                "Desktop",
+            )
+
+    def test_shared_cli_desktop_sources_are_mixed(self) -> None:
+        self.assertEqual(
+            github_copilot_provider.tool({"_kind": "copilot-session-state"}),
+            "Mixed",
+        )
+        self.assertEqual(
+            github_copilot_provider.tool({"_kind": "copilot-db"}),
+            "Mixed",
+        )
+        self.assertEqual(
+            github_copilot_provider.tool({"_kind": "copilot-chat"}),
+            "Extension",
+        )
+
     def test_tools_are_attached_to_the_assistant_invocation_that_started_them(self) -> None:
         interaction_id = "interaction-1"
         records = [

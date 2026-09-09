@@ -18,7 +18,28 @@ def display_root(root: Path) -> Path:
 
 
 def tool(summary: dict) -> str:
-    return "CLI / VS Code integration"
+    return str(summary.get("_surface") or "Mixed")
+
+
+def _surface_from_records(records: list[dict]) -> str:
+    """Identify Codex's CLI, VS Code, and Desktop origin when recorded."""
+    surfaces: set[str] = set()
+    for record in records:
+        payload = record.get("payload", record)
+        if not isinstance(payload, dict):
+            continue
+        originator = str(payload.get("originator") or record.get("originator") or "").lower()
+        source = str(payload.get("source") or record.get("source") or "").lower()
+        marker = originator or source
+        if "desktop" in marker:
+            surfaces.add("Desktop")
+        elif "vscode" in marker or marker == "vscode" or "extension" in marker:
+            surfaces.add("Extension")
+        elif "cli" in marker or marker in {"codex-tui", "tui"}:
+            surfaces.add("CLI")
+    if len(surfaces) == 1:
+        return next(iter(surfaces))
+    return "Mixed"
 
 
 def identity(record: dict, fallback: str) -> tuple[str, str]:
@@ -68,6 +89,8 @@ def index(root: Path) -> list[dict]:
         entries.append(entry)
     for entry in entries:
         entry["_has_data"] = _has_data(entry["_source"])
+        entry["_surface"] = _surface_from_records(viewer.safe_json_lines(entry["_source"]))
+        entry["_source_label"] = tool(entry)
     return entries
 
 

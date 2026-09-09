@@ -10,7 +10,7 @@ The provider scans:
 - Copilot Desktop / CLI session and metadata from `%USERPROFILE%\\.copilot\\session-store.db`
 - Copilot Desktop / CLI session and metadata from `%USERPROFILE%\.copilot\session-state\<session-id>\` containing `workspace.yaml`, `events.jsonl`, and optional per-session database files
 
-The source path is retained in `_source` and displayed as the information source. The source label identifies VS Code, Copilot session-state, or the CLI / Desktop database.
+The source path is retained in `_source` and displayed as the information source. The source label identifies `Extension` for VS Code chat files. Session-state `workspace.yaml` files can identify CLI sessions through `client_name: github/cli`, and Desktop sessions through `client_name: github/autopilot`. When that marker is absent, the shared session-state and database sources are labelled `Mixed` because they can contain CLI and Desktop sessions without a reliable client identifier.
 When the same session ID exists in more than one source, all matching sources
 are read. Session-state events provide the conversation content and the local
 database supplements metadata, messages, and usage fields when they are
@@ -40,10 +40,12 @@ deletes the CLI database session and its related rows.
 ## Surface identification
 
 - Extension JSONL sessions are labelled `Extension`.
-- Session-state folders are labelled `CLI / Desktop`, because these local
-  Copilot session sources are written by the CLI/Desktop storage family and do
-  not contain a reliable marker to distinguish the two surfaces.
-- Sessions from the local `.copilot\\session-store.db` are labelled `CLI / Desktop`:
+- Session-state folders with `client_name: github/cli` are labelled `CLI`.
+  Folders with `client_name: github/autopilot` are labelled `Desktop`. Other session-state
+  folders are labelled `Mixed`, because these local Copilot session sources
+  are written by the CLI/Desktop storage family and may not contain a reliable
+  marker to distinguish the two surfaces.
+- Sessions from the local `.copilot\\session-store.db` are labelled `Mixed`:
 	the database location identifies the local Copilot store, but the records do
 	not contain a reliable client marker to distinguish CLI from Desktop.
 

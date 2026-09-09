@@ -6,10 +6,16 @@ The provider scans:
 
 - Extension / CLI / Desktop `%USERPROFILE%\\.codex\\sessions\\**\\*.jsonl`
 
-The exact rollout path is retained as `_source` and displayed as the information source. The source label is OpenAI Codex and the tool surface is reported as Extension, CLI and Desktop.
+The exact rollout path is retained as `_source` and displayed as the information source. The source label is OpenAI Codex and the tool surface is reported as `Extension`, `CLI`, `Desktop`, or `Mixed`.
+
+Codex source attribution uses transcript metadata such as `originator` and
+`source`: `codex_vscode`/`vscode` identifies the extension,
+`codex_work_desktop` identifies Desktop, and CLI markers identify the CLI. If
+metadata is absent or conflicting, the UI uses `Mixed` rather than guessing.
+The terminal originator `codex-tui` is also treated as CLI.
 
 The same local rollout storage can contain both Codex coding sessions and Codex
-chat conversations created through the CLI or the VS Code integration. The
+chat conversations created through the extension, CLI or the Desktop. The
 viewer reads both types from the JSONL transcript records; no separate chat
 storage location is required.
 

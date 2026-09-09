@@ -4,34 +4,42 @@
 
 The provider scans:
 
-- Extension / CLI `%USERPROFILE%\\.claude\\projects\\**\\*.jsonl`
-- Desktop `%LOCALAPPDATA%\\Claude-3p\\local-agent-mode-sessions\\**\\audit.jsonl`
+- Extension / CLI / Desktop `%USERPROFILE%\\.claude\\projects\\**\\*.jsonl`
+- Extension / CLI / Desktop session metadata `%USERPROFILE%\\.claude\\sessions\\*.json`
+- Desktop audit records `%LOCALAPPDATA%\\Claude-3p\\local-agent-mode-sessions\\**\\audit.jsonl`
 
 The exact transcript or audit path is retained as `_source` and displayed as the
 information source. The source label is Anthropic Claude Code, and the tool
-surface is reported as CLI, Extension, or Desktop when the storage location
+surface is reported as Extension, CLI, or Desktop when the storage location
 provides enough evidence.
 
-Claude Code and the VS Code integration may share the same `.claude` transcript
-locations. The viewer reads both from the JSONL records and labels ambiguous
-sessions `CLI / Extension` rather than claiming a single surface. The provider
+Claude Code, the VS Code integration, and Desktop may share the same `.claude`
+transcript locations. The viewer reads the JSONL records and labels sessions
+without identifying metadata `Mixed` rather than claiming a single surface. The provider
 deduplicates entries by conversation ID and prefers a source with data, then
 the most recently updated source.
 
 ## Surface identification
 
-- Desktop sessions are identified by the `Claude-3p\\local-agent-mode-sessions` path.
+- Desktop sessions are identified by the `Claude-3p\\local-agent-mode-sessions` path,
+	a matching `*.desktop-released.json` marker, or explicit Desktop metadata.
+- Session or transcript metadata with `entrypoint: claude-vscode` is labeled
+	**Extension**; CLI and Desktop entrypoints are labeled accordingly when
+	present.
+- If the same session ID has evidence from multiple surfaces, the UI labels it
+	`Mixed` instead of choosing one source arbitrarily.
 - Sessions under `.claude\\projects` or `.claude\\sessions` may originate from
-	either Claude Code CLI or the VS Code integration because those surfaces can
-	share the same transcript locations. The viewer labels them `CLI / Extension`
-	rather than claiming a single surface without explicit metadata.
+	Claude Code CLI, the VS Code integration, or Desktop because those surfaces
+	can share the same transcript locations. The viewer labels them with the
+	explicit surface when metadata is available and `Mixed` otherwise.
 
 ## Actions
 
 Claude Code exposes **Delete** for local transcripts. The viewer exposes
 **Delete** and removes the selected Claude Code JSONL transcript or Desktop
-`audit.jsonl` file. This is a local file operation and does not delete ordinary
-cloud-backed Claude Chat history.
+`audit.jsonl` file. Session registry and Desktop release-marker metadata are
+not treated as transcripts. This is a local file operation and does not delete
+ordinary cloud-backed Claude Chat history.
 
 ## Identity and metadata
 

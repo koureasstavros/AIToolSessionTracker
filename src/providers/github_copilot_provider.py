@@ -413,9 +413,29 @@ def display_root(root: Path) -> Path:
 
 
 def tool(summary: dict) -> str:
-    # The local Copilot database path identifies the storage family, but its
-    # records do not contain a reliable CLI-versus-Desktop marker.
-    return "CLI / Desktop" if summary.get("_kind") in {"copilot-db", "copilot-session-state"} else "Extension"
+    surface = summary.get("_surface")
+    if surface in {"CLI", "Desktop", "Extension", "Mixed"}:
+        return surface
+    # The local Copilot database and session-state records identify a shared
+    # CLI/Desktop storage family, but do not contain a reliable surface marker.
+    return "Mixed" if summary.get("_kind") in {"copilot-db", "copilot-session-state"} else "Extension"
+
+
+def _surface_from_session_state(folder: Path) -> str | None:
+    """Read the Copilot client marker persisted in session-state workspace.yaml."""
+    try:
+        for line in (folder / "workspace.yaml").read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.startswith("client_name:"):
+                continue
+            client = line.partition(":")[2].strip().strip("\"'").lower()
+            if client in {"github/cli", "github/copilot-cli"}:
+                return "CLI"
+            if client in {"github/autopilot", "github/desktop"} or "desktop" in client:
+                return "Desktop"
+            return None
+    except OSError:
+        return None
+    return None
 
 
 def identity(record: dict, fallback: str) -> tuple[str, str]:
@@ -462,7 +482,12 @@ def index(root: Path) -> list[dict]:
                 )
             for path in candidates:
                 if path.is_dir() and path.name != "__pycache__" and (path / "events.jsonl").exists():
-                    entries.append(viewer.session_summary(path, "copilot", "copilot-session-state"))
+                    entry = viewer.session_summary(path, "copilot", "copilot-session-state")
+                    surface = _surface_from_session_state(path)
+                    if surface:
+                        entry["_surface"] = surface
+                    entry["_source_label"] = tool(entry)
+                    entries.append(entry)
         except OSError:
             continue
     entries.extend(_db_index())
@@ -487,6 +512,18 @@ def index(root: Path) -> list[dict]:
         if existing.get("name") in {None, "", existing["id"]} and entry.get("name"):
             existing["name"] = entry["name"]
         existing["updated"] = max(existing["updated"], entry["updated"])
+    for entry in unique.values():
+        surfaces = set()
+        for source in entry.get("_sources", []):
+            surface = source.get("_surface")
+            if surface in {"CLI", "Desktop", "Extension"}:
+                surfaces.add(surface)
+            elif source.get("_kind") == "copilot-chat":
+                # A chatSessions JSONL path is an explicit VS Code extension
+                # source even though it does not need a client_name marker.
+                surfaces.add("Extension")
+        entry["_surface"] = next(iter(surfaces)) if len(surfaces) == 1 else "Mixed"
+        entry["_source_label"] = tool(entry)
     return sorted(unique.values(), key=lambda item: item["updated"], reverse=True)
 
 
@@ -512,7 +549,7 @@ def _db_index() -> list[dict]:
             return fallback
     return [{"id": sid, "name": name, "updated": timestamp(updated),
              "turns": [], "tokens": viewer.blank_tokens(), "model": "GitHub Copilot",
-             "_source": path, "_session_id": sid, "_source_label": "CLI / Desktop", "_kind": "copilot-db"}
+             "_source": path, "_session_id": sid, "_source_label": "Mixed", "_kind": "copilot-db"}
             for sid, name, updated in rows]
 
 

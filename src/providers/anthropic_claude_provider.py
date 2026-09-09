@@ -15,10 +15,11 @@ def display_root(root: Path) -> Path:
 
 
 def tool(summary: dict) -> str:
-    # Claude Code CLI and the VS Code integration can share the same
-    # ~/.claude transcript locations. Only Desktop has a distinct local-agent
-    # storage path, so expose both possible labels when the source is shared.
-    return "Desktop" if "local-agent-mode-sessions" in str(summary.get("_source", "")) else "CLI / Extension"
+    surface = summary.get("_surface")
+    if isinstance(surface, str) and surface:
+        return surface
+    # Shared .claude transcript paths do not normally identify their surface.
+    return "Desktop" if "local-agent-mode-sessions" in str(summary.get("_source", "")) else "Mixed"
 
 
 def identity(record: dict, fallback: str) -> tuple[str, str]:
@@ -62,6 +63,38 @@ def _files() -> list[Path]:
     return list(dict.fromkeys(files))
 
 
+def _surface_by_session_id(files: list[Path]) -> dict[str, set[str]]:
+    """Collect explicit Desktop and entrypoint markers for shared transcripts."""
+    surfaces: dict[str, set[str]] = {}
+
+    def add_surface(session_id: object, surface: str) -> None:
+        if session_id:
+            surfaces.setdefault(str(session_id), set()).add(surface)
+
+    projects = Path.home() / ".claude" / "projects"
+    try:
+        for marker in projects.rglob("*.desktop-released.json") if projects.exists() else ():
+            session_id = marker.name.removesuffix(".desktop-released.json")
+            add_surface(session_id, "Desktop")
+    except OSError:
+        pass
+
+    for path in files:
+        records = _viewer().safe_json_lines(path)
+        for record in records:
+            session_id = record.get("sessionId") or record.get("session_id")
+            entrypoint = str(record.get("entrypoint") or "").lower()
+            if not session_id or not entrypoint:
+                continue
+            if "desktop" in entrypoint:
+                add_surface(session_id, "Desktop")
+            elif "vscode" in entrypoint or "extension" in entrypoint:
+                add_surface(session_id, "Extension")
+            elif "cli" in entrypoint:
+                add_surface(session_id, "CLI")
+    return surfaces
+
+
 def _is_subagent(path: Path) -> bool:
     return path.parent.name == "subagents" and path.name.startswith("agent-")
 
@@ -99,6 +132,7 @@ def _children_for(parent: Path, files: list[Path]) -> list[Path]:
 def index(root: Path) -> list[dict]:
     viewer = _viewer()
     files = _files()
+    surfaces = _surface_by_session_id(files)
     entries = []
     for path in files:
         if _is_subagent(path):
@@ -113,9 +147,20 @@ def index(root: Path) -> list[dict]:
         explicit_name = viewer.explicit_conversation_name(records, entry["id"])
         if explicit_name:
             entry["name"] = explicit_name
+        source_path = str(entry["_source"]).replace("\\", "/")
+        if "local-agent-mode-sessions" in source_path:
+            entry["_surface"] = "Desktop"
+        elif entry["id"] in surfaces:
+            # A session can be observed by more than one Claude surface. Mark
+            # that case as Mixed instead of presenting a misleading combined
+            # source label.
+            evidence = surfaces[entry["id"]]
+            entry["_surface"] = (
+                "Mixed" if len(evidence) > 1 else next(iter(evidence))
+            )
         # Keep the sidebar flag consistent with the surface shown in the
-        # conversation header. Shared .claude paths intentionally retain both
-        # possible labels.
+        # conversation header. Shared .claude paths retain an explicit marker
+        # when one is available and otherwise remain ambiguous.
         entry["_source_label"] = tool(entry)
     # A conversation can be discovered through more than one local Claude
     # source while it is being written. Keep one sidebar item per session ID.

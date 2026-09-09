@@ -2,11 +2,51 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.providers import openai_codex_provider
 
 
 class CodexInvocationGroupingTests(unittest.TestCase):
+    def test_source_is_identified_from_originator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            sessions = home / ".codex" / "sessions"
+            sessions.mkdir(parents=True)
+            path = sessions / "rollout-cli.jsonl"
+            path.write_text(json.dumps({
+                "type": "session_meta",
+                "payload": {"id": "cli-session", "originator": "codex_vscode", "source": "vscode"},
+            }) + "\n", encoding="utf-8")
+            with patch("pathlib.Path.home", return_value=home):
+                entries = openai_codex_provider.index(home)
+
+        self.assertEqual(entries[0]["_source_label"], "Extension")
+
+    def test_conflicting_originators_are_mixed(self) -> None:
+        records = [
+            {"type": "session_meta", "payload": {"id": "mixed-session", "originator": "codex_vscode"}},
+            {"type": "event_msg", "payload": {"originator": "codex_work_desktop"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            sessions = home / ".codex" / "sessions"
+            sessions.mkdir(parents=True)
+            path = sessions / "rollout-mixed.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+            with patch("pathlib.Path.home", return_value=home):
+                entries = openai_codex_provider.index(home)
+
+        self.assertEqual(entries[0]["_source_label"], "Mixed")
+
+    def test_codex_tui_originator_is_cli(self) -> None:
+        self.assertEqual(
+            openai_codex_provider._surface_from_records([
+                {"type": "session_meta", "payload": {"originator": "codex-tui", "source": "cli"}},
+            ]),
+            "CLI",
+        )
+
     def test_tools_are_grouped_as_invocations_in_one_logical_turn(self) -> None:
         records = [
             {"type": "session_meta", "payload": {"id": "session-1"}},

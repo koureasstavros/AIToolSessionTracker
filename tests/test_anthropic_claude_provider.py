@@ -2,12 +2,82 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src import pricing
 from src.providers import anthropic_claude_provider
 
 
 class ClaudeInvocationGroupingTests(unittest.TestCase):
+    def test_shared_transcript_without_surface_metadata_is_mixed(self) -> None:
+        self.assertEqual(
+            anthropic_claude_provider.tool({"_source": Path("session.jsonl")}),
+            "Mixed",
+        )
+
+    def test_transcript_entrypoint_identifies_cli_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / ".claude" / "projects" / "project"
+            project.mkdir(parents=True)
+            path = project / "cli-session.jsonl"
+            path.write_text(
+                json.dumps({
+                    "sessionId": "cli-session",
+                    "type": "user",
+                    "entrypoint": "cli",
+                    "message": {"role": "user", "content": "Hello from CLI"},
+                }) + "\n",
+                encoding="utf-8",
+            )
+            with patch("pathlib.Path.home", return_value=home):
+                entries = anthropic_claude_provider.index(home)
+
+        self.assertEqual(entries[0]["_source_label"], "CLI")
+
+    def test_shared_project_transcript_uses_desktop_marker_and_audit_is_discovered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / ".claude" / "projects" / "project"
+            project.mkdir(parents=True)
+            session_id = "desktop-session"
+            transcript = project / f"{session_id}.jsonl"
+            transcript.write_text(
+                json.dumps({
+                    "sessionId": session_id,
+                    "type": "user",
+                    "message": {"role": "user", "content": "Hello from Desktop"},
+                }) + "\n",
+                encoding="utf-8",
+            )
+            (project / f"{session_id}.desktop-released.json").write_text(
+                json.dumps({"v": 1, "reason": "delete"}),
+                encoding="utf-8",
+            )
+            sessions = home / ".claude" / "sessions"
+            sessions.mkdir(parents=True)
+            (sessions / "extension.json").write_text(
+                json.dumps({"sessionId": session_id, "entrypoint": "claude-vscode"}),
+                encoding="utf-8",
+            )
+            audit = home / "AppData" / "Local" / "Claude-3p" / "local-agent-mode-sessions" / session_id / "audit.jsonl"
+            audit.parent.mkdir(parents=True)
+            audit.write_text(
+                json.dumps({
+                    "sessionId": "audit-session",
+                    "type": "user",
+                    "message": {"role": "user", "content": "Audit prompt"},
+                }) + "\n",
+                encoding="utf-8",
+            )
+            with patch("pathlib.Path.home", return_value=home):
+                entries = anthropic_claude_provider.index(home)
+
+        desktop_entry = next(entry for entry in entries if entry["id"] == session_id)
+        audit_entry = next(entry for entry in entries if entry["id"] == "audit-session")
+        self.assertEqual(desktop_entry["_source_label"], "Mixed")
+        self.assertEqual(audit_entry["_source_label"], "Desktop")
+
     def test_pre_turn_attachments_are_visible_as_internal_instructions(self) -> None:
         records = [
             {
