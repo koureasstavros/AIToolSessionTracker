@@ -8,6 +8,42 @@ from src.providers import anthropic_claude_provider
 
 
 class ClaudeInvocationGroupingTests(unittest.TestCase):
+    def test_pre_turn_attachments_are_visible_as_internal_instructions(self) -> None:
+        records = [
+            {
+                "type": "attachment",
+                "attachment": {
+                    "type": "prompt_snapshot",
+                    "systemPrompt": ["You are an interactive software engineering agent."],
+                },
+            },
+            {
+                "type": "attachment",
+                "attachment": {
+                    "type": "agent_listing_delta",
+                    "addedTypes": ["Explore", "Plan"],
+                },
+            },
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "sessionId": "session-1",
+                "message": {"role": "user", "content": "Inspect the project"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session-1.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+            session = anthropic_claude_provider.details({"_source": path})
+
+        instructions = session["turns"][0]["internalInstructions"]
+        self.assertEqual([item["name"] for item in instructions], [
+            "Claude prompt_snapshot",
+            "Claude agent_listing_delta",
+        ])
+        self.assertIn("interactive software engineering agent", instructions[0]["content"])
+        self.assertIn("Explore", instructions[1]["content"])
+
     def test_assistant_messages_become_invocations_with_nested_tools_and_usage(self) -> None:
         first_usage = {"input_tokens": 2, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 20, "output_tokens": 12}
         final_usage = {"input_tokens": 3, "cache_read_input_tokens": 110, "cache_creation_input_tokens": 5, "output_tokens": 30}

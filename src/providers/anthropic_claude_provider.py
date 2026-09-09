@@ -147,6 +147,7 @@ def details(summary: dict) -> dict:
     seen_usage_records: set[str] = set()
     current_turn: dict | None = None
     previous_was_tool_result = False
+    pending_instructions: list[tuple[str, str]] = []
 
     def new_invocation(turn: dict, message_id: str | None) -> dict:
         if message_id and message_id in message_invocations:
@@ -161,6 +162,27 @@ def details(summary: dict) -> dict:
         if message_id:
             message_invocations[message_id] = (turn, invocation)
         return invocation
+
+    def capture_attachment(target: dict | None, record: dict) -> None:
+        attachment = record.get("attachment") if isinstance(record.get("attachment"), dict) else None
+        if not attachment:
+            return
+        if target is None:
+            attachment_type = str(attachment.get("type") or "internal instructions")
+            if attachment_type != "file":
+                instruction = json.dumps(attachment, indent=2, ensure_ascii=False)
+                pending_instructions.append((f"Claude {attachment_type}", instruction))
+            return
+        viewer.add_attached_files(target, viewer.files_from_content(attachment))
+        attachment_type = str(attachment.get("type") or "internal instructions")
+        if attachment_type != "file":
+            instruction = json.dumps(attachment, indent=2, ensure_ascii=False)
+            viewer.add_internal_instruction(target, f"Claude {attachment_type}", instruction)
+
+    def apply_pending_instructions(target: dict) -> None:
+        for name, content in pending_instructions:
+            viewer.add_internal_instruction(target, name, content)
+        pending_instructions.clear()
 
     for record in records:
         payload = record.get("payload", record)
@@ -197,9 +219,12 @@ def details(summary: dict) -> dict:
             if not (isinstance(part, dict) and part.get("type") in {"tool_use", "tool_result"})
         )
 
+        capture_attachment(current_turn, record)
+
         if role == "user" and not is_tool_result:
             logical_id = str(turn_id or record.get("uuid") or f"turn-{len(turns) + 1}")
             current_turn = turns.setdefault(logical_id, viewer.new_turn(logical_id))
+            apply_pending_instructions(current_turn)
             current_turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
             if content:
                 if previous_was_tool_result:
@@ -241,13 +266,6 @@ def details(summary: dict) -> dict:
         if record_model and record_model != "<synthetic>":
             turn["model"] = record_model
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
-        attachment = record.get("attachment") if isinstance(record.get("attachment"), dict) else None
-        if attachment:
-            viewer.add_attached_files(turn, viewer.files_from_content(attachment))
-            attachment_type = str(attachment.get("type") or "internal instructions")
-            if attachment_type != "file":
-                instruction = json.dumps(attachment, indent=2, ensure_ascii=False)
-                viewer.add_internal_instruction(turn, f"Claude {attachment_type}", instruction)
         message_id_value = message.get("id") if isinstance(message, dict) else None
         message_id = str(message_id_value) if message_id_value else None
         invocation = new_invocation(turn, message_id) if role in {"assistant", "model"} or is_tool_use else None
