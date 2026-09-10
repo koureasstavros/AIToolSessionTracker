@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import session_token_viewer
 from src.common import source_pricing as pricing
 from src.providers import anthropic_claude_provider
 
@@ -78,6 +79,62 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(desktop_entry["_source_label"], "Mixed")
         self.assertEqual(audit_entry["_source_label"], "Desktop")
 
+    def test_index_builds_recursive_subagent_summary_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / ".claude" / "projects" / "project"
+            root = project / "root.jsonl"
+            child = project / "root" / "subagents" / "agent-child.jsonl"
+            grandchild = child.parent / child.stem / "subagents" / "agent-grandchild.jsonl"
+            for path in (root, child, grandchild):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            root.write_text("\n".join([
+                json.dumps({
+                    "sessionId": "root",
+                    "type": "user",
+                    "message": {"role": "user", "content": "Delegate work"},
+                }),
+                json.dumps({
+                    "sessionId": "root",
+                    "type": "assistant",
+                    "message": {
+                        "id": "parent-message",
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "tool-child", "name": "Agent", "input": {}}],
+                        "usage": {"input_tokens": 3, "output_tokens": 1},
+                    },
+                }),
+            ]) + "\n", encoding="utf-8")
+            usage = {"input_tokens": 1, "output_tokens": 2}
+            for path, session_id in ((child, "root"), (grandchild, "root")):
+                path.write_text("\n".join([
+                    json.dumps({"sessionId": session_id, "type": "user", "message": {"role": "user", "content": "Work"}}),
+                    json.dumps({"sessionId": session_id, "type": "assistant", "message": {"id": path.stem, "role": "assistant", "content": "Done", "usage": usage}}),
+                ]) + "\n", encoding="utf-8")
+            child.with_suffix(".meta.json").write_text(json.dumps({
+                "description": "Review delegated work",
+                "toolUseId": "tool-child",
+                "model": "haiku",
+                "spawnDepth": 1,
+            }), encoding="utf-8")
+
+            with patch("pathlib.Path.home", return_value=home):
+                entries = anthropic_claude_provider.index(home)
+                session = anthropic_claude_provider.details(entries[0])
+
+        self.assertEqual(len(session["subagents"]), 1)
+        self.assertEqual(len(session["subagents"][0]["subagents"]), 1)
+        self.assertEqual(session["subagentTokens"]["outputTokens"], 4)
+        linked_agent = session["turns"][0]["invocations"][0]["tools"][0]["subagent"]
+        self.assertEqual(linked_agent["agentDescription"], "Review delegated work")
+        self.assertEqual(linked_agent["ownTokens"]["outputTokens"], 2)
+        totals, _, agent_count = session_token_viewer.invocation_rollup(
+            session["turns"][0]["invocations"][0]
+        )
+        self.assertEqual(agent_count, 2)
+        self.assertEqual(totals["inputTokens"], 5)
+        self.assertEqual(totals["outputTokens"], 5)
+
     def test_pre_turn_attachments_are_visible_as_internal_instructions(self) -> None:
         records = [
             {
@@ -137,6 +194,25 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(turn["invocations"][0]["tokens"]["outputTokens"], 12)
         self.assertEqual(turn["invocations"][1]["tokens"]["outputTokens"], 30)
         self.assertEqual(turn["tokens"]["outputTokens"], 42)
+
+    def test_background_task_notification_stays_in_originating_turn(self) -> None:
+        records = [
+            {"type": "user", "uuid": "user-1", "promptId": "turn-1", "sessionId": "session-1", "message": {"role": "user", "content": "Run an agent"}},
+            {"type": "assistant", "uuid": "assistant-1", "message": {"id": "message-1", "role": "assistant", "content": [{"type": "tool_use", "id": "tool-agent", "name": "Agent", "input": {}}], "usage": {"input_tokens": 10, "output_tokens": 5}}},
+            {"type": "user", "uuid": "notification-1", "promptId": "notification-turn", "message": {"role": "user", "content": "<task-notification><task-id>agent-1</task-id><tool-use-id>tool-agent</tool-use-id><status>completed</status><result>Delegated result</result></task-notification>"}},
+            {"type": "assistant", "uuid": "assistant-2", "message": {"id": "message-2", "role": "assistant", "content": "The agent finished.", "usage": {"input_tokens": 12, "output_tokens": 6}}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session-1.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+            session = anthropic_claude_provider.details({"_source": path})
+
+        self.assertEqual(len(session["turns"]), 1)
+        turn = session["turns"][0]
+        self.assertEqual(turn["user"], "Run an agent")
+        self.assertEqual(len(turn["invocations"]), 2)
+        self.assertEqual(turn["tools"][0]["result"], "Delegated result")
+        self.assertEqual(turn["assistant"][-1], "The agent finished.")
 
     def test_synthetic_error_does_not_replace_or_inherit_real_model_for_pricing(self) -> None:
         records = [

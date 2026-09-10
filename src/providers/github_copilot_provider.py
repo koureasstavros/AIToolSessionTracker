@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 
 from src.common.source_archive import create_archive, inject_archive
@@ -42,6 +43,7 @@ def _read_session_state(folder: Path) -> dict:
     turn_interactions: dict[str, str] = {}
     output_total = 0
     internal_context: list[tuple[str, str]] = []
+    subagent_info: dict[str, dict] = {}
     for record in records:
         if record.get("type") == "system.message":
             data = record.get("data") if isinstance(record.get("data"), dict) else {}
@@ -53,6 +55,11 @@ def _read_session_state(folder: Path) -> dict:
             context = data.get("context")
             if isinstance(context, dict) and context:
                 internal_context.append(("Copilot session context", json.dumps(context, indent=2, ensure_ascii=False)))
+        elif record.get("type") in {"subagent.started", "subagent.completed"}:
+            data = record.get("data") if isinstance(record.get("data"), dict) else {}
+            tool_call_id = data.get("toolCallId")
+            if tool_call_id:
+                subagent_info.setdefault(str(tool_call_id), {}).update(data)
 
     def get_turn(key: str) -> dict:
         turn = turns.setdefault(key, viewer.new_turn(key))
@@ -147,6 +154,31 @@ def _read_session_state(folder: Path) -> dict:
                         viewer.add_token_usage(session["tokens"], model.get("usage") or {})
 
     session["turns"] = list(turns.values())
+    tools_by_id = {
+        str(tool.get("id")): tool
+        for turn in session["turns"]
+        for tool in turn.get("tools", [])
+        if isinstance(tool, dict) and tool.get("id")
+    }
+    claimed_turns: set[str] = set()
+    for tool_call_id, info in subagent_info.items():
+        tool = tools_by_id.get(tool_call_id)
+        arguments = tool.get("arguments") if isinstance(tool, dict) and isinstance(tool.get("arguments"), dict) else {}
+        prompt = str(arguments.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        child_turn = next(
+            (
+                turn for turn in session["turns"]
+                if str(turn.get("user") or "").strip() == prompt
+                and str(turn.get("id")) not in claimed_turns
+            ),
+            None,
+        )
+        if child_turn is not None:
+            child_turn["_parent_tool_call_id"] = tool_call_id
+            claimed_turns.add(str(child_turn.get("id")))
+    session["_subagent_info"] = subagent_info
     if output_total:
         session["tokens"]["outputTokens"] = output_total
     if len(session["turns"]) == 1:
@@ -190,6 +222,7 @@ def _read_chat(path: Path) -> dict:
     requests = [dict(item) for item in metadata.get("requests", []) if isinstance(item, dict)]
     context_blocks = viewer.context_instruction_blocks(records, "Copilot")
     session_token_fields: set[str] = set()
+    embedded_subagents: list[dict] = []
     positions = {item.get("requestId"): index for index, item in enumerate(requests) if item.get("requestId")}
     for record in records:
         if record.get("k") == ["customTitle"]:
@@ -293,6 +326,44 @@ def _read_chat(path: Path) -> dict:
                     }
                     if call_id in tool_results:
                         tool["result"] = tool_results[call_id]
+                    if viewer.is_subagent_invocation({"tools": [tool]}):
+                        arguments = call.get("arguments")
+                        try:
+                            arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+                        except json.JSONDecodeError:
+                            arguments = {}
+                        arguments = arguments if isinstance(arguments, dict) else {}
+                        result_value = tool.get("result")
+                        if isinstance(result_value, dict):
+                            content = result_value.get("content")
+                            if isinstance(content, list):
+                                result_value = "\n".join(
+                                    str(item.get("value") or item.get("text") or "")
+                                    for item in content if isinstance(item, dict)
+                                ).strip()
+                        agent_model = round_data.get("modelId") or request.get("modelId") or "model unavailable"
+                        child = viewer.new_session(
+                            call_id,
+                            str(arguments.get("agentName") or arguments.get("name") or arguments.get("description") or call_id),
+                            updated,
+                            str(agent_model),
+                            session.get("project"),
+                        )
+                        child_turn = viewer.new_turn(call_id)
+                        child_turn["user"] = str(arguments.get("prompt") or "")
+                        if result_value:
+                            child_turn["assistant"] = [str(result_value)]
+                        child["turns"] = [child_turn]
+                        child["ownTokens"] = dict(child["tokens"])
+                        child["subagents"] = []
+                        child["subagentTokens"] = viewer.blank_tokens()
+                        child["relation"] = "subagent"
+                        child["agentDescription"] = arguments.get("description") or child["name"]
+                        child["agentModel"] = str(agent_model)
+                        child["spawnDepth"] = 1
+                        child["toolUseId"] = call_id
+                        tool["subagent"] = child
+                        embedded_subagents.append(child)
                     invocation["tools"].append(tool)
                     turn.setdefault("tools", []).append(tool)
                 turn["invocations"].append(invocation)
@@ -331,6 +402,7 @@ def _read_chat(path: Path) -> dict:
     session["model"] = str(next((request.get("modelId") for request in requests if request.get("modelId")), "model unavailable"))
     session["deployment"] = viewer.deployment_from_records(records)
     session["tokenFields"] = [key for key in viewer.TOKEN_KEYS if key in session_token_fields]
+    session["_embedded_subagents"] = embedded_subagents
     return session
 
 
@@ -338,13 +410,27 @@ def _read_db(session_id: str, db_path: Path) -> dict:
     viewer = _viewer()
     session = viewer.new_session(session_id, session_id, db_path.stat().st_mtime, "GitHub Copilot")
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as db:
             columns = {row[1] for row in db.execute('PRAGMA table_info("sessions")')}
             project_column = next((name for name in ("cwd", "working_directory", "project_path") if name in columns), None)
             extra = f", {project_column}" if project_column else ""
             row = db.execute(f"SELECT summary, updated_at{extra} FROM sessions WHERE id = ?", (session_id,)).fetchone()
             turns = db.execute("SELECT turn_index, user_message, assistant_response FROM turns WHERE session_id = ? ORDER BY turn_index", (session_id,)).fetchall()
-            usage = db.execute("SELECT turn_index, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens FROM assistant_usage_events WHERE session_id = ? ORDER BY id", (session_id,)).fetchall()
+            usage_columns = {row[1] for row in db.execute('PRAGMA table_info("assistant_usage_events")')}
+            optional_usage_columns = [
+                name for name in ("agent_id", "parent_tool_call_id", "model", "initiator", "created_at")
+                if name in usage_columns
+            ]
+            selected_usage_columns = [
+                "turn_index", "input_tokens", "cache_read_tokens",
+                "cache_write_tokens", "output_tokens", "reasoning_tokens",
+                *optional_usage_columns,
+            ]
+            usage = db.execute(
+                f'SELECT {", ".join(selected_usage_columns)} FROM assistant_usage_events '
+                'WHERE session_id = ? ORDER BY id',
+                (session_id,),
+            ).fetchall()
             if row:
                 session["name"] = row[0] or session_id
                 if project_column and row[2]:
@@ -357,10 +443,30 @@ def _read_db(session_id: str, db_path: Path) -> dict:
     except (OSError, sqlite3.Error):
         return session
     by_turn: dict[int, list[dict]] = {}
-    for index, *values in usage:
-        by_turn.setdefault(index or 0, []).append(dict(zip(viewer.TOKEN_KEYS, values)))
+    for row in usage:
+        values = dict(zip(selected_usage_columns, row))
+        index = values.pop("turn_index", 0) or 0
+        invocation = {
+            "tokens": {
+                "inputTokens": values.pop("input_tokens", None),
+                "cacheReadTokens": values.pop("cache_read_tokens", None),
+                "cacheWriteTokens": values.pop("cache_write_tokens", None),
+                "outputTokens": values.pop("output_tokens", None),
+                "reasoningTokens": values.pop("reasoning_tokens", None),
+            },
+            "agentId": values.get("agent_id"),
+            "parentToolCallId": values.get("parent_tool_call_id"),
+            "model": values.get("model"),
+            "initiator": values.get("initiator"),
+            "createdAt": values.get("created_at"),
+        }
+        invocation["tokenFields"] = [
+            key for key, value in invocation["tokens"].items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        ]
+        by_turn.setdefault(index, []).append(invocation)
     for index, user, assistant in turns:
-        invocations = by_turn.get(index) or [{key: 0 for key in viewer.TOKEN_KEYS}]
+        invocations = by_turn.get(index) or [{"tokens": {key: 0 for key in viewer.TOKEN_KEYS}}]
         # Several assistant_usage_events rows can belong to one logical turn.
         # Keep one UI turn card and retain the individual usage rows as invocations
         # inside it instead of presenting every row as a separate conversation.
@@ -369,12 +475,16 @@ def _read_db(session_id: str, db_path: Path) -> dict:
         turn["assistant"] = [assistant] if assistant else []
         turn["turn_index"], turn["invocation_count"] = index, len(invocations)
         turn["invocations"] = []
-        for invocation_index, tokens in enumerate(invocations, 1):
+        for invocation_index, invocation_data in enumerate(invocations, 1):
+            tokens = invocation_data["tokens"]
             normalized_tokens = {
                 key: value if isinstance(value, int) else 0
                 for key, value in tokens.items()
             }
-            turn["invocations"].append({"index": invocation_index, "tokens": normalized_tokens})
+            invocation = dict(invocation_data)
+            invocation["index"] = invocation_index
+            invocation["tokens"] = normalized_tokens
+            turn["invocations"].append(invocation)
             for key, value in normalized_tokens.items():
                 turn["tokens"][key] = (turn["tokens"][key] or 0) + value
             turn["raw"].append(json.dumps({"user": user, "assistant": assistant, "invocation": invocation_index, "tokens": normalized_tokens}, ensure_ascii=False))
@@ -393,12 +503,15 @@ def _read_db(session_id: str, db_path: Path) -> dict:
         turn["kind"] = "usage_summary"
         turn["turn_index"], turn["invocation_count"] = index, len(invocations)
         turn["invocations"] = []
-        for invocation_index, tokens in enumerate(invocations, 1):
+        for invocation_index, invocation_data in enumerate(invocations, 1):
+            tokens = invocation_data["tokens"]
             normalized_tokens = {
                 key: value if isinstance(value, int) else 0
                 for key, value in tokens.items()
             }
-            turn["invocations"].append({"index": invocation_index, "kind": "usage_summary", "tokens": normalized_tokens})
+            invocation = dict(invocation_data)
+            invocation.update({"index": invocation_index, "kind": "usage_summary", "tokens": normalized_tokens})
+            turn["invocations"].append(invocation)
             for key, value in normalized_tokens.items():
                 turn["tokens"][key] = (turn["tokens"][key] or 0) + value
             turn["raw"].append(json.dumps({"source": "assistant_usage_events", "turn_index": index, "invocation": invocation_index, "tokens": normalized_tokens}, ensure_ascii=False))
@@ -541,7 +654,7 @@ def _db_index() -> list[dict]:
     if not path.exists():
         return []
     try:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
             rows = db.execute(
                 "SELECT id, COALESCE(summary, id), updated_at FROM sessions "
                 "ORDER BY updated_at DESC"
@@ -596,6 +709,65 @@ def details(summary: dict) -> dict:
                 for invocation in (database_turn.get("invocations") or [])
                 if isinstance(invocation, dict)
             ]
+            child_usage = {
+                str(invocation["parentToolCallId"]): invocation
+                for invocation in database_invocations
+                if invocation.get("parentToolCallId")
+            }
+            if child_usage:
+                child_turns = {
+                    str(turn["_parent_tool_call_id"]): turn
+                    for turn in result["turns"]
+                    if turn.get("_parent_tool_call_id")
+                }
+                result["turns"] = [
+                    turn for turn in result["turns"]
+                    if not turn.get("_parent_tool_call_id")
+                ]
+                tools_by_id = {
+                    str(tool.get("id")): tool
+                    for turn in result["turns"]
+                    for tool in turn.get("tools", [])
+                    if isinstance(tool, dict) and tool.get("id")
+                }
+                lifecycle = result.get("_subagent_info") if isinstance(result.get("_subagent_info"), dict) else {}
+                embedded_subagents = []
+                for tool_call_id, usage_invocation in child_usage.items():
+                    info = lifecycle.get(tool_call_id) if isinstance(lifecycle.get(tool_call_id), dict) else {}
+                    tool = tools_by_id.get(tool_call_id)
+                    arguments = tool.get("arguments") if isinstance(tool, dict) and isinstance(tool.get("arguments"), dict) else {}
+                    name = info.get("agentDisplayName") or arguments.get("name") or info.get("agentName") or tool_call_id
+                    model = usage_invocation.get("model") or info.get("firstDispatchedModel") or info.get("model") or result.get("model")
+                    child = viewer.new_session(tool_call_id, str(name), result.get("updated", 0), model, result.get("project"))
+                    child_turn = child_turns.get(tool_call_id)
+                    child_invocation = dict(usage_invocation)
+                    child_invocation.update({"index": 1, "tools": []})
+                    child_invocation.pop("kind", None)
+                    if child_turn is not None:
+                        child_turn["invocations"] = [child_invocation]
+                        child_turn["tokens"] = dict(child_invocation.get("tokens", {}))
+                        child_turn["tokenFields"] = list(child_invocation.get("tokenFields", []))
+                        child["turns"] = [child_turn]
+                    child["tokens"] = dict(child_invocation.get("tokens", {}))
+                    child["tokenFields"] = list(child_invocation.get("tokenFields", []))
+                    child["subagents"] = []
+                    child["subagentTokens"] = viewer.blank_tokens()
+                    child["relation"] = "subagent"
+                    child["agentDescription"] = info.get("agentDescription") or arguments.get("description") or name
+                    child["agentModel"] = model
+                    child["spawnDepth"] = 1
+                    child["toolUseId"] = tool_call_id
+                    viewer.subtract_cached_input(child)
+                    child["ownTokens"] = dict(child["tokens"])
+                    child = viewer.pricing.apply_costs(child)
+                    embedded_subagents.append(child)
+                    if tool is not None:
+                        tool["subagent"] = child
+                result["_embedded_subagents"] = embedded_subagents
+                database_invocations = [
+                    invocation for invocation in database_invocations
+                    if not invocation.get("parentToolCallId")
+                ]
             event_invocation_counts = [
                 turn.get("_event_invocation_count", 0)
                 for turn in result["turns"]
@@ -609,11 +781,17 @@ def details(summary: dict) -> dict:
                 viewer.LOGGER.warning("%s Session %s", issue, result["id"])
                 offset = 0
                 for index, (turn, invocation_count) in enumerate(zip(result["turns"], event_invocation_counts)):
+                    event_invocations = [
+                        invocation for invocation in turn.get("invocations", [])
+                        if isinstance(invocation, dict)
+                    ]
                     invocations = [dict(invocation) for invocation in database_invocations[offset:offset + invocation_count]]
                     offset += invocation_count
                     for invocation_index, invocation in enumerate(invocations, 1):
                         invocation["index"] = invocation_index
                         invocation.pop("kind", None)
+                        event_invocation = event_invocations[invocation_index - 1] if invocation_index <= len(event_invocations) else {}
+                        invocation["assistant"] = list(event_invocation.get("assistant", []))
                         invocation["tools"] = [
                             tool for tool in turn.get("tools", [])
                             if tool.get("_invocation_index") == invocation_index
@@ -622,12 +800,21 @@ def details(summary: dict) -> dict:
                     turn["invocation_count"] = invocation_count
                     turn["turn_index"] = index
                     turn["tokens"] = viewer.blank_tokens()
+                    turn["tokenFields"] = []
                     for invocation in invocations:
                         for key, value in invocation.get("tokens", {}).items():
                             turn["tokens"][key] = (turn["tokens"][key] or 0) + value
+                        turn["tokenFields"] = list(set(turn["tokenFields"]) | set(invocation.get("tokenFields", [])))
                 for key in viewer.TOKEN_KEYS:
-                    if supplement.get("tokens", {}).get(key) is not None:
-                        result["tokens"][key] = supplement["tokens"][key]
+                    values = [turn.get("tokens", {}).get(key) for turn in result["turns"]]
+                    result["tokens"][key] = sum(value for value in values if isinstance(value, int)) if any(isinstance(value, int) for value in values) else None
+                result["tokenFields"] = [
+                    key for key in viewer.TOKEN_KEYS
+                    if any(key in turn.get("tokenFields", []) for turn in result["turns"])
+                ]
+                result["tokenFlags"] = [
+                    flag for flag in result.get("tokenFlags", []) if flag != "estimated"
+                ]
                 continue
         by_id = {str(turn.get("id")): turn for turn in result["turns"]}
         for index, other in enumerate(supplement.get("turns", [])):
@@ -676,8 +863,14 @@ def details(summary: dict) -> dict:
     if not result.get("project"):
         result["project"] = summary.get("project")
     result["ownTokens"] = dict(result.get("tokens", {}))
-    result["subagents"] = []
+    result["subagents"] = list(result.pop("_embedded_subagents", []))
     result["subagentTokens"] = viewer.blank_tokens()
+    for child in result["subagents"]:
+        for key in viewer.TOKEN_KEYS:
+            value = child.get("tokens", {}).get(key)
+            if isinstance(value, int):
+                result["subagentTokens"][key] = (result["subagentTokens"][key] or 0) + value
+                result["tokens"][key] = (result["tokens"][key] or 0) + value
     for child_summary in summary.get("_children", []):
         if not isinstance(child_summary, dict) or not isinstance(child_summary.get("_source"), Path):
             continue

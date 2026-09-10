@@ -63,7 +63,8 @@ GitHub Copilot uses source-specific turn handling:
   `requests` array, including requests reconstructed from later JSONL patch
   records. Persisted `toolCallRounds` become numbered invocations. Tools
   are listed vertically inside the round that initiated them, including their
-  arguments and stored results.
+  arguments and stored results. Serialized `runSubagent` tools become nested
+  agent cards using their description, agent name, model, prompt, and result.
 - **CLI / Desktop session-state:** events are grouped by `interactionId`, or by
   the linked `turnId`. Internal assistant turns become invocations, and
   tool start/completion events are attached to the assistant invocation that
@@ -71,6 +72,11 @@ GitHub Copilot uses source-specific turn handling:
 - **CLI / Desktop SQLite:** multiple assistant usage rows become invocations
   inside their logical user turn. Usage-only records can still become
   synthetic turns when no matching conversation content exists.
+
+CLI/Desktop subagent usage rows expose `parent_tool_call_id`. The viewer uses
+that identifier to move child interactions under the exact `task` tool that
+spawned them. Parent orchestration usage remains separately expandable, while
+the invocation total combines parent and linked child usage.
 
 A request or event group can contain:
 
@@ -109,6 +115,10 @@ the complete request; earlier tool rounds remain unavailable rather than being
 assigned estimated values.
 
 The VS Code chat-session source often does not persist usage statistics. In that case, prompts, responses, and tool events remain visible while token fields remain unavailable.
+This also applies to `runSubagent`: when the child request's token usage is not
+persisted, the child card explicitly reports **Token usage unavailable** and
+the invocation rollup is marked as partial rather than estimating or dividing
+the request-level total among agents.
 
 Token availability is not uniform across GitHub Copilot turns and invocations.
 A text-bearing invocation may have `null` token fields. Tools never inherit or

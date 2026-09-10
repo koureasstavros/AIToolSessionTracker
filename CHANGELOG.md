@@ -4,6 +4,10 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Explorer, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.27 — 2026-09-10
+
+- Added hierarchy handling for subagents including orchistration and agent cost
+
 ### Version v0.0.26 — 2026-09-10
 
 - Added timestamp for each session-turn

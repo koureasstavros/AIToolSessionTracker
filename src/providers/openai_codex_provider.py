@@ -70,6 +70,24 @@ def _has_data(path: Path) -> bool:
     return False
 
 
+def _subagent_metadata(records: list[dict]) -> dict:
+    """Return Codex thread-spawn metadata from a child rollout."""
+    for record in records:
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+        subagent = source.get("subagent") if isinstance(source.get("subagent"), dict) else {}
+        spawn = subagent.get("thread_spawn") if isinstance(subagent.get("thread_spawn"), dict) else {}
+        parent_id = spawn.get("parent_thread_id")
+        if parent_id:
+            return {
+                "parentThreadId": str(parent_id),
+                "nickname": spawn.get("agent_nickname"),
+                "role": spawn.get("agent_role"),
+                "depth": spawn.get("depth"),
+            }
+    return {}
+
+
 def index(root: Path) -> list[dict]:
     viewer = _viewer()
     location = Path.home() / ".codex" / "sessions"
@@ -77,16 +95,26 @@ def index(root: Path) -> list[dict]:
         files = list(location.rglob("*.jsonl")) if location.exists() else []
     except OSError:
         files = []
-    entries = []
+    summaries: dict[str, dict] = {}
+    parent_ids: dict[str, str] = {}
     for path in files:
-        if viewer.is_subagent_path(path):
-            continue
         entry = viewer.session_summary(path, "codex", "external")
-        entry["_children"] = [
-            viewer.session_summary(child, "codex", "external")
-            for child in viewer.related_subagent_paths(path, files)
-        ]
-        entries.append(entry)
+        records = viewer.safe_json_lines(path)
+        metadata = _subagent_metadata(records)
+        entry["_children"] = []
+        if metadata:
+            entry["_agent_meta"] = metadata
+            parent_ids[entry["id"]] = metadata["parentThreadId"]
+        summaries[entry["id"]] = entry
+    for child_id, parent_id in parent_ids.items():
+        parent = summaries.get(parent_id)
+        child = summaries.get(child_id)
+        if parent is not None and child is not None:
+            parent["_children"].append(child)
+    entries = [
+        entry for session_id, entry in summaries.items()
+        if session_id not in parent_ids or parent_ids[session_id] not in summaries
+    ]
     for entry in entries:
         entry["_has_data"] = _has_data(entry["_source"])
         entry["_surface"] = _surface_from_records(viewer.safe_json_lines(entry["_source"]))
@@ -257,12 +285,32 @@ def details(summary: dict) -> dict:
     result["subagents"] = []
     result["ownTokens"] = dict(result["tokens"])
     result["subagentTokens"] = viewer.blank_tokens()
+    tools_by_agent_id: dict[str, dict] = {}
+    for turn in result["turns"]:
+        for tool in turn.get("tools", []):
+            if not isinstance(tool, dict) or tool.get("name") != "spawn_agent":
+                continue
+            output = tool.get("result")
+            try:
+                output = json.loads(output) if isinstance(output, str) else output
+            except json.JSONDecodeError:
+                output = None
+            if isinstance(output, dict) and output.get("agent_id"):
+                tools_by_agent_id[str(output["agent_id"])] = tool
     for child_summary in children:
         if not isinstance(child_summary, dict) or not isinstance(child_summary.get("_source"), Path):
             continue
         child = details(child_summary)
         child["relation"] = "subagent"
+        metadata = child_summary.get("_agent_meta") if isinstance(child_summary.get("_agent_meta"), dict) else {}
+        child["agentDescription"] = metadata.get("nickname") or child.get("name")
+        child["agentModel"] = child.get("model")
+        child["spawnDepth"] = metadata.get("depth")
+        tool = tools_by_agent_id.get(str(child.get("id")))
+        child["toolUseId"] = tool.get("id") if isinstance(tool, dict) else None
         result["subagents"].append(child)
+        if tool is not None:
+            tool["subagent"] = child
         for key in viewer.TOKEN_KEYS:
             value = child.get("tokens", {}).get(key)
             if isinstance(value, int):

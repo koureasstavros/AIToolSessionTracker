@@ -214,7 +214,7 @@ def normalize_session_data(value: dict) -> SessionData:
             flags.append("uncategorizedOutput")
     result["tokenFlags"] = flags
     result["tokenFields"] = [key for key in TOKEN_KEYS if key in supplied_fields] if has_supplied_fields else list(TOKEN_KEYS if isinstance(supplied_tokens, dict) else [])
-    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_session_id", "_db_metadata", "_db_issue", "_has_data", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation"):
+    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_surface", "_session_id", "_db_metadata", "_db_issue", "_has_data", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation"):
         if key in value:
             result[key] = value[key]
     for turn in result["turns"]:
@@ -1272,9 +1272,9 @@ def token_cards(tokens: dict[str, int | None], model: str | None = None, extra_c
     )
 
 
-def invocation_token_cards(tokens: dict[str, int | None], model: str | None = None, token_flags: list[str] | None = None) -> str:
+def invocation_token_cards(tokens: dict[str, int | None], model: str | None = None, token_flags: list[str] | None = None, costs: dict[str, float] | None = None) -> str:
     """Render per-invocation usage grouped by the side of the model exchange."""
-    costs = pricing.cost_breakdown(tokens, model)
+    costs = costs if costs is not None else pricing.cost_breakdown(tokens, model)
     def cards(keys: tuple[str, ...]) -> str:
         return "".join(
             f'<div class="metric compact" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}{token_warning_markup(token_flags, key)}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
@@ -1289,6 +1289,65 @@ def invocation_token_cards(tokens: dict[str, int | None], model: str | None = No
         f'<div class="invocation-metrics">{cards(("outputTokens", "reasoningTokens"))}</div></section>'
         '</div>'
     )
+
+
+def invocation_rollup(invocation: dict) -> tuple[dict[str, int | None], dict[str, float], int]:
+    """Combine parent invocation usage with each linked delegated agent."""
+    parent_tokens = invocation.get("tokens") if isinstance(invocation.get("tokens"), dict) else {}
+    totals = blank_tokens()
+    costs = {key: 0.0 for key in TOKEN_KEYS}
+
+    def add_usage(tokens: dict, model: str | None) -> None:
+        token_costs = pricing.cost_breakdown(tokens, model)
+        for key in TOKEN_KEYS:
+            value = tokens.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] = (totals[key] or 0) + value
+            costs[key] += token_costs.get(key) or 0.0
+
+    add_usage(parent_tokens, invocation.get("model"))
+    agent_count = 0
+
+    def add_agent(agent: dict) -> None:
+        nonlocal agent_count
+        agent_count += 1
+        own_tokens = agent.get("ownTokens") if isinstance(agent.get("ownTokens"), dict) else agent.get("tokens", {})
+        add_usage(own_tokens, agent.get("agentModel") or agent.get("pricingModel") or agent.get("model"))
+        nested = agent.get("subagents") if isinstance(agent.get("subagents"), list) else []
+        for child in nested:
+            if isinstance(child, dict):
+                add_agent(child)
+
+    tools = invocation.get("tools") if isinstance(invocation.get("tools"), list) else []
+    for tool in tools:
+        agent = tool.get("subagent") if isinstance(tool, dict) and isinstance(tool.get("subagent"), dict) else None
+        if agent is not None:
+            add_agent(agent)
+    return totals, costs, agent_count
+
+
+def invocation_total_cards(invocation: dict, model: str | None, token_flags: list[str] | None = None) -> str:
+    """Render parent-only usage or a parent-plus-delegated invocation total."""
+    totals, costs, agent_count = invocation_rollup(invocation)
+    cards = invocation_token_cards(totals, model, token_flags, costs)
+    if not agent_count:
+        return cards
+    tools = invocation.get("tools") if isinstance(invocation.get("tools"), list) else []
+    linked_agents = [
+        tool.get("subagent") for tool in tools
+        if isinstance(tool, dict) and isinstance(tool.get("subagent"), dict)
+    ]
+    has_unknown_usage = any(
+        not any(
+            isinstance((agent.get("ownTokens") or agent.get("tokens", {})).get(key), int)
+            for key in TOKEN_KEYS
+        )
+        for agent in linked_agents
+    )
+    label = f'Parent + {agent_count} delegated agent{"s" if agent_count != 1 else ""}'
+    if has_unknown_usage:
+        label += " · partial usage"
+    return f'<section class="invocation-total"><div class="invocation-total-title"><span>Invocation total</span><b>{esc(label)}</b></div>{cards}</section>'
 
 
 def turn_token_cards(tokens: dict[str, int | None], model: str | None, session_id: str, provider: str, turn_index: int, selected_turn: int | None, selected_metric: str | None, show_empty: bool = False, token_flags: list[str] | None = None) -> str:
@@ -1311,10 +1370,16 @@ def turn_token_cards(tokens: dict[str, int | None], model: str | None, session_i
 
 
 def invocation_tools(invocation: dict) -> str:
-    """Render the tool calls that belong to one model invocation."""
+    """Render the response and tool calls that belong to one invocation."""
     tools = invocation.get("tools") if isinstance(invocation.get("tools"), list) else []
+    messages = invocation.get("assistant") if isinstance(invocation.get("assistant"), list) else []
+    response = "\n\n".join(str(message) for message in messages if str(message).strip())
+    response_markup = (
+        f'<div class="invocation-response"><span>Response</span><p>{esc(response)}</p></div>'
+        if response else ""
+    )
     if not tools:
-        return '<div class="invocation-no-tools">Model response · no tool calls</div>'
+        return response_markup or '<div class="invocation-no-tools">Model response · no stored text or tool calls</div>'
     rendered = []
     for tool in tools:
         if not isinstance(tool, dict):
@@ -1324,20 +1389,64 @@ def invocation_tools(invocation: dict) -> str:
         sections = []
         for label, field in (("Arguments", "arguments"), ("Result", "result")):
             value = tool.get(field)
-            if value is None:
+            if value is None or value == "" or value == {} or value == []:
                 continue
             text = value if isinstance(value, str) else json.dumps(value, indent=2, ensure_ascii=False)
             sections.append(f'<div class="tool-payload"><b>{label}</b><pre>{esc(text)}</pre></div>')
+        agent = tool.get("subagent") if isinstance(tool.get("subagent"), dict) else None
+        agent_markup = ""
+        summary_name = name
+        if agent is not None:
+            summary_name = agent.get("agentDescription") or agent.get("name") or name
+            own_tokens = agent.get("ownTokens") if isinstance(agent.get("ownTokens"), dict) else agent.get("tokens", {})
+            agent_model = agent.get("agentModel") or agent.get("pricingModel") or agent.get("model")
+            agent_total = sum(
+                own_tokens.get(key) or 0
+                for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens")
+            )
+            has_agent_usage = any(
+                isinstance(own_tokens.get(key), int) and not isinstance(own_tokens.get(key), bool)
+                for key in TOKEN_KEYS
+            )
+            usage_summary = (
+                f'{fmt(agent_total)} tokens · {fmt_cost(agent.get("costUsd"))}'
+                if has_agent_usage else "Token usage unavailable"
+            )
+            agent_markup = (
+                '<section class="delegated-agent">'
+                f'<div class="delegated-agent-heading"><span>Delegated agent</span><b>{esc(display_model_name(agent_model))}</b>'
+                f'<strong>{esc(usage_summary)}</strong></div>'
+                f'{invocation_token_cards(own_tokens, agent_model, agent.get("tokenFlags"))}'
+                '</section>'
+            )
         rendered.append(
-            f'<details class="invocation-tool"><summary><span class="tool-name">{esc(name)}</span>'
+            f'<details class="invocation-tool {"delegated-tool" if agent is not None else ""}"><summary><span class="tool-name">{esc(summary_name)}</span>'
             f'<span class="tool-status {esc(status)}">{esc(status)}</span></summary>'
-            f'<div class="invocation-tool-body">{"".join(sections) or "No stored arguments or result."}</div></details>'
+            f'<div class="invocation-tool-body">{agent_markup}{"".join(sections) or ("" if agent is not None else "No stored arguments or result.")}</div></details>'
         )
-    return '<div class="invocation-tools">' + "".join(rendered) + '</div>'
+    return response_markup + '<div class="invocation-tools">' + "".join(rendered) + '</div>'
 
 
 def invocation_subagent_badge(invocation: dict) -> str:
-    return ""
+    tools = invocation.get("tools") if isinstance(invocation.get("tools"), list) else []
+    delegated = [tool for tool in tools if isinstance(tool, dict) and isinstance(tool.get("subagent"), dict)]
+    if not delegated:
+        return ""
+    count = len(delegated)
+    label = f"Parent orchestration · {count} delegated agent{'s' if count != 1 else ''}"
+    tokens = invocation.get("tokens") if isinstance(invocation.get("tokens"), dict) else {}
+    total = sum(tokens.get(key) or 0 for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens"))
+    has_usage = any(
+        isinstance(tokens.get(key), int) and not isinstance(tokens.get(key), bool)
+        for key in TOKEN_KEYS
+    )
+    total_label = f"{fmt(total)} tokens" if has_usage else "Token usage unavailable"
+    return (
+        '<details class="invocation-parent-note">'
+        f'<summary><span aria-hidden="true">↗</span><b>{esc(label)}</b><strong>{esc(total_label)}</strong></summary>'
+        '<div class="invocation-parent-body"><p>Usage for the parent response that created the Agent tool calls.</p>'
+        f'{invocation_token_cards(tokens, invocation.get("model"), invocation.get("tokenFlags"))}</div></details>'
+    )
 
 
 def user_files_markup(turn: dict) -> str:
@@ -1608,7 +1717,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 invocation_markup = '<details class="turn-invocations"><summary><span><span class="invocation-icon" aria-hidden="true">I</span> Invocations</span><span class="summary-count">' + str(len(invocations)) + '</span></summary><div class="invocations-list">' + "".join(
                     f'<div class="turn-invocation"><div class="invocation-name"><span><i></i>Invocation {esc(invocation.get("index", invocation_index))}</span>'
                     f'{" <span class=\"turn-kind\">Usage summary</span>" if invocation.get("kind") == "usage_summary" else ""}'
-                    f'<span class="invocation-model"><small>Model</small><b>{esc(display_model_name(invocation.get("model") or turn.get("model") or chosen.get("model")))}</b></span></div><div class="invocation-content">{invocation_tools(invocation)}{invocation_token_cards(invocation.get("tokens", {}), invocation.get("model") or turn.get("model") or chosen.get("model"), invocation.get("tokenFlags") or turn.get("tokenFlags") or chosen.get("tokenFlags"))}</div></div>'
+                    f'<span class="invocation-model"><small>Model</small><b>{esc(display_model_name(invocation.get("model") or turn.get("model") or chosen.get("model")))}</b></span></div><div class="invocation-content">{invocation_subagent_badge(invocation)}{invocation_tools(invocation)}{invocation_total_cards(invocation, invocation.get("model") or turn.get("model") or chosen.get("model"), invocation.get("tokenFlags") or turn.get("tokenFlags") or chosen.get("tokenFlags"))}</div></div>'
                     for invocation_index, invocation in enumerate(invocations, 1) if isinstance(invocation, dict)
                 ) + '</div></details>'
             invocation_label = f'{len(invocations)} {"invocation" if len(invocations) == 1 else "invocations"}'
@@ -1657,16 +1766,29 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 overview_costs[key] += value
         subagents = chosen.get("subagents") if isinstance(chosen.get("subagents"), list) else []
         subagent_markup = ""
-        if subagents:
-            subagent_rows = "".join(
-                f'<tr><td>{esc(agent.get("name") or agent.get("id"))}</td><td>{fmt(sum((agent.get("tokens", {}).get(key) or 0) for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens")))}</td><td>{fmt_cost(agent.get("costUsd"))}</td></tr>'
-                for agent in subagents
-            )
-            subagent_markup = f'<section class="subagents-section"><div class="section-heading"><div><span class="section-kicker">DELEGATED WORK</span><h2>Sub-agents</h2></div><span class="muted">Parent and delegated usage are included in the session total</span></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>Agent</th><th>Total tokens</th><th>Cost</th></tr></thead><tbody>{subagent_rows}</tbody></table></div></section>'
+        unlinked_subagents = [agent for agent in subagents if not agent.get("toolUseId")]
+        if unlinked_subagents:
+            def delegated_rows(agents: list[dict], depth: int = 0) -> str:
+                rows = []
+                for agent in agents:
+                    total = sum(
+                        (agent.get("tokens", {}).get(key) or 0)
+                        for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens")
+                    )
+                    indent = "<span class=\"subagent-indent\">↳ </span>" * depth
+                    rows.append(
+                        f'<tr><td>{indent}{esc(agent.get("name") or agent.get("id"))}</td><td>{fmt(total)}</td><td>{fmt_cost(agent.get("costUsd"))}</td></tr>'
+                    )
+                    nested = agent.get("subagents") if isinstance(agent.get("subagents"), list) else []
+                    rows.append(delegated_rows(nested, depth + 1))
+                return "".join(rows)
+
+            subagent_rows = delegated_rows(unlinked_subagents)
+            subagent_markup = f'<section class="subagents-section"><div class="section-heading"><div><span class="section-kicker">DELEGATED WORK</span><h2>Unlinked sub-agents</h2></div><span class="muted">These transcripts could not be matched to an invocation</span></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>Agent</th><th>Total tokens</th><th>Cost</th></tr></thead><tbody>{subagent_rows}</tbody></table></div></section>'
         session_expand_buttons = '<span class="session-expand-controls"><button type="button" class="invocation-count session-toggle" data-target="user">User</button><button type="button" class="invocation-count session-toggle" data-target="assistant">Assistant</button><button type="button" class="invocation-count session-toggle" data-target="invocations">Invocations</button><button type="button" class="invocation-count session-toggle" data-target="all">All</button></span>'
         close_explorer_url = refresh_conversation_url
         detail = f'''<main class="detail"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>{esc(PROVIDERS.get(provider, provider))}</div><h1>{esc(chosen["name"])}</h1>
-            <div class="header-chips"><span>{esc(session_tool(chosen_summary, provider))}</span><span>{esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span><span>Model: {esc(chosen.get("pricingModel") or chosen.get("model") or "Unavailable")}</span></div>
+            <div class="header-chips"><span>Surface: {esc(session_tool(chosen_summary, provider))}</span><span>Timestamp: {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span><span>Model: {esc(chosen.get("pricingModel") or chosen.get("model") or "Unavailable")}</span></div>
             </div><div class="detail-actions"><a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a><a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
             <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
             <button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form></div></header>
@@ -2124,10 +2246,32 @@ PAGE = PAGE.replace('</style>\n</head>', '''<style>
 .invocation-model small{color:#6f829d;font-size:7px;line-height:1;text-transform:uppercase;letter-spacing:.12em}
 .invocation-model b{overflow-wrap:anywhere;color:#c7d7ec;font-size:9px;line-height:1.35;letter-spacing:0}
 .invocation-content{gap:8px}
+.invocation-parent-note{border:1px solid #36597a;border-radius:8px;background:#122235;color:#9bb6d1;font-size:9px;overflow:hidden}
+.invocation-parent-note>summary{display:flex;align-items:center;gap:7px;padding:8px 10px;cursor:pointer;list-style:none}
+.invocation-parent-note>summary::-webkit-details-marker{display:none}
+.invocation-parent-note>summary>span{display:grid;place-items:center;width:16px;height:16px;border-radius:50%;background:#24527b;color:#d7edff;font-size:10px}
+.invocation-parent-note>summary>b{color:#c7e4fb;font-size:9px}
+.invocation-parent-note>summary>strong{margin-left:auto;color:#d6e8f8;font-size:9px}
+.invocation-parent-body{display:grid;gap:7px;padding:8px;border-top:1px solid #36597a;background:#0d1927}
+.invocation-parent-body>p{margin:0;color:#7890aa;font-size:9px}
+.invocation-total{display:grid;gap:7px;padding:8px;border:1px solid #34445b;border-radius:8px;background:#0e1622}
+.invocation-total-title{display:flex;align-items:center;gap:8px;color:#8799b0;font-size:8px;text-transform:uppercase;letter-spacing:.1em}
+.invocation-total-title>b{margin-left:auto;color:#b9cce1;font-size:8px;text-transform:none;letter-spacing:0}
+.invocation-response{display:grid;gap:5px;padding:9px 10px;border:1px solid #2b3850;border-radius:8px;background:#0d141f}
+.invocation-response>span{color:#71859e;font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.1em}
+.invocation-response>p{margin:0;color:#c6d3e3;font-size:10px;line-height:1.5;white-space:pre-wrap}
 .invocation-tools{gap:5px}
 .invocation-tool{border-color:#2b3850;background:#131d2b;box-shadow:0 2px 8px rgba(0,0,0,.12)}
 .invocation-tool>summary{min-height:31px;padding:7px 10px}
 .invocation-tool-body{background:#0d141f}
+.delegated-tool{border-color:#315b72;background:#11212b}
+.delegated-tool>summary{background:#142733}
+.delegated-agent{display:grid;gap:8px;padding:9px}
+.delegated-agent-heading{display:flex;align-items:center;gap:8px;color:#8fa4bc;font-size:9px}
+.delegated-agent-heading>span{text-transform:uppercase;letter-spacing:.1em}
+.delegated-agent-heading>b{padding:3px 6px;border:1px solid #315b72;border-radius:999px;color:#a9dcef;font-size:8px}
+.delegated-agent-heading>strong{margin-left:auto;color:#c6d8e7;font-size:9px}
+.delegated-agent .invocation-usage{margin:0}
 .invocation-usage{grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:7px}
 .invocation-metric-group{padding:7px;background:#0d141f}
 .invocation-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}

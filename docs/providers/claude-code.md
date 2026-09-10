@@ -62,6 +62,12 @@ with the `user` role remain part of the active turn and are not treated as new
 prompts. Explicit turn identifiers are preferred, with the user-record UUID or
 a generated identifier used as a fallback.
 
+Background-agent `<task-notification>` records also use the `user` role, but
+they are provider-generated completion events rather than human prompts. The
+viewer links their `<tool-use-id>` to the originating Agent tool, updates its
+result, and keeps the following assistant response as another invocation in
+the original logical turn.
+
 Each unique Claude assistant message ID becomes a numbered model invocation.
 Claude can persist the text and `tool_use` portions of one API response as
 separate records with the same message ID; the viewer combines those records

@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "model", "tracker", "llm", "slm", "session", "turn", "invocation"]
 license: "apache-2.0"
-version: v0.0.26
+version: v0.0.27
 ---
 
 # AI Tool Session Explorer
@@ -175,7 +175,7 @@ Every provider returns conversations using the same normalized fields:
 - `provider`, the provider (ai tool family)
 - `surface`, the harness (ai tool inteface)
 - `turns`, including user content, assistant content
-- `invocations`, including tools, commands, etc
+- `invocations`, including tools, commands, subagents, etc
 - `tokens`, containing:
 	- `inputTokens`
 	- `cacheReadTokens`

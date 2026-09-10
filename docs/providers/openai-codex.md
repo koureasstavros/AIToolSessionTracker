@@ -62,6 +62,14 @@ Codex function calls are grouped under their owning invocation:
 	the tool row.
 - Raw records remain attached to the logical turn.
 
+Spawned-agent rollouts are identified through
+`source.subagent.thread_spawn.parent_thread_id` and removed from the root
+session list when their parent rollout is available. A successful
+`spawn_agent` result supplies the child `agent_id`, which links the child
+rollout and its usage to that exact tool. Parent orchestration usage is shown
+separately, each child has its own expandable usage, and the invocation total
+combines the parent with all linked descendants.
+
 Metadata-only records such as initial queue/attachment records are not displayed as turns.
 
 ## Tokens
@@ -77,9 +85,12 @@ Usage is read primarily from `event_msg` records containing `token_count.info.la
 Each `token_count.info.last_token_usage` record supplies exact metrics for one
 invocation. Invocation metrics are grouped in the UI as **User / Input** and
 **Assistant / Output**, then summed into the logical turn and session totals.
-Token information is not attributed to individual tools because tool call and
-result records do not contain separate usage. Missing values are not inferred
-or copied; duplicating an invocation's usage across its tools would overcount totals.
+Token information is not attributed to ordinary tools because tool call and
+result records do not contain separate usage. A `spawn_agent` tool is the
+exception when its returned `agent_id` resolves to a separate child rollout;
+that rollout's independently reported usage is displayed under the tool.
+Missing values are not inferred or copied; duplicating an invocation's usage
+across its tools would overcount totals.
 
 ## Empty-session rule
 

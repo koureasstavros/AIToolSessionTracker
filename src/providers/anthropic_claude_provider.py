@@ -1,6 +1,7 @@
 """Anthropic Claude Code transcript discovery and parsing."""
 from pathlib import Path
 import json
+import re
 
 from src.common.source_archive import create_archive, inject_archive
 
@@ -112,21 +113,39 @@ def _parent_id(records: list[dict]) -> str | None:
 
 
 def _children_for(parent: Path, files: list[Path]) -> list[Path]:
-    """Find verified subagent siblings without treating every agent as global."""
+    """Find direct subagents for a transcript, including nested agent levels."""
+    child_directories = {parent.parent / parent.stem / "subagents"}
+    # Older Claude layouts stored the root's agents directly beside the root
+    # transcript. Keep accepting that form while using the transcript-specific
+    # directory for nested agents.
+    if parent.parent.name != "subagents":
+        child_directories.add(parent.parent / "subagents")
     children = []
     for path in files:
-        if not _is_subagent(path) or path.parent.parent != parent.parent:
+        if not _is_subagent(path) or path.parent not in child_directories:
             continue
         parent_id = _parent_id(_viewer().safe_json_lines(path))
         if parent_id and parent_id not in {parent.stem, parent.name}:
             continue
         children.append(path)
-    # A project directory with one root transcript is a safe fallback for
-    # agent files that omit parent metadata.
-    roots = [item for item in files if item.parent == parent.parent and not _is_subagent(item)]
-    if len(roots) == 1:
-        return [path for path in files if _is_subagent(path) and path.parent.parent == parent.parent]
     return children
+
+
+def _summary_with_children(path: Path, files: list[Path]) -> dict:
+    """Build a summary tree while preserving each agent's own transcript."""
+    summary = _viewer().session_summary(path, "claude", "external")
+    metadata_path = path.with_suffix(".meta.json")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        metadata = {}
+    if isinstance(metadata, dict):
+        summary["_agent_meta"] = metadata
+    summary["_children"] = [
+        _summary_with_children(child, files)
+        for child in _children_for(path, files)
+    ]
+    return summary
 
 
 def index(root: Path) -> list[dict]:
@@ -139,7 +158,7 @@ def index(root: Path) -> list[dict]:
             continue
         entry = viewer.session_summary(path, "claude", "external")
         children = _children_for(path, files)
-        entry["_children"] = [viewer.session_summary(child, "claude", "external") for child in children]
+        entry["_children"] = [_summary_with_children(child, files) for child in children]
         entries.append(entry)
     for entry in entries:
         entry["_has_data"] = _has_data(entry["_source"])
@@ -267,6 +286,26 @@ def details(summary: dict) -> dict:
 
         capture_attachment(current_turn, record)
 
+        task_notification = role == "user" and "<task-notification>" in content
+        if task_notification:
+            tool_id_match = re.search(r"<tool-use-id>(.*?)</tool-use-id>", content, re.DOTALL)
+            result_match = re.search(r"<result>(.*?)</result>", content, re.DOTALL)
+            tool_id = tool_id_match.group(1).strip() if tool_id_match else ""
+            reference = tool_calls.get(tool_id)
+            if reference is not None:
+                owner_turn, _, tool = reference
+                current_turn = owner_turn
+                serialized = json.dumps(record, indent=2, ensure_ascii=False)
+                if not owner_turn["raw"] or owner_turn["raw"][-1] != serialized:
+                    owner_turn["raw"].append(serialized)
+                tool["status"] = "completed"
+                if result_match:
+                    tool["result"] = result_match.group(1).strip()
+            elif current_turn is not None:
+                current_turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
+            previous_was_tool_result = True
+            continue
+
         if role == "user" and not is_tool_result:
             logical_id = str(turn_id or record.get("uuid") or f"turn-{len(turns) + 1}")
             current_turn = turns.setdefault(logical_id, viewer.new_turn(logical_id))
@@ -388,7 +427,15 @@ def details(summary: dict) -> dict:
             continue
         child = viewer.pricing.apply_costs(details(child_summary))
         child["relation"] = "subagent"
+        metadata = child_summary.get("_agent_meta") if isinstance(child_summary.get("_agent_meta"), dict) else {}
+        child["agentDescription"] = metadata.get("description") or child.get("name")
+        child["agentModel"] = metadata.get("model") or child.get("model")
+        child["spawnDepth"] = metadata.get("spawnDepth")
+        child["toolUseId"] = metadata.get("toolUseId")
         subagents.append(child)
+        reference = tool_calls.get(str(child["toolUseId"])) if child.get("toolUseId") else None
+        if reference is not None:
+            reference[2]["subagent"] = child
         for key in viewer.TOKEN_KEYS:
             value = child.get("tokens", {}).get(key)
             if isinstance(value, int):

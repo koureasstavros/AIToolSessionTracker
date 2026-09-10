@@ -4,6 +4,16 @@ from session_token_viewer import normalize_session_data, token_cards, token_warn
 
 
 class TokenWarningTests(unittest.TestCase):
+    def test_normalization_preserves_detected_surface(self) -> None:
+        session = normalize_session_data({
+            "id": "session",
+            "_surface": "Desktop",
+            "_source_label": "Desktop",
+        })
+
+        self.assertEqual(session["_surface"], "Desktop")
+        self.assertEqual(session["_source_label"], "Desktop")
+
     def test_turn_timestamp_reads_iso_and_millisecond_values(self) -> None:
         self.assertGreater(turn_timestamp({"raw": ['{"timestamp":"2026-09-10T12:00:00Z"}']}), 0)
         self.assertEqual(turn_timestamp({"timestamp": 1_000_000_000_000}), 1_000_000_000)
