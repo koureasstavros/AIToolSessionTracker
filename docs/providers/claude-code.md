@@ -41,6 +41,11 @@ Claude Code exposes **Delete** for local transcripts. The viewer exposes
 not treated as transcripts. This is a local file operation and does not delete
 ordinary cloud-backed Claude Chat history.
 
+Imported transcripts are written to `%USERPROFILE%\\.claude\\projects\\imported`.
+Existing filenames are preserved when possible; filename collisions receive a
+generated suffix. Imported archives are validated for provider ownership and
+path traversal before any file is written.
+
 ## Identity and metadata
 
 - **GUID / ID:** Prefer `sessionId`, `session_id`, `conversationId`, or `conversation_id`. Fall back to the filename stem.

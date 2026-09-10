@@ -14,7 +14,7 @@ import shutil
 import sqlite3
 from pathlib import Path
 
-from .source_archive import create_archive, inject_archive
+from src.common.source_archive import create_archive, inject_archive
 
 UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 USER_REQUEST_PATTERN = re.compile(r"<USER_REQUEST>\s*(.*?)\s*(?:</USER_REQUEST>|\Z)", re.DOTALL | re.IGNORECASE)

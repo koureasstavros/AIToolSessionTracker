@@ -26,6 +26,11 @@ rollout. The viewer exposes **Delete** and removes the selected JSONL rollout
 file. This only removes the local transcript; it does not affect any remote
 account data.
 
+Imported transcripts are written to `%USERPROFILE%\\.codex\\sessions\\imported`.
+Existing filenames are preserved when possible; filename collisions receive a
+generated suffix. Imported archives are validated for provider ownership and
+path traversal before any file is written.
+
 ## Identity and metadata
 
 - **GUID / ID:** Prefer `sessionId` or `session_id`. If the value contains a UUID, expose the UUID portion. Otherwise use the filename stem.

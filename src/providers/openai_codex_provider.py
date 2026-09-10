@@ -3,7 +3,7 @@ from pathlib import Path
 import json
 import re
 
-from .source_archive import create_archive, inject_archive
+from src.common.source_archive import create_archive, inject_archive
 
 UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 

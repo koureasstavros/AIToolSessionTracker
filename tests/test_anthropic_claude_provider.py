@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src import pricing
+from src.common import source_pricing as pricing
 from src.providers import anthropic_claude_provider
 
 

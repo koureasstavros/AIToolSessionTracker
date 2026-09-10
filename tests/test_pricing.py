@@ -1,6 +1,6 @@
 import unittest
 
-from src import pricing
+from src.common import source_pricing as pricing
 
 
 class PricingTests(unittest.TestCase):

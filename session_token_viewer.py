@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TypedDict
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
-from src import pricing
+from src.common import source_pricing as pricing
 from src.providers import anthropic_claude_provider
 from src.providers import github_copilot_provider
 from src.providers import google_antigravity_provider

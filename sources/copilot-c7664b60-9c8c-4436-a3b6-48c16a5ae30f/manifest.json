@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "provider": "copilot",
+  "files": [
+    {
+      "member": "sources/000000-c7664b60-9c8c-4436-a3b6-48c16a5ae30f.jsonl",
+      "target": "chatSessions/c7664b60-9c8c-4436-a3b6-48c16a5ae30f.jsonl",
+      "mtime": 0.7077742
+    }
+  ]
+}

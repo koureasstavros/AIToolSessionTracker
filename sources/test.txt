@@ -1,0 +1,2 @@
+This is a dummy file to include it into contect.
+Together with this file there would be agents, skills and instructions.

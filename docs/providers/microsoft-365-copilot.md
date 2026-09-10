@@ -16,6 +16,12 @@ delete the account conversation. For a local JSON/JSONL export, the viewer's
 **Delete** action removes the selected export file only. It does not change the
 conversation in Microsoft 365 or delete the cloud history.
 
+Imported transcripts are written to the `imported` subfolder of
+`M365_COPILOT_ROOT`, or to the default local export directory. Existing
+filenames are preserved when possible; filename collisions receive a generated
+suffix. Imported archives are validated for provider ownership and path
+traversal before any file is written.
+
 ## Identity and metadata
 
 - **GUID / ID:** Prefer `sessionId`, `session_id`, `conversationId`, or `conversation_id`. Fall back to the filename stem.

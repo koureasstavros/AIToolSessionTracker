@@ -18,6 +18,11 @@ The exact transcript path is retained as `_source` and displayed as the informat
 - **Import source files**: Injects an Antigravity ZIP archive into the configured destination under `imported/`, checking provider ownership and verifying path safety.
 - **Delete**: Removes the conversation directory from `brain/` and unlinks the matching conversation SQLite database in `conversations/`. Deletion is local and irreversible.
 
+Imported transcripts are written to the `imported` subfolder of
+`ANTIGRAVITY_ROOT`, or to `%USERPROFILE%\\.gemini\\antigravity-ide\\brain\\imported`
+by default. Existing filenames are preserved when possible; filename
+collisions receive a generated suffix.
+
 ## Identity and metadata
 
 - **GUID / ID:** Uses the conversation UUID folder name under `brain/` or the transcript filename stem.
@@ -45,7 +50,7 @@ Antigravity executes against Google backend APIs that stream conversation states
 - **Output tokens**: Model planner responses, tool arguments, and reasoning/thinking steps.
 - **Reasoning tokens**: Extracted directly from model `thinking` properties.
 
-Token counts are priced using Google Gemini model rates defined in `src/model_costs.json` (including Flash, Flash-Lite, and Pro variants from Gemini 2.5 through 3.8). In the timeline header, turns show the explanatory footnote `· token metrics estimated from transcript content`. In aggregate views (Statistics by Tool, Model, Project, Day, and Timeline), these estimates allow complete cross-provider comparison, cost tracking, and activity analysis.
+Token counts are priced using Google Gemini model rates defined in `src/common/model_costs.json` (including Flash, Flash-Lite, and Pro variants from Gemini 2.5 through 3.8). In the timeline header, turns show the explanatory footnote `· token metrics estimated from transcript content`. In aggregate views (Statistics by Tool, Model, Project, Day, and Timeline), these estimates allow complete cross-provider comparison, cost tracking, and activity analysis.
 
 ## Empty-session rule
 

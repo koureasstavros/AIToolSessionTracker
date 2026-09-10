@@ -2,7 +2,7 @@
 from pathlib import Path
 import json
 
-from .source_archive import create_archive, inject_archive
+from src.common.source_archive import create_archive, inject_archive
 
 
 def _viewer():

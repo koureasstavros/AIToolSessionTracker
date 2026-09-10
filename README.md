@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "model", "llm", "slm", "session", "tracker", "turn", "invocation"]
 license: "apache-2.0"
-version: v0.0.20
+version: v0.0.21
 ---
 
 # AI Tool Session Explorer
@@ -10,6 +10,21 @@ version: v0.0.20
 A local, read-only browser app for exploring AI coding-agent sessions, turns, content, raw events, and token usage.
 
 ![AI Tool Session Tracker](material/readme/ai_tool_session_tracker.png)
+
+The main explorer provides a unified view of local AI sessions, with provider
+selection, conversation navigation, and access to operational and statistical
+views.
+
+![AI Tool Session Tracker](material/readme/ai_tool_session_tracker_context.png)
+
+The context view presents the content associated with a selected turn or token
+category, making prompts, responses, tool activity, and other available context
+easy to inspect.
+
+![AI Tool Session Tracker](material/readme/ai_tool_session_tracker_invocations.png)
+
+The invocations view breaks a session into model interactions and shows their
+associated token usage, tool calls, results, and estimated costs.
 
 ## Run
 
@@ -21,30 +36,25 @@ python session_token_viewer.py
 
 The app opens at `http://127.0.0.1:8765`.
 
-See [Provider storage and viewer support matrix](docs/provider-storage-matrix.md)
-for the supported chat and code surfaces, storage locations, and local-read
-limitations.
-
-Sidebar entries show the conversation name when the provider supplies one; otherwise they show the conversation ID. Every entry also shows its source and last-updated timestamp.
-
-Each conversation also has a delete button. Deletion requires browser confirmation and removes the provider’s stored transcript or database records locally:
-
-- Copilot and Codex/Claude file-backed sessions: removes the related transcript file.
-- Copilot session-state folders: removes the session folder and its contents.
-- Copilot CLI database sessions: removes the session and related rows from `session-store.db`.
-
-Deletion cannot be undone by this application.
-
-When available, the session detail header shows the associated project directory between the session GUID and model information.
-
 Optional arguments:
 
 ```text
 python session_token_viewer.py --port 9000
-python session_token_viewer.py --root C:\path\to\copilot\session-state
 ```
 
+The app opens at `http://127.0.0.1:9000`.
+
 Stop the server with `Ctrl+C`.
+
+## Description
+
+Sidebar entries show the conversation name when the provider supplies one; otherwise they show the conversation ID. Every entry also shows its source and last-updated timestamp. When available, the session detail header shows the associated project directory between the session GUID and model information.
+
+The explorer provides two complementary views for reviewing local AI activity.
+The **Operational** view presents detailed session information, including turns,
+invocations, usage, costs, context, and other available metadata. The
+**Statistics** view summarizes activity across providers, with aggregated usage
+and cost information that can be grouped and explored at a higher level.
 
 ## Supported providers
 
@@ -56,12 +66,37 @@ documented separately:
 - [Anthropic Claude Code](docs/providers/claude-code.md)
 - [Google Antigravity](docs/providers/google-antigravity.md)
 - [Microsoft 365 Copilot](docs/providers/microsoft-365-copilot.md)
-- [Provider storage and viewer support matrix](docs/provider-storage-matrix.md)
 
 The viewer only reads local transcripts or user-provided exports. It does not
 download cloud-only chat history.
 
-## Import and export source files
+See [Provider storage and viewer support matrix](docs/provider-storage-matrix.md)
+for the supported chat and code surfaces, storage locations, and local-read
+limitations.
+
+## Supported features
+
+### Operational and Statistics views
+The application provides two complementary views for exploring local AI
+sessions:
+
+- **Operational view:** Inspect individual conversations in detail, including
+	turns, user and assistant content, model invocations, tool calls and results,
+	token usage, estimated costs, attached files, raw events, and available
+	project and model metadata.
+- **Statistics view:** Analyze aggregated activity across the supported
+	providers, including total sessions, token consumption, estimated cost, and
+	average usage. Results can be grouped by project, day, week, month, year,
+	provider, model, or timeline.
+
+### Session Expand and Collapse
+
+Expand and collapse controls help manage the amount of information displayed in
+long or complex sessions. Use them to inspect or hide conversation turns, model
+invocations, tool events, raw records, and content sections while keeping the
+session view organized.
+
+### Session Import and export
 
 The detail header provides **Export source files** for the selected conversation.
 The download is a ZIP containing the provider's original transcript files and a
@@ -69,21 +104,22 @@ manifest. Use **Import source files** in the provider sidebar to inject a ZIP
 back into local provider storage; existing filenames are preserved when
 possible, and collisions receive a generated suffix.
 
-Imports are provider-specific:
-
-- GitHub Copilot injects file-backed sessions into the configured workspace
-	storage root's `imported` folder. Copilot database rows are intentionally not
-	exported because a database copy cannot be safely merged into the live
-	session store.
-- OpenAI Codex injects transcripts into `~/.codex/sessions/imported`.
-- Anthropic Claude Code injects transcripts into `~/.claude/projects/imported`.
-- Google Antigravity injects transcripts into the `imported` subfolder of
-	`ANTIGRAVITY_ROOT` or `~/.gemini/antigravity-ide/brain/imported`.
-- Microsoft 365 Copilot injects transcripts into the `imported` subfolder of
-	`M365_COPILOT_ROOT` or its default local export directory.
+Import destinations are documented in the corresponding provider guides under
+[`docs/providers/`](docs/providers/).
 
 Archives are validated for provider ownership and path traversal before any
 file is written.
+
+### Session Delete
+Each conversation has a delete button for removing its locally stored transcript
+or database records. After browser confirmation, the operation applies only to
+the selected provider's local storage and does not modify cloud conversation
+history.
+
+Deletion behavior is provider-specific and documented in the corresponding
+provider guides under [`docs/providers/`](docs/providers/).
+
+Deletion cannot be undone by this application.
 
 ## Provider architecture
 
@@ -102,9 +138,9 @@ storage and transcript formats.
 
 Every provider returns conversations using the same normalized fields:
 
-- `id`, `name`, `updated`, and `model`
-- `project` and `source`
-- `provider`, source label, source kind, and provider storage metadata
+- `id`, `name`, `updated`, `model`, `project` and `source`
+- `provider`, the provider (ai tool family)
+- `surface`, the harness (ai tool inteface)
 - `turns`, including user content, assistant content, and raw records
 - `tokens`, containing:
 	- `inputTokens`
@@ -113,7 +149,7 @@ Every provider returns conversations using the same normalized fields:
 	- `outputTokens`
 	- `reasoningTokens`
 - `costUsd` at session, turn, and model-invocation levels when the extracted
-	model is present in [`src/model_costs.json`](src/model_costs.json).
+	model is present in [`src/common/model_costs.json`](src/common/model_costs.json).
 
 The main application normalizes provider results before passing them to the
 interface. Rendering therefore does not need to understand each provider's
@@ -151,16 +187,22 @@ the session directory, and Copilot CLI removes related database rows.
 
 The left-hand provider menu selects the data source. The session list then shows sessions for that provider.
 
-![AI Tool Session Tracker](material/readme/sessions_invocations.png)
-
 ### Interface
 
 - The left sidebar stays fixed while the main session details scroll independently.
 - The sidebar session list has its own styled vertical scrollbar and does not scroll horizontally.
-- Use the refresh button above the session list to rescan provider data.
+- The **Operational** view provides detailed session inspection; the
+	**Statistics** view provides aggregated usage analysis and navigation back to
+	the sessions behind each result.
+- Use the refresh button above the session list to rescan the selected
+	provider's local storage for newly created, modified, or removed sessions.
+- Use the session filter to quickly narrow the current provider's list by
+	conversation name, ID, source, or other visible session details.
 - Use **Show empty** or **Hide empty** beside refresh to control whether sessions without a meaningful turn appear. A session is non-empty when at least one turn has user input, assistant output, or a numeric token value (including zero). The preference is preserved while switching providers and inspecting token content.
 - The selected session header shows its GUID, associated project directory when available, model, and the exact transcript or database source path used to load it.
 - The main content area shows token totals, turn cards, and the **Content Explorer** side panel.
+- Expand and collapse controls help manage conversation turns, tool events,
+	raw records, and content sections when reviewing long sessions.
 - The layout adapts to smaller screens by returning to normal page scrolling.
 
 Each session contains one or more interactions. An interaction is grouped into a turn containing:
@@ -217,7 +259,7 @@ form.
 The adapters extract the public model identifier from transcript fields such as
 `model`, `modelId`, provider message metadata, and Copilot `modelMetrics` keys;
 deployment/display aliases are only used when no model identifier is available.
-Pricing is stored locally in `src/model_costs.json` as USD per one million
+Pricing is stored locally in `src/common/model_costs.json` as USD per one million
 tokens. The calculated cost uses uncached input, cache-read input,
 cache-write input, regular output, and output reasoning tokens. Reasoning tokens
 are included in output totals but are charged at the separate reasoning rate,

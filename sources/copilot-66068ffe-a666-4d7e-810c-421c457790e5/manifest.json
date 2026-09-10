@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "provider": "copilot",
+  "files": [
+    {
+      "member": "sources/000000-.workspace-fork.lock",
+      "target": "66068ffe-a666-4d7e-810c-421c457790e5/.workspace-fork.lock",
+      "mtime": 0.2843719
+    },
+    {
+      "member": "sources/000001-index.md",
+      "target": "66068ffe-a666-4d7e-810c-421c457790e5/checkpoints/index.md",
+      "mtime": 0.2833714
+    },
+    {
+      "member": "sources/000002-events.jsonl",
+      "target": "66068ffe-a666-4d7e-810c-421c457790e5/events.jsonl",
+      "mtime": 0.9174314
+    },
+    {
+      "member": "sources/000003-tracking.json",
+      "target": "66068ffe-a666-4d7e-810c-421c457790e5/rewind-file-snapshots/tracking.json",
+      "mtime": 0.2746344
+    },
+    {
+      "member": "sources/000004-workspace.yaml",
+      "target": "66068ffe-a666-4d7e-810c-421c457790e5/workspace.yaml",
+      "mtime": 0.9039886
+    }
+  ]
+}

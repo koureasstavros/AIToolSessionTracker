@@ -28,6 +28,12 @@ different operations in VS Code. The viewer exposes **Delete** only. It removes
 the selected JSONL transcript, removes the complete session-state folder, or
 deletes the CLI database session and its related rows.
 
+Imported file-backed sessions are written to the configured workspace storage
+root's `imported` folder. Copilot database rows are not exported because a
+database copy cannot be safely merged into the live session store. Imported
+archives are validated for provider ownership and path traversal before any
+file is written.
+
 ## Identity and metadata
 
 - **GUID / ID:** For VS Code JSONL, use the first record's `sessionId`; fall back to the filename stem. For CLI database records, use the database session ID.
