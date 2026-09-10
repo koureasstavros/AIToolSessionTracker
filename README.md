@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "model", "llm", "slm", "session", "tracker", "turn", "invocation"]
 license: "apache-2.0"
-version: v0.0.21
+version: v0.0.22
 ---
 
 # AI Tool Session Explorer
@@ -45,6 +45,20 @@ python session_token_viewer.py --port 9000
 The app opens at `http://127.0.0.1:9000`.
 
 Stop the server with `Ctrl+C`.
+
+## Windows executable
+
+Python is required only on the computer that builds the application. End users
+can run the packaged executable without installing Python.
+
+On Windows, double-click `packer\windows\build_windows_exe.bat`. The
+script installs PyInstaller into the active Python environment if necessary and
+creates `dist\AI-Tool-Session-Explorer.exe`. The executable starts the local
+viewer and opens it in the default browser.
+
+The build includes the model pricing data required by the application. The
+executable must still be run on Windows because it reads provider data from
+Windows-local application storage.
 
 ## Description
 
