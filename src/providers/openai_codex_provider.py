@@ -106,6 +106,7 @@ def details(summary: dict) -> dict:
     result["project"] = viewer.project_from_records(records)
     turns: dict[str, dict] = {}
     tool_calls: dict[str, tuple[dict, dict]] = {}
+    session_token_fields: set[str] = set()
     current_turn_id = ""
     current_invocation: dict | None = None
     session_context_blocks = viewer.context_instruction_blocks(records, "Codex")
@@ -179,6 +180,10 @@ def details(summary: dict) -> dict:
         info = payload.get("info") or {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or (info.get("last_token_usage") if isinstance(info, dict) else {})
         normalized_usage = viewer.usage_from(usage) if isinstance(usage, dict) else viewer.blank_tokens()
+        usage_fields = viewer.token_fields_from_sources(usage)
+        session_token_fields.update(usage_fields)
+        turn.setdefault("tokenFields", [])
+        turn["tokenFields"] = list(set(turn["tokenFields"]) | set(usage_fields))
         has_usage = any(value is not None for value in normalized_usage.values())
         creates_invocation = (
             payload_type in {"function_call", "function_call_output", "reasoning"}
@@ -186,6 +191,9 @@ def details(summary: dict) -> dict:
             or (payload_type == "token_count" and has_usage)
         )
         invocation = get_invocation(turn) if creates_invocation else None
+        if invocation is not None:
+            invocation.setdefault("tokenFields", [])
+            invocation["tokenFields"] = list(set(invocation["tokenFields"]) | set(usage_fields))
         if payload_type == "function_call":
             arguments = payload.get("arguments", payload.get("input", {}))
             tool = {
@@ -239,6 +247,7 @@ def details(summary: dict) -> dict:
     result["turns"] = list(turns.values())
     result["model"] = result["model"] or "codex"
     result["deployment"] = viewer.deployment_from_records(records)
+    result["tokenFields"] = [key for key in viewer.TOKEN_KEYS if key in session_token_fields]
     for key in viewer.TOKEN_KEYS:
         values = [turn["tokens"][key] for turn in result["turns"] if turn["tokens"][key] is not None]
         if values:

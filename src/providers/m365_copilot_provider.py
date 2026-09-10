@@ -101,6 +101,7 @@ def details(summary: dict) -> dict:
             if isinstance(value, int):
                 result["subagentTokens"][key] = (result["subagentTokens"][key] or 0) + value
                 result["tokens"][key] = (result["tokens"][key] or 0) + value
+        result["tokenFields"] = sorted(set(result.get("tokenFields", [])) | set(child.get("tokenFields", [])))
     result["source"] = str(summary.get("_source", ""))
     return result
 

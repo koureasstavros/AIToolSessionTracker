@@ -154,6 +154,7 @@ def _read_session_state(folder: Path) -> dict:
             if session["turns"][0]["tokens"][key] is None:
                 session["turns"][0]["tokens"][key] = session["tokens"][key]
     elif session["turns"]:
+        session.setdefault("tokenFlags", []).append("estimated")
         weights = [max(turn["tokens"]["outputTokens"] or 0, 1) for turn in session["turns"]]
         total_weight = sum(weights)
         for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens"):
@@ -188,6 +189,7 @@ def _read_chat(path: Path) -> dict:
         session["project"] = viewer.workspace_project_path(path.parent.parent)
     requests = [dict(item) for item in metadata.get("requests", []) if isinstance(item, dict)]
     context_blocks = viewer.context_instruction_blocks(records, "Copilot")
+    session_token_fields: set[str] = set()
     positions = {item.get("requestId"): index for index, item in enumerate(requests) if item.get("requestId")}
     for record in records:
         if record.get("k") == ["customTitle"]:
@@ -221,6 +223,9 @@ def _read_chat(path: Path) -> dict:
             turn["assistant"] = [str(item["value"]) for item in response if isinstance(item, dict) and item.get("value")]
         result = request.get("result") if isinstance(request.get("result"), dict) else {}
         metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        request_token_fields = viewer.token_fields_from_sources(request, metadata)
+        turn["tokenFields"] = request_token_fields
+        session_token_fields.update(request_token_fields)
         for instruction_key in ("renderedGlobalContext", "renderedSystemMessage", "internalInstructions", "toolInstructions"):
             value = metadata.get(instruction_key) or request.get(instruction_key)
             if isinstance(value, list):
@@ -272,6 +277,7 @@ def _read_chat(path: Path) -> dict:
                 invocation = {
                     "index": round_index,
                     "tokens": viewer.blank_tokens(),
+                    "tokenFields": viewer.token_fields_from_sources(metadata),
                     "tools": [],
                     "assistant": [str(round_data["response"])] if round_data.get("response") else [],
                 }
@@ -315,6 +321,7 @@ def _read_chat(path: Path) -> dict:
                 turn["invocations"] = [{
                     "index": 1,
                     "tokens": viewer.blank_tokens(),
+                    "tokenFields": list(turn.get("tokenFields", [])),
                     "tools": turn["tools"],
                     "assistant": list(turn["assistant"]),
                 }]
@@ -323,6 +330,7 @@ def _read_chat(path: Path) -> dict:
             session["tokens"][key] = (session["tokens"][key] or 0) + (turn["tokens"][key] or 0)
     session["model"] = str(next((request.get("modelId") for request in requests if request.get("modelId")), "model unavailable"))
     session["deployment"] = viewer.deployment_from_records(records)
+    session["tokenFields"] = [key for key in viewer.TOKEN_KEYS if key in session_token_fields]
     return session
 
 

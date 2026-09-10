@@ -1,8 +1,8 @@
 ---
 language: ["en"]
-tags: ["ai", "tool", "model", "llm", "slm", "session", "tracker", "turn", "invocation"]
+tags: ["ai", "tool", "model", "tracker", "llm", "slm", "session", "turn", "invocation"]
 license: "apache-2.0"
-version: v0.0.25
+version: v0.0.26
 ---
 
 # AI Tool Session Explorer
@@ -174,7 +174,8 @@ Every provider returns conversations using the same normalized fields:
 - `id`, `name`, `updated`, `model`, `project` and `source`
 - `provider`, the provider (ai tool family)
 - `surface`, the harness (ai tool inteface)
-- `turns`, including user content, assistant content, and raw records
+- `turns`, including user content, assistant content
+- `invocations`, including tools, commands, etc
 - `tokens`, containing:
 	- `inputTokens`
 	- `cacheReadTokens`
@@ -182,7 +183,8 @@ Every provider returns conversations using the same normalized fields:
 	- `outputTokens`
 	- `reasoningTokens`
 - `costUsd` at session, turn, and model-invocation levels when the extracted
-	model is present in [`src/common/model_costs.json`](src/common/model_costs.json).
+	model is present in [`src/common/model_costs.json`](src/common/model_costs.json)
+- `raw`, raw event records
 
 The main application normalizes provider results before passing them to the
 interface. Rendering therefore does not need to understand each provider's

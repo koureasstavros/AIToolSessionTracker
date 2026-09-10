@@ -283,6 +283,7 @@ def details(summary: dict) -> dict:
     model, project = _detect_model_and_project(conv_id, conv_dir, records)
 
     result = viewer.new_session(conv_id, summary.get("name") or conv_id, updated, model=model, project=project)
+    result["tokenFlags"] = ["estimated"]
 
     turns: list[dict] = []
     current_turn: dict | None = None
@@ -465,6 +466,7 @@ def details(summary: dict) -> dict:
             inv["tokens"]["cacheWriteTokens"] = 0
             inv["tokens"]["outputTokens"] = output_tokens
             inv["tokens"]["reasoningTokens"] = reasoning_tokens
+            inv["tokenFields"] = list(viewer.TOKEN_KEYS)
 
             for k in viewer.TOKEN_KEYS:
                 turn["tokens"][k] = (turn["tokens"][k] or 0) + (inv["tokens"][k] or 0)
@@ -476,6 +478,7 @@ def details(summary: dict) -> dict:
             turn["tokens"]["cacheWriteTokens"] = 0
             turn["tokens"]["outputTokens"] = _estimate_tokens(ast_text)
             turn["tokens"]["reasoningTokens"] = 0
+            turn["tokenFields"] = list(viewer.TOKEN_KEYS)
 
     for key in viewer.TOKEN_KEYS:
         vals = [turn["tokens"][key] for turn in turns if turn["tokens"][key] is not None]
@@ -485,6 +488,7 @@ def details(summary: dict) -> dict:
     result["turns"] = turns
     result["source"] = str(summary.get("_source", ""))
     result["ownTokens"] = dict(result["tokens"])
+    result["tokenFields"] = list(viewer.TOKEN_KEYS)
     result["subagents"] = []
     result["subagentTokens"] = viewer.blank_tokens()
 

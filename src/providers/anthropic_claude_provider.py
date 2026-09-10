@@ -190,6 +190,7 @@ def details(summary: dict) -> dict:
     tool_calls: dict[str, tuple[dict, dict, dict]] = {}
     message_invocations: dict[str, tuple[dict, dict]] = {}
     seen_usage_records: set[str] = set()
+    session_token_fields: set[str] = set()
     current_turn: dict | None = None
     previous_was_tool_result = False
     pending_instructions: list[tuple[str, str]] = []
@@ -339,6 +340,13 @@ def details(summary: dict) -> dict:
         info = payload.get("info") or {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or (info.get("last_token_usage") if isinstance(info, dict) else {})
         if isinstance(usage, dict):
+            usage_fields = viewer.token_fields_from_sources(usage)
+            session_token_fields.update(usage_fields)
+            turn.setdefault("tokenFields", [])
+            turn["tokenFields"] = list(set(turn["tokenFields"]) | set(usage_fields))
+            if invocation is not None:
+                invocation.setdefault("tokenFields", [])
+                invocation["tokenFields"] = list(set(invocation["tokenFields"]) | set(usage_fields))
             # Claude Code can persist one assistant API response as multiple
             # records: for example, a text record followed by a tool_use
             # record. Both records carry the same message ID and usage. Count
@@ -366,6 +374,7 @@ def details(summary: dict) -> dict:
     result["turns"] = list(turns.values())
     result["model"] = viewer.model_from_records(records) or result["model"] or "claude"
     result["deployment"] = viewer.deployment_from_records(records)
+    result["tokenFields"] = [key for key in viewer.TOKEN_KEYS if key in session_token_fields]
     for key in viewer.TOKEN_KEYS:
         values = [turn["tokens"][key] for turn in result["turns"] if turn["tokens"][key] is not None]
         if values:

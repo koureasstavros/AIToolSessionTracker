@@ -153,7 +153,7 @@ TOKEN_ALIASES = {
     "cacheReadTokens": ("cached_tokens", "cachedTokens", "input_cached_tokens", "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"),
     "cacheWriteTokens": ("cache_write_input_tokens", "input_cache_write_tokens", "cache_creation_input_tokens", "cacheWriteTokens"),
     "outputTokens": ("output_tokens", "completion_tokens", "outputTokens"),
-    "reasoningTokens": ("reasoning_output_tokens", "reasoning_tokens", "reasoningTokens"),
+    "reasoningTokens": ("reasoning_output_tokens", "reasoning_tokens", "thinking_tokens", "thinkingTokens", "reasoningTokens"),
 }
 class SessionData(TypedDict, total=False):
     """Provider-neutral conversation contract returned to the UI layer."""
@@ -171,12 +171,15 @@ class SessionData(TypedDict, total=False):
     _kind: str
     _source_label: str
     provider: str
+    tokenFlags: list[str]
+    tokenFields: list[str]
 
 
 def normalize_session_data(value: dict) -> SessionData:
     """Ensure every provider returns the same conversation shape."""
     tokens = blank_tokens()
     supplied_tokens = value.get("tokens")
+    supplied_token_keys = set(supplied_tokens) if isinstance(supplied_tokens, dict) else set()
     if isinstance(supplied_tokens, dict):
         for key in TOKEN_KEYS:
             candidate = supplied_tokens.get(key)
@@ -194,15 +197,59 @@ def normalize_session_data(value: dict) -> SessionData:
     }
     result["costUsd"] = value.get("costUsd") if isinstance(value.get("costUsd"), (int, float)) else None
     result["pricingModel"] = value.get("pricingModel") if isinstance(value.get("pricingModel"), str) else None
+    provider = value.get("provider") if isinstance(value.get("provider"), str) else ""
+    flags = [flag for flag in value.get("tokenFlags", []) if flag in {"estimated", "uncategorized", "uncategorizedInput", "uncategorizedOutput"}] if isinstance(value.get("tokenFlags"), list) else []
+    has_supplied_fields = isinstance(value.get("tokenFields"), list)
+    supplied_fields = set(value.get("tokenFields", [])) if has_supplied_fields else set()
+    if has_supplied_fields:
+        missing_fields = any(key not in supplied_fields for key in TOKEN_KEYS)
+    else:
+        missing_fields = not isinstance(supplied_tokens, dict) or any(key not in supplied_token_keys for key in TOKEN_KEYS)
+    if missing_fields:
+        missing_input = any(key not in supplied_fields for key in TOKEN_KEYS[:3]) if has_supplied_fields else True
+        missing_output = any(key not in supplied_fields for key in TOKEN_KEYS[3:]) if has_supplied_fields else True
+        if missing_input and "uncategorizedInput" not in flags:
+            flags.append("uncategorizedInput")
+        if missing_output and "uncategorizedOutput" not in flags:
+            flags.append("uncategorizedOutput")
+    result["tokenFlags"] = flags
+    result["tokenFields"] = [key for key in TOKEN_KEYS if key in supplied_fields] if has_supplied_fields else list(TOKEN_KEYS if isinstance(supplied_tokens, dict) else [])
     for key in ("source", "_source", "_sources", "_kind", "_source_label", "_session_id", "_db_metadata", "_db_issue", "_has_data", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation"):
         if key in value:
             result[key] = value[key]
     for turn in result["turns"]:
-        if not isinstance(turn, dict) or not isinstance(turn.get("invocations"), list):
+        if not isinstance(turn, dict):
+            continue
+        turn_flags = turn.get("tokenFlags") if isinstance(turn.get("tokenFlags"), list) else []
+        turn["tokenFlags"] = [flag for flag in turn_flags if flag in {"estimated", "uncategorized", "uncategorizedInput", "uncategorizedOutput"}]
+        turn_token_source = turn.get("tokens") if isinstance(turn.get("tokens"), dict) else {}
+        has_turn_fields = isinstance(turn.get("tokenFields"), list)
+        turn_fields = set(turn.get("tokenFields", [])) if has_turn_fields else set()
+        turn_missing = any(key not in turn_fields for key in TOKEN_KEYS) if has_turn_fields else ("tokens" not in turn or any(key not in turn_token_source for key in TOKEN_KEYS))
+        if turn_missing:
+            turn_fields = turn_fields if has_turn_fields else set()
+            if any(key not in turn_fields for key in TOKEN_KEYS[:3]) and "uncategorizedInput" not in turn["tokenFlags"]:
+                turn["tokenFlags"].append("uncategorizedInput")
+            if any(key not in turn_fields for key in TOKEN_KEYS[3:]) and "uncategorizedOutput" not in turn["tokenFlags"]:
+                turn["tokenFlags"].append("uncategorizedOutput")
+        if "estimated" in flags and "estimated" not in turn["tokenFlags"]:
+            turn["tokenFlags"].append("estimated")
+        if not isinstance(turn.get("invocations"), list):
             continue
         for invocation in turn["invocations"]:
             if isinstance(invocation, dict):
                 invocation["isSubagent"] = is_subagent_invocation(invocation)
+                invocation["tokenFlags"] = [flag for flag in turn["tokenFlags"] if flag in {"estimated", "uncategorizedInput", "uncategorizedOutput", "uncategorized"}]
+                invocation_token_source = invocation.get("tokens") if isinstance(invocation.get("tokens"), dict) else {}
+                has_invocation_fields = isinstance(invocation.get("tokenFields"), list)
+                invocation_fields = set(invocation.get("tokenFields", [])) if has_invocation_fields else set()
+                invocation_missing = any(key not in invocation_fields for key in TOKEN_KEYS) if has_invocation_fields else ("tokens" not in invocation or any(key not in invocation_token_source for key in TOKEN_KEYS))
+                if invocation_missing:
+                    invocation_fields = invocation_fields if has_invocation_fields else set()
+                    if any(key not in invocation_fields for key in TOKEN_KEYS[:3]) and "uncategorizedInput" not in invocation["tokenFlags"]:
+                        invocation["tokenFlags"].append("uncategorizedInput")
+                    if any(key not in invocation_fields for key in TOKEN_KEYS[3:]) and "uncategorizedOutput" not in invocation["tokenFlags"]:
+                        invocation["tokenFlags"].append("uncategorizedOutput")
     return result
 
 
@@ -433,8 +480,11 @@ def usage_from(source: object) -> dict[str, int | None]:
     if isinstance(cache_creation, dict) and "cache_creation_input_tokens" not in normalized:
         normalized["cache_creation_input_tokens"] = cache_creation.get("input_tokens")
     output_details = source.get("output_tokens_details")
-    if isinstance(output_details, dict) and "reasoning_tokens" not in normalized:
-        normalized["reasoning_tokens"] = output_details.get("reasoning_tokens")
+    if isinstance(output_details, dict) and not any(alias in normalized for alias in TOKEN_ALIASES["reasoningTokens"]):
+        for alias in TOKEN_ALIASES["reasoningTokens"]:
+            if alias in output_details:
+                normalized[alias] = output_details[alias]
+                break
     result = blank_tokens()
     for key, aliases in TOKEN_ALIASES.items():
         result[key] = next(
@@ -442,6 +492,17 @@ def usage_from(source: object) -> dict[str, int | None]:
             None,
         )
     return result
+
+
+def token_fields_from_sources(*sources: object) -> list[str]:
+    """Return canonical token categories whose source fields are present."""
+    fields = []
+    dictionaries = [source for source in sources if isinstance(source, dict)]
+    for key, aliases in TOKEN_ALIASES.items():
+        nested = [source.get("output_tokens_details") for source in dictionaries if isinstance(source.get("output_tokens_details"), dict)]
+        if any(alias in source for source in dictionaries for alias in aliases) or any(alias in source for source in nested for alias in aliases):
+            fields.append(key)
+    return fields
 
 
 def safe_json_lines(path: Path) -> list[dict]:
@@ -1015,6 +1076,9 @@ def parse_export_session(path: Path, provider: str) -> dict:
             info = {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or info.get("last_token_usage") or {}
         if isinstance(usage, dict):
+            usage_fields = token_fields_from_sources(usage)
+            turn.setdefault("tokenFields", [])
+            turn["tokenFields"] = list(set(turn["tokenFields"]) | set(usage_fields))
             # Claude Code may persist one assistant API response as separate
             # text and tool_use records. They share a message ID and usage,
             # so count the usage only once.
@@ -1032,6 +1096,7 @@ def parse_export_session(path: Path, provider: str) -> dict:
     model = model_from_records(records)
     session["deployment"] = deployment_from_records(records)
     session["model"] = model or provider
+    session["tokenFields"] = sorted({field for turn in session["turns"] for field in turn.get("tokenFields", [])})
     for key in TOKEN_KEYS:
         values = [turn["tokens"][key] for turn in session["turns"] if turn["tokens"][key] is not None]
         if values:
@@ -1087,7 +1152,9 @@ def load_session_index(root: Path, provider: str, show_empty: bool = False) -> l
 
 def load_session_details(summary: dict, provider: str) -> dict:
     """Load one full transcript through its provider adapter."""
-    return pricing.apply_costs(normalize_session_data(PROVIDER_ADAPTERS[provider].details(summary)))
+    details = PROVIDER_ADAPTERS[provider].details(summary)
+    details["provider"] = provider
+    return pricing.apply_costs(normalize_session_data(details))
 
 
 def delete_session(summary: dict) -> None:
@@ -1141,6 +1208,33 @@ def format_timestamp(value: float) -> str:
     return datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M")
 
 
+def turn_timestamp(turn: dict, fallback: float = 0) -> float:
+    """Resolve the earliest persisted timestamp associated with a turn."""
+    candidates = [turn.get(key) for key in ("timestamp", "createdAt", "created_at", "updated")]
+    for raw in turn.get("raw", []) if isinstance(turn.get("raw"), list) else []:
+        try:
+            record = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(record, dict):
+            candidates.extend(record.get(key) for key in ("timestamp", "createdAt", "created_at", "startTime", "ts", "time"))
+            for nested_key in ("data", "payload", "message"):
+                nested = record.get(nested_key)
+                if isinstance(nested, dict):
+                    candidates.extend(nested.get(key) for key in ("timestamp", "createdAt", "created_at", "startTime", "ts", "time"))
+            if any(candidate is not None for candidate in candidates):
+                break
+    for value in candidates:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value / 1000 if value > 100_000_000_000 else float(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+    return fallback
+
+
 def display_model_name(model: object) -> str:
     """Show the public model name instead of a provider deployment path."""
     price = pricing.find_model(model)
@@ -1151,20 +1245,39 @@ def esc(value: object, quote: bool = True) -> str:
     return html.escape(str(value), quote=quote)
 
 
-def token_cards(tokens: dict[str, int | None], model: str | None = None, extra_class: str = "", costs: dict[str, float] | None = None) -> str:
+def token_warning(flags: list[str] | None, key: str | None = None) -> str:
+    """Describe why a token-derived price should be treated cautiously."""
+    flags = set(flags or [])
+    messages = []
+    if "estimated" in flags:
+        messages.append("Token counts are estimated from transcript content; price is approximate.")
+    if "uncategorized" in flags or (key is None and ("uncategorizedInput" in flags or "uncategorizedOutput" in flags)) or (key in TOKEN_KEYS[:3] and "uncategorizedInput" in flags) or (key in TOKEN_KEYS[3:] and "uncategorizedOutput" in flags):
+        group = "input" if key in TOKEN_KEYS[:3] else "output" if key in TOKEN_KEYS[3:] else "token"
+        messages.append(f"Price is not accurate because some {group} token categories are missing from the provider data.")
+    return " ".join(messages)
+
+
+def token_warning_markup(flags: list[str] | None, key: str | None = None) -> str:
+    warning = token_warning(flags, key)
+    if not warning:
+        return ""
+    return f'<span class="token-warning" title="{esc(warning, quote=True)}" aria-label="{esc(warning, quote=True)}">⚠</span>'
+
+
+def token_cards(tokens: dict[str, int | None], model: str | None = None, extra_class: str = "", costs: dict[str, float] | None = None, token_flags: list[str] | None = None) -> str:
     costs = costs if costs is not None else pricing.cost_breakdown(tokens, model)
     return "".join(
-        f'<div class="metric {extra_class}" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
+        f'<div class="metric {extra_class}" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}{token_warning_markup(token_flags, key)}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
         for key in TOKEN_KEYS
     )
 
 
-def invocation_token_cards(tokens: dict[str, int | None], model: str | None = None) -> str:
+def invocation_token_cards(tokens: dict[str, int | None], model: str | None = None, token_flags: list[str] | None = None) -> str:
     """Render per-invocation usage grouped by the side of the model exchange."""
     costs = pricing.cost_breakdown(tokens, model)
     def cards(keys: tuple[str, ...]) -> str:
         return "".join(
-            f'<div class="metric compact" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
+            f'<div class="metric compact" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}{token_warning_markup(token_flags, key)}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
             for key in keys
         )
 
@@ -1178,7 +1291,7 @@ def invocation_token_cards(tokens: dict[str, int | None], model: str | None = No
     )
 
 
-def turn_token_cards(tokens: dict[str, int | None], model: str | None, session_id: str, provider: str, turn_index: int, selected_turn: int | None, selected_metric: str | None, show_empty: bool = False) -> str:
+def turn_token_cards(tokens: dict[str, int | None], model: str | None, session_id: str, provider: str, turn_index: int, selected_turn: int | None, selected_metric: str | None, show_empty: bool = False, token_flags: list[str] | None = None) -> str:
     costs = pricing.cost_breakdown(tokens, model)
     cards = []
     for key in TOKEN_KEYS:
@@ -1192,7 +1305,7 @@ def turn_token_cards(tokens: dict[str, int | None], model: str | None, session_i
         }), quote=True)
         cards.append(
             f'<a class="metric compact clickable {"active" if active else ""}" data-metric="{esc(key)}" href="{href}">'
-            f'<span>{esc(TOKEN_LABELS[key])}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></a>'
+            f'<span>{esc(TOKEN_LABELS[key])}{token_warning_markup(token_flags, key)}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></a>'
         )
     return "".join(cards)
 
@@ -1495,7 +1608,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 invocation_markup = '<details class="turn-invocations"><summary><span><span class="invocation-icon" aria-hidden="true">I</span> Invocations</span><span class="summary-count">' + str(len(invocations)) + '</span></summary><div class="invocations-list">' + "".join(
                     f'<div class="turn-invocation"><div class="invocation-name"><span><i></i>Invocation {esc(invocation.get("index", invocation_index))}</span>'
                     f'{" <span class=\"turn-kind\">Usage summary</span>" if invocation.get("kind") == "usage_summary" else ""}'
-                    f'<span class="invocation-model"><small>Model</small><b>{esc(display_model_name(invocation.get("model") or turn.get("model") or chosen.get("model")))}</b></span></div><div class="invocation-content">{invocation_tools(invocation)}{invocation_token_cards(invocation.get("tokens", {}), invocation.get("model") or turn.get("model") or chosen.get("model"))}</div></div>'
+                    f'<span class="invocation-model"><small>Model</small><b>{esc(display_model_name(invocation.get("model") or turn.get("model") or chosen.get("model")))}</b></span></div><div class="invocation-content">{invocation_tools(invocation)}{invocation_token_cards(invocation.get("tokens", {}), invocation.get("model") or turn.get("model") or chosen.get("model"), invocation.get("tokenFlags") or turn.get("tokenFlags") or chosen.get("tokenFlags"))}</div></div>'
                     for invocation_index, invocation in enumerate(invocations, 1) if isinstance(invocation, dict)
                 ) + '</div></details>'
             invocation_label = f'{len(invocations)} {"invocation" if len(invocations) == 1 else "invocations"}'
@@ -1503,13 +1616,14 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             turn_token_total = sum(turn.get("tokens", {}).get(key) or 0 for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens"))
             turn_model = turn.get("model") or chosen.get("model")
             turn_model_label = display_model_name(turn_model)
-            turn_total_badges = f'<span class="invocation-count">Model {esc(turn_model_label)}</span><span class="invocation-count">Invocations {len(invocations)}</span><span class="invocation-count">Tools {len(tools)}</span><span class="invocation-count">Tokens {fmt_unit(turn_token_total)}</span><span class="invocation-count">Cost {fmt_cost(turn.get("costUsd"))}</span>'
+            turn_time_label = format_timestamp(turn_timestamp(turn, chosen.get("updated", 0)))
+            turn_total_badges = f'<span class="invocation-count">Time {esc(turn_time_label)}</span><span class="invocation-count">Model {esc(turn_model_label)}</span><span class="invocation-count">Invocations {len(invocations)}</span><span class="invocation-count">Tools {len(tools)}</span><span class="invocation-count">Tokens {fmt_unit(turn_token_total)}</span><span class="invocation-count">Cost {fmt_cost(turn.get("costUsd"))}</span>'
             turns += f'''<article class="turn" id="turn-{index}"><header><div class="turn-number"><span>{index:02d}</span><div><b>Turn {esc(turn_label)}</b><small>Turn activity</small></div></div><div class="turn-badges">{turn_total_badges}{kind_label}</div></header>
                 <details class="message user turn-message user-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">U</span><label>User</label></summary><p>{esc(turn["user"] or "(no user message)")}</p>{files_markup}</details>
                 <details class="message assistant turn-message assistant-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">AI</span><label>Assistant</label></summary><p>{esc(assistant)}</p></details>
                 {tool_markup}
                 {invocation_markup}
-                <div class="turn-footer"><div class="turn-metrics">{turn_token_cards(turn["tokens"], turn_model, chosen["id"], provider, index, selected_turn, selected_metric, show_empty)}</div>
+                <div class="turn-footer"><div class="turn-metrics">{turn_token_cards(turn["tokens"], turn_model, chosen["id"], provider, index, selected_turn, selected_metric, show_empty, turn.get("tokenFlags") or chosen.get("tokenFlags"))}</div>
                 <a class="show-raw clickable" href="{raw_url}"><span aria-hidden="true">&lt;/&gt;</span>View raw event data <span class="raw-arrow" aria-hidden="true">→</span></a></div></article>'''
     all_statistics_sessions = [
         (provider_key, summary)
@@ -1559,7 +1673,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             <section class="session-facts"><div><span>Session ID</span><code>{esc(chosen["id"])}</code><button type="button" class="copy-value" data-copy="{esc(chosen["id"], quote=True)}">Copy</button></div><div><span>Project</span><code>{esc(chosen.get("project") or "Unavailable")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("project") or "Unavailable", quote=True)}">Copy</button></div><div><span>Source</span><code>{esc(chosen.get("source") or "Unknown")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("source") or "Unknown", quote=True)}">Copy</button></div></section>
             {token_accounting_note(provider, len(chosen["turns"]))}
             {f'<div class="provider-note"><b>Provider note</b>{esc(chosen["_db_issue"])}</div>' if chosen.get("_db_issue") else ""}
-            <section class="overview"><div class="section-heading"><div><span class="section-kicker">OVERVIEW</span><h2>Session usage</h2>{session_expand_buttons}</div><div class="overview-stats"><span><b>{len(chosen["turns"])}</b> turns</span><span><b>{invocation_total}</b> invocations</span><span><b>{tool_total}</b> tools</span><span><b>{fmt_unit(token_total)}</b> tokens</span><span><b>{fmt_cost(chosen.get("costUsd"))}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/turn</span><span><b>{fmt_cost(average_cost)}</b> avg cost/turn</span></div></div><div class="metrics">{token_cards(chosen["tokens"], chosen.get("pricingModel") or chosen.get("model"), costs=overview_costs)}</div></section>{subagent_markup}
+            <section class="overview"><div class="section-heading"><div><span class="section-kicker">OVERVIEW</span><h2>Session usage</h2>{session_expand_buttons}</div><div class="overview-stats"><span><b>{len(chosen["turns"])}</b> turns</span><span><b>{invocation_total}</b> invocations</span><span><b>{tool_total}</b> tools</span><span><b>{fmt_unit(token_total)}</b> tokens</span><span><b>{fmt_cost(chosen.get("costUsd"))}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/turn</span><span><b>{fmt_cost(average_cost)}</b> avg cost/turn</span></div></div><div class="metrics">{token_cards(chosen["tokens"], chosen.get("pricingModel") or chosen.get("model"), costs=overview_costs, token_flags=chosen.get("tokenFlags"))}</div></section>{subagent_markup}
             <section class="conversation"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Conversation turns</h2></div><span class="muted">{len(chosen["turns"])} turns{esc(turn_note)}</span></div>
             <div class="content-layout"><div class="turns">{turns or '<div class="empty"><b>No turns yet</b><span>No conversation events were found for this session.</span></div>'}</div>
             <aside class="explorer {"is-active" if selected_turn else ""}"><div class="explorer-header"><div><span class="section-kicker">INSPECTOR</span><h2>{esc(explorer_title)}</h2></div><a href="{close_explorer_url}" class="explorer-close" aria-label="Close inspector">×</a></div><div class="explorer-body">{f'<p>{esc(explorer_text)}</p>' if explorer_text else ''}{explorer_raw if explorer_raw and selected_raw else ''}</div></aside></div></section></main>'''
@@ -1936,7 +2050,7 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
 .session-list{flex:1;min-height:0;overflow:auto;padding:0 10px 18px;scrollbar-width:thin;scrollbar-color:#344056 transparent}.empty-search{margin:24px 10px;padding:20px;border:1px dashed var(--line-strong);border-radius:10px;color:#6f7f95;text-align:center;font-size:11px}.session-row{position:relative;display:flex;align-items:center;margin:2px 0}.session{display:flex;align-items:flex-start;gap:10px;min-width:0;flex:1;padding:10px 34px 10px 10px;border:1px solid transparent;border-radius:11px;color:#b9c4d3;text-decoration:none}.session:hover{background:#131a26}.session.selected{border-color:#293750;background:linear-gradient(100deg,#182235,#131a27);color:#fff}.session-glyph{display:grid;place-items:center;width:27px;height:27px;flex:none;border:1px solid #29354a;border-radius:8px;background:#171f2e;color:#8396b2;font-size:10px;font-weight:800}.session.selected .session-glyph{border-color:#5362ad;background:#2a335b;color:#cdd3ff}.session-copy{min-width:0;flex:1}.session b{display:block;overflow:hidden;color:inherit;font-size:12px;font-weight:650;line-height:1.35;text-overflow:ellipsis;white-space:nowrap}.session small{display:block;overflow:hidden;margin-top:3px;color:#647389;font:9px/1.3 ui-monospace,monospace;text-overflow:ellipsis;white-space:nowrap}.session .session-meta{color:#73829a;font-family:inherit}.session-row form{position:absolute;right:8px;top:9px}.delete-session{display:grid;place-items:center;width:25px;height:25px;padding:0;border:0;border-radius:7px;background:transparent;color:#56657a;cursor:pointer;font-size:16px;opacity:0}.session-row:hover .delete-session,.delete-session:focus{opacity:1}.delete-session:hover{background:#331923;color:var(--danger)}
 .detail{width:calc(100% - var(--sidebar));min-height:100vh;margin-left:var(--sidebar);padding:42px clamp(24px,4vw,64px) 90px}.detail-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;max-width:1500px;margin:auto}.heading-copy{min-width:0}.eyebrow{display:flex;align-items:center;gap:7px;color:#8c9bb0;font-size:10px;font-weight:750;letter-spacing:.13em;text-transform:uppercase}.eyebrow>span{width:6px;height:6px;border-radius:50%;background:var(--accent-2);box-shadow:0 0 0 4px rgba(87,212,178,.09)}h1{max-width:900px;margin:8px 0 11px;font-size:clamp(25px,3vw,39px);font-weight:720;letter-spacing:-.035em;line-height:1.08;overflow-wrap:anywhere}.header-chips{display:flex;flex-wrap:wrap;gap:6px}.header-chips span{padding:5px 8px;border:1px solid var(--line);border-radius:7px;background:rgba(18,24,35,.7);color:#8090a6;font-size:10px}.detail-actions{display:flex;gap:7px}.icon-button{display:grid;place-items:center;width:34px;height:34px;padding:0;border:1px solid var(--line-strong);border-radius:9px;background:var(--surface-2);color:#a9b5c7;text-decoration:none;cursor:pointer}.icon-button:hover{background:var(--surface-3);color:#fff}.icon-button.danger:hover{border-color:#713243;background:#351721;color:var(--danger)}.detail-refresh{width:34px;height:34px;padding:0}
 .session-facts{display:grid;grid-template-columns:minmax(160px,.7fr) minmax(220px,1fr) minmax(220px,1.3fr);max-width:1500px;margin:27px auto 0;border:1px solid var(--line);border-radius:12px;background:rgba(13,18,27,.72);overflow:hidden}.session-facts>div{min-width:0;padding:11px 14px;border-right:1px solid var(--line)}.session-facts>div:last-child{border:0}.session-facts span{display:block;margin-bottom:4px;color:#59687d;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.session-facts code{display:block;overflow:hidden;color:#8595aa;font:10px ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.token-accounting-note{display:flex;align-items:flex-start;gap:13px;max-width:1500px;margin:14px auto 0;padding:15px 17px;border:1px solid #3f4c8c;border-radius:12px;background:linear-gradient(105deg,rgba(38,43,83,.9),rgba(24,31,53,.86));box-shadow:0 8px 24px rgba(26,35,82,.16);color:#b9c5e4}.token-accounting-icon{display:grid;place-items:center;width:28px;height:28px;flex:none;border:1px solid #6976c1;border-radius:8px;background:#303866;color:#d9ddff;font-size:15px;font-weight:800}.token-accounting-note .section-kicker{margin-bottom:4px;color:#93a2e8}.token-accounting-note h2{margin:0 0 6px;color:#edf0ff;font-size:13px;font-weight:700;letter-spacing:0}.token-accounting-note p{max-width:1000px;margin:0;color:#aeb9d5;font-size:11px;line-height:1.6}.provider-note{max-width:1500px;margin:10px auto 0;padding:10px 13px;border:1px solid #39452e;border-radius:9px;background:#171d13;color:#aeb99e;font-size:11px}.provider-note b{margin-right:8px;color:#c9d3ba}
-.overview,.conversation{max-width:1500px;margin:38px auto 0}.section-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:13px}.section-kicker{display:block;margin-bottom:4px;color:#5f7088;font-size:9px;font-weight:800;letter-spacing:.16em}.section-heading h2,.explorer-header h2{margin:0;font-size:16px;font-weight:680;letter-spacing:-.01em}.overview-stats{display:flex;align-items:center;gap:8px}.overview-stats span{padding:6px 9px;border:1px solid var(--line);border-radius:8px;color:#6f7e92;font-size:10px}.overview-stats b{color:#cbd4e1;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.metric{position:relative;display:flex;min-width:0;min-height:70px;flex-direction:column;align-items:center;justify-content:center;padding:14px 15px;border:1px solid var(--line);border-radius:11px;background:linear-gradient(145deg,#121925,#0f151f);text-align:center;overflow:hidden}.metric:before{content:"";position:absolute;inset:auto 0 0;height:2px;background:#6676d8;opacity:.5}.metric[data-metric="cacheReadTokens"]:before{background:#42b8c4}.metric[data-metric="cacheWriteTokens"]:before{background:#b985e5}.metric[data-metric="outputTokens"]:before{background:#54c99f}.metric[data-metric="reasoningTokens"]:before{background:#e4a35f}.metric span{display:block;width:100%;overflow:hidden;color:#697a91;font-size:9px;font-weight:700;letter-spacing:.06em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.metric strong{display:block;margin-top:8px;color:#e9eef7;font:600 19px/1 ui-monospace,SFMono-Regular,Consolas,monospace}.metric.compact{min-height:52px;padding:9px 10px;border-radius:8px;text-decoration:none}.metric.compact strong{margin-top:5px;font-size:12px}.metric.clickable{transition:transform .15s,border-color .15s,background .15s}.metric.clickable:hover{transform:translateY(-1px);border-color:#42516a;background:#182131}.metric.clickable.active{border-color:#6878db;background:#202843;box-shadow:0 0 0 2px rgba(104,120,219,.11)}
+.overview,.conversation{max-width:1500px;margin:38px auto 0}.section-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:13px}.section-kicker{display:block;margin-bottom:4px;color:#5f7088;font-size:9px;font-weight:800;letter-spacing:.16em}.section-heading h2,.explorer-header h2{margin:0;font-size:16px;font-weight:680;letter-spacing:-.01em}.overview-stats{display:flex;align-items:center;gap:8px}.overview-stats span{padding:6px 9px;border:1px solid var(--line);border-radius:8px;color:#6f7e92;font-size:10px}.overview-stats b{color:#cbd4e1;font-weight:700}.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.metric{position:relative;display:flex;min-width:0;min-height:70px;flex-direction:column;align-items:center;justify-content:center;padding:14px 15px;border:1px solid var(--line);border-radius:11px;background:linear-gradient(145deg,#121925,#0f151f);text-align:center;overflow:hidden}.metric:before{content:"";position:absolute;inset:auto 0 0;height:2px;background:#6676d8;opacity:.5}.metric[data-metric="cacheReadTokens"]:before{background:#42b8c4}.metric[data-metric="cacheWriteTokens"]:before{background:#b985e5}.metric[data-metric="outputTokens"]:before{background:#54c99f}.metric[data-metric="reasoningTokens"]:before{background:#e4a35f}.metric span{display:block;width:100%;overflow:hidden;color:#697a91;font-size:9px;font-weight:700;letter-spacing:.06em;text-overflow:ellipsis;text-transform:uppercase;white-space:nowrap}.token-warning{display:inline-block!important;width:auto!important;margin-left:5px;color:#f4c84e!important;font-size:12px!important;line-height:1;vertical-align:-1px;cursor:help}.metric strong{display:block;margin-top:8px;color:#e9eef7;font:600 19px/1 ui-monospace,SFMono-Regular,Consolas,monospace}.metric.compact{min-height:52px;padding:9px 10px;border-radius:8px;text-decoration:none}.metric.compact strong{margin-top:5px;font-size:12px}.metric.clickable{transition:transform .15s,border-color .15s,background .15s}.metric.clickable:hover{transform:translateY(-1px);border-color:#42516a;background:#182131}.metric.clickable.active{border-color:#6878db;background:#202843;box-shadow:0 0 0 2px rgba(104,120,219,.11)}
 .muted{color:#687990;font-size:10px}.content-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,340px);align-items:start;gap:14px}.turns{display:grid;gap:12px;min-width:0}.turn{min-width:0;border:1px solid var(--line);border-radius:var(--radius);background:rgba(14,19,29,.82);box-shadow:0 12px 36px rgba(0,0,0,.08);overflow:hidden}.turn>header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line);background:#111722}.turn-number{display:flex;align-items:center;gap:10px}.turn-number>span{display:grid;place-items:center;width:29px;height:29px;border:1px solid #2c3950;border-radius:8px;background:#182131;color:#8191aa;font:10px ui-monospace,monospace}.turn-number b{display:block;font-size:12px}.turn-number small{display:block;margin-top:2px;color:#5f6e83;font-size:9px}.turn-badges{display:flex;gap:5px}.step-count,.turn-kind,.summary-count{padding:4px 7px;border:1px solid #34425a;border-radius:999px;background:#1a2332;color:#8fa0b8;font-size:8px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}.message{display:grid;grid-template-columns:72px minmax(0,1fr);gap:10px;padding:14px 16px;border-bottom:1px solid rgba(32,42,58,.7)}.message.assistant{background:rgba(15,23,34,.6)}.role{display:flex;align-items:center;gap:7px;height:24px}.role>span{display:grid;place-items:center;width:22px;height:22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800}.assistant .role>span{background:#15372f;color:#8ee4c9}.message label{color:#7f8ea4;font-size:9px;font-weight:750;text-transform:uppercase}.message p{min-width:0;margin:2px 0 0;color:#b9c5d5;font:11px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;white-space:pre-wrap}.message.user p{color:#d8e0eb}.message.tool{display:block;background:#101722}.message.tool label{display:block;margin-bottom:4px}.message.tool code{display:inline-block;max-width:100%;margin-top:5px;color:#8ba0ba;white-space:pre-wrap;overflow-wrap:anywhere}
 .turn-steps{margin:12px 14px;border:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-steps>summary{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-steps summary::-webkit-details-marker{display:none}.steps-list{padding:0 12px 6px}.turn-step{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-top:1px solid #1b2432}.step-name{display:flex;align-items:center;gap:7px;width:90px;flex:none;padding-top:8px;color:#8292a8;font-size:9px}.step-name i{width:5px;height:5px;border-radius:50%;background:#5869cb}.step-content{display:grid;min-width:0;flex:1;gap:8px}.step-tools{display:grid;grid-template-columns:minmax(0,1fr);gap:6px}.step-tool{width:100%;min-width:0;border:1px solid #263247;border-radius:7px;background:#111925;overflow:hidden}.step-tool>summary{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;cursor:pointer;list-style:none}.tool-name{min-width:0;overflow:hidden;color:#aebcd0;font:9px ui-monospace,SFMono-Regular,Consolas,monospace;text-overflow:ellipsis;white-space:nowrap}.tool-status{padding:2px 5px;border-radius:999px;background:#252e3d;color:#8392a7;font-size:7px;font-weight:750;text-transform:uppercase}.tool-status.completed{background:#15352d;color:#7ed7bc}.tool-status.failed{background:#3a1c25;color:#ff91a0}.step-tool-body{padding:8px 9px;border-top:1px solid #263247;color:#75869d;font-size:9px}.tool-payload+ .tool-payload{margin-top:8px}.tool-payload b{display:block;margin-bottom:4px;color:#788ba4;font-size:8px;letter-spacing:.06em;text-transform:uppercase}.tool-payload pre{max-height:180px;margin:0;padding:7px;border-radius:6px;background:#090e16;color:#9cacbf;font:8px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}.step-no-tools{padding:6px 8px;border:1px dashed #263247;border-radius:7px;color:#64758a;font-size:9px}.step-usage{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:6px}.step-metric-group{min-width:0;padding:7px;border:1px solid #202a3a;border-radius:8px;background:#0d131d}.step-group-title{display:flex;align-items:center;gap:6px;margin:0 2px 6px;color:#74849b;font-size:8px;font-weight:750;letter-spacing:.06em;text-transform:uppercase}.step-group-title span{display:grid;place-items:center;width:16px;height:16px;border-radius:5px;background:#272d50;color:#bec6ff;font-size:6px}.output-group .step-group-title span{background:#15372f;color:#8ee4c9}.step-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;min-width:0}.output-group .step-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.step-metrics .metric{padding:6px 7px;background:#0f1621}.step-metrics .metric span{font-size:7px}.step-metrics .metric strong{margin-top:4px;font-size:9px}.turn-footer{padding:10px 14px 14px}.turn-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}.show-raw{display:flex;align-items:center;justify-content:center;gap:8px;min-height:34px;margin-top:9px;padding:8px 12px;border:1px solid #2d3b53;border-radius:8px;background:#131b28;color:#a9b7ca;text-decoration:none;font-size:10px;font-weight:650;letter-spacing:.01em}.show-raw>span:first-child{color:#8292ff;font:9px ui-monospace,monospace}.show-raw .raw-arrow{margin-left:2px;color:#71829a;font:12px system-ui,sans-serif;transition:transform .15s}.show-raw:hover{border-color:#5262b1;background:#1c2540;color:#fff}.show-raw:hover .raw-arrow{transform:translateX(2px);color:#aeb7ff}
 .turn-invocations{margin:12px 14px;border:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-invocations>summary{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-invocations summary::-webkit-details-marker{display:none}.invocations-list{padding:0 12px 6px}.turn-invocation{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-top:1px solid #1b2432}.invocation-name{display:flex;align-items:center;gap:7px;width:90px;flex:none;padding-top:8px;color:#8292a8;font-size:9px}.invocation-name i{width:5px;height:5px;border-radius:50%;background:#5869cb}.invocation-content{display:grid;min-width:0;flex:1;gap:8px}.invocation-tools{display:grid;grid-template-columns:minmax(0,1fr);gap:6px}.invocation-tool{width:100%;min-width:0;border:1px solid #263247;border-radius:7px;background:#111925;overflow:hidden}.invocation-tool>summary{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;cursor:pointer;list-style:none}.invocation-tool-body{padding:8px 9px;border-top:1px solid #263247;color:#75869d;font-size:9px}.invocation-no-tools{padding:6px 8px;border:1px dashed #263247;border-radius:7px;color:#64758a;font-size:9px}.invocation-usage{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:6px}.invocation-metric-group{min-width:0;padding:7px;border:1px solid #202a3a;border-radius:8px;background:#0d131d}.invocation-group-title{display:flex;align-items:center;gap:6px;margin:0 2px 6px;color:#74849b;font-size:8px;font-weight:750;letter-spacing:.06em;text-transform:uppercase}.invocation-group-title span{display:grid;place-items:center;width:16px;height:16px;border-radius:5px;background:#272d50;color:#bec6ff;font-size:6px}.output-group .invocation-group-title span{background:#15372f;color:#8ee4c9}.invocation-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;min-width:0}.output-group .invocation-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.invocation-metrics .metric{padding:6px 7px;background:#0f1621}.invocation-metrics .metric span{font-size:7px}.invocation-metrics .metric strong{margin-top:4px;font-size:9px}.invocation-count{padding:4px 7px;border:1px solid #34425a;border-radius:999px;background:#1a2332;color:#8fa0b8;font-size:8px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}.explorer{position:sticky;top:20px;display:flex;min-width:0;max-height:calc(100vh - 40px);flex-direction:column;border:1px solid var(--line);border-radius:var(--radius);background:#0c111a;box-shadow:var(--shadow);overflow:hidden}.explorer-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px;border-bottom:1px solid var(--line);background:#111722}.explorer-close{display:grid;place-items:center;width:25px;height:25px;border-radius:7px;color:#617086;text-decoration:none;font-size:16px}.explorer-close:hover{background:#20293a;color:#fff}.explorer-body{min-height:170px;padding:14px;overflow:auto;scrollbar-width:thin;scrollbar-color:#344056 transparent}.explorer-body p,.explorer-body pre{margin:0;color:#9eacbf;font:10px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;white-space:pre-wrap}.explorer-body pre{color:#aab8cb}.empty{display:flex;flex-direction:column;align-items:center;padding:50px;border:1px dashed var(--line-strong);border-radius:var(--radius);color:#6f8098;text-align:center}.empty b{color:#b6c1d1}.empty span{margin-top:5px;font-size:11px}.no-sessions{display:grid;place-items:center}.empty-hero{max-width:500px;text-align:center}.hero-icon{display:grid;place-items:center;width:54px;height:54px;margin:0 auto 18px;border:1px solid #303c52;border-radius:17px;background:linear-gradient(145deg,#192235,#101620);color:#94a3ff;font-size:23px;box-shadow:var(--shadow)}.empty-hero h1{margin:7px auto 10px}.empty-hero p{margin:0;color:#7989a0;font-size:13px;line-height:1.6}
