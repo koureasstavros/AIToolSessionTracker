@@ -98,4 +98,7 @@ def apply_costs(session: dict) -> dict:
         session["pricingModel"] = next(iter(pricing_models))
     else:
         session["pricingModel"] = "Mixed"
+    for subagent in session.get("subagents", []) if isinstance(session.get("subagents"), list) else []:
+        if isinstance(subagent, dict):
+            apply_costs(subagent)
     return session

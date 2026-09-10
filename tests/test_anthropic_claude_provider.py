@@ -108,13 +108,14 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
             usage = {"input_tokens": 1, "output_tokens": 2}
             for path, session_id in ((child, "root"), (grandchild, "root")):
                 path.write_text("\n".join([
+                    json.dumps({"type": "attachment", "attachment": {"type": "prompt_snapshot", "systemPrompt": ["Child-only context"]}}),
                     json.dumps({"sessionId": session_id, "type": "user", "message": {"role": "user", "content": "Work"}}),
-                    json.dumps({"sessionId": session_id, "type": "assistant", "message": {"id": path.stem, "role": "assistant", "content": "Done", "usage": usage}}),
+                    json.dumps({"sessionId": session_id, "type": "assistant", "message": {"id": path.stem, "model": "claude-sonnet-5", "role": "assistant", "content": "Done", "usage": usage}}),
                 ]) + "\n", encoding="utf-8")
             child.with_suffix(".meta.json").write_text(json.dumps({
                 "description": "Review delegated work",
                 "toolUseId": "tool-child",
-                "model": "haiku",
+                "model": "claude-sonnet-5",
                 "spawnDepth": 1,
             }), encoding="utf-8")
 
@@ -128,6 +129,13 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         linked_agent = session["turns"][0]["invocations"][0]["tools"][0]["subagent"]
         self.assertEqual(linked_agent["agentDescription"], "Review delegated work")
         self.assertEqual(linked_agent["ownTokens"]["outputTokens"], 2)
+        self.assertEqual(
+            linked_agent["turns"][0]["internalInstructions"][0]["name"],
+            "Claude prompt_snapshot",
+        )
+        self.assertIn("Child-only context", linked_agent["turns"][0]["internalInstructions"][0]["content"])
+        self.assertIsNotNone(linked_agent["costUsd"])
+        self.assertNotIn("internalInstructions", session["turns"][0])
         totals, _, agent_count = session_token_viewer.invocation_rollup(
             session["turns"][0]["invocations"][0]
         )

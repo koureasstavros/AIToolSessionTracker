@@ -8,6 +8,48 @@ from src.providers import openai_codex_provider
 
 
 class CodexInvocationGroupingTests(unittest.TestCase):
+    def test_internal_user_records_do_not_replace_original_prompt(self) -> None:
+        turn_id = "turn-1"
+        records = [
+            {"type": "session_meta", "payload": {"id": "session-1"}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
+            {"type": "response_item", "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "<recommended_plugins>generated context</recommended_plugins>"}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+            }},
+            {"type": "response_item", "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Original human prompt"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "content_item_kinds": ["user.text"],
+                },
+            }},
+            {"type": "response_item", "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "<subagent_notification>generated result</subagent_notification>"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "content_item_kinds": ["multi_agent.subagent_notification"],
+                },
+            }},
+            {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": turn_id}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session-1.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+            session = openai_codex_provider.details({"_source": path})
+
+        self.assertEqual(session["turns"][0]["user"], "Original human prompt")
+        self.assertEqual(
+            [item["name"] for item in session["turns"][0]["internalInstructions"]],
+            ["Codex recommended plugins"],
+        )
+
     def test_source_is_identified_from_originator(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -90,6 +132,7 @@ class CodexInvocationGroupingTests(unittest.TestCase):
         child_records = [
             {"type": "session_meta", "payload": {"id": child_id, "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent_id, "depth": 1, "agent_nickname": "Worker"}}}}},
             {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "child-turn"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "developer", "content": "Child-only instructions", "internal_chat_message_metadata_passthrough": {"turn_id": "child-turn"}}},
             {"type": "response_item", "payload": {"type": "message", "role": "user", "content": "Do work"}},
             {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 50, "cached_input_tokens": 20, "cache_write_input_tokens": 20, "output_tokens": 5}}}},
             {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "child-turn"}},
@@ -111,6 +154,11 @@ class CodexInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(len(session["subagents"]), 1)
         tool = session["turns"][0]["invocations"][0]["tools"][0]
         self.assertEqual(tool["subagent"]["agentDescription"], "Worker")
+        self.assertEqual(
+            tool["subagent"]["turns"][0]["internalInstructions"][0],
+            {"name": "Codex developer instructions", "content": "Child-only instructions"},
+        )
+        self.assertNotIn("internalInstructions", session["turns"][0])
         self.assertEqual(tool["subagent"]["tokens"]["inputTokens"], 10)
         self.assertEqual(tool["subagent"]["tokens"]["outputTokens"], 5)
 

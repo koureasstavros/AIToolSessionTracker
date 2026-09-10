@@ -48,7 +48,7 @@ def _read_session_state(folder: Path) -> dict:
         if record.get("type") == "system.message":
             data = record.get("data") if isinstance(record.get("data"), dict) else {}
             content = data.get("content")
-            if isinstance(content, str) and content.strip():
+            if not data.get("interactionId") and isinstance(content, str) and content.strip():
                 internal_context.append(("Copilot system instructions", content))
         elif record.get("type") == "session.start":
             data = record.get("data") if isinstance(record.get("data"), dict) else {}
@@ -93,6 +93,14 @@ def _read_session_state(folder: Path) -> dict:
             turn["raw"].append(json.dumps(event, indent=2, ensure_ascii=False))
         if event_type == "session.start":
             session["model"] = data.get("model") or data.get("modelId") or data.get("selectedModel")
+        elif event_type == "system.message":
+            content = data.get("content")
+            if interaction_id and isinstance(content, str) and content.strip():
+                viewer.add_internal_instruction(
+                    get_turn(interaction_id),
+                    "Copilot system instructions",
+                    content,
+                )
         elif event_type == "assistant.turn_start":
             interaction_id = interaction_id or turn_id
             turn_interactions[turn_id] = interaction_id

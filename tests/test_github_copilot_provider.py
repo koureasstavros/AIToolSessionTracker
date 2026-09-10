@@ -155,11 +155,13 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
         prompt = "Return one delegated result"
         records = [
             {"type": "user.message", "data": {"interactionId": parent_interaction, "content": "Delegate work"}},
+            {"type": "system.message", "data": {"interactionId": parent_interaction, "content": "Parent-only instructions"}},
             {"type": "assistant.turn_start", "data": {"interactionId": parent_interaction, "turnId": "0"}},
             {"type": "assistant.message", "data": {"interactionId": parent_interaction, "turnId": "0", "content": "Delegating"}},
             {"type": "tool.execution_start", "data": {"turnId": "0", "toolCallId": tool_call_id, "toolName": "task", "arguments": {"name": "Worker", "description": "Do work", "prompt": prompt}}},
             {"type": "subagent.started", "data": {"toolCallId": tool_call_id, "agentDisplayName": "Worker", "agentDescription": "Do work", "model": "gpt-test"}},
             {"type": "user.message", "data": {"interactionId": child_interaction, "content": prompt}},
+            {"type": "system.message", "data": {"interactionId": child_interaction, "content": "Child-only instructions"}},
             {"type": "assistant.turn_start", "data": {"interactionId": child_interaction, "turnId": "0"}},
             {"type": "assistant.message", "data": {"interactionId": child_interaction, "turnId": "0", "content": "Child result"}},
             {"type": "subagent.completed", "data": {"toolCallId": tool_call_id, "agentDisplayName": "Worker", "totalTokens": 30}},
@@ -182,9 +184,9 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
                 db.execute("CREATE TABLE assistant_usage_events (id INTEGER PRIMARY KEY, session_id TEXT, turn_index INTEGER, agent_id TEXT, parent_tool_call_id TEXT, model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, initiator TEXT, created_at TEXT)")
                 db.execute("INSERT INTO sessions VALUES (?, ?, ?)", ("session-1", "Delegation", "2026-09-10T00:00:00Z"))
                 rows = [
-                    (1, "session-1", 0, None, None, "gpt-test", 20, 4, 0, 18, 1, "user", "2026-09-10T00:00:01Z"),
-                    (2, "session-1", 0, "agent-1", tool_call_id, "gpt-test", 30, 5, 20, 7, 2, "sub-agent", "2026-09-10T00:00:02Z"),
-                    (3, "session-1", 0, None, None, "gpt-test", 25, 3, 18, 5, 0, "agent", "2026-09-10T00:00:03Z"),
+                    (1, "session-1", 0, None, None, "gpt-5.6-luna", 20, 4, 0, 18, 1, "user", "2026-09-10T00:00:01Z"),
+                    (2, "session-1", 0, "agent-1", tool_call_id, "gpt-5.6-luna", 30, 5, 20, 7, 2, "sub-agent", "2026-09-10T00:00:02Z"),
+                    (3, "session-1", 0, None, None, "gpt-5.6-luna", 25, 3, 18, 5, 0, "agent", "2026-09-10T00:00:03Z"),
                 ]
                 db.executemany("INSERT INTO assistant_usage_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
                 db.commit()
@@ -208,6 +210,15 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(tool["subagent"]["name"], "Worker")
         self.assertEqual(tool["subagent"]["tokens"]["inputTokens"], 3)
         self.assertEqual(tool["subagent"]["tokens"]["outputTokens"], 5)
+        self.assertEqual(
+            session["turns"][0]["internalInstructions"][0]["content"],
+            "Parent-only instructions",
+        )
+        self.assertEqual(
+            tool["subagent"]["turns"][0]["internalInstructions"][0]["content"],
+            "Child-only instructions",
+        )
+        self.assertIsNotNone(tool["subagent"]["costUsd"])
         self.assertEqual(
             session["turns"][0]["invocations"][1]["assistant"],
             ["Complete"],

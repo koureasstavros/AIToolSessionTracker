@@ -88,6 +88,37 @@ def _subagent_metadata(records: list[dict]) -> dict:
     return {}
 
 
+def _is_internal_user_message(payload: dict, content: object) -> bool:
+    """Return whether a user-role record is generated Codex context."""
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if isinstance(metadata, dict):
+        kinds = metadata.get("content_item_kinds")
+        if isinstance(kinds, list) and any(
+            str(kind).startswith("multi_agent.") for kind in kinds
+        ):
+            return True
+    text = str(content).lstrip().lower()
+    return text.startswith((
+        "<subagent_notification>",
+        "<recommended_plugins>",
+        "<available_plugins>",
+        "<available_skills>",
+        "# agents.md instructions for ",
+    ))
+
+
+def _internal_user_message_name(content: object) -> str | None:
+    """Name generated user-role context that should remain inspectable."""
+    text = str(content).lstrip().lower()
+    labels = (
+        ("<recommended_plugins>", "Codex recommended plugins"),
+        ("<available_plugins>", "Codex available plugins"),
+        ("<available_skills>", "Codex available skills"),
+        ("# agents.md instructions for ", "Codex AGENTS.md instructions"),
+    )
+    return next((label for prefix, label in labels if text.startswith(prefix)), None)
+
+
 def index(root: Path) -> list[dict]:
     viewer = _viewer()
     location = Path.home() / ".codex" / "sessions"
@@ -193,8 +224,9 @@ def details(summary: dict) -> dict:
             continue
         call_id = str(payload.get("call_id") or payload.get("callId") or "")
         role = payload.get("role") or message.get("role") or item.get("role")
+        content = payload.get("content") or message.get("content") or item.get("content") or payload.get("text") or item.get("text")
         relevant = (
-            role in {"user", "assistant", "model"}
+            role in {"user", "assistant", "model", "developer", "system"}
             or payload_type in {"function_call", "function_call_output", "token_count", "reasoning", "task_started", "task_complete"}
             or event_type == "turn_context"
         )
@@ -243,12 +275,19 @@ def details(summary: dict) -> dict:
                     invocation["tools"].append(tool)
             tool["status"] = "completed"
             tool["result"] = payload.get("output", payload.get("result", ""))
-        content = payload.get("content") or message.get("content") or item.get("content") or payload.get("text") or item.get("text")
         if isinstance(content, list):
             content = "\n".join(str(part.get("text", part)) if isinstance(part, dict) else str(part) for part in content)
         if content and role == "user":
-            turn["user"] = str(content)
-            viewer.add_attached_files(turn, viewer.mentioned_files(content))
+            internal = _is_internal_user_message(payload, content)
+            instruction_name = _internal_user_message_name(content)
+            if instruction_name:
+                viewer.add_internal_instruction(turn, instruction_name, content)
+            elif not internal and not turn["user"]:
+                turn["user"] = str(content)
+                viewer.add_attached_files(turn, viewer.mentioned_files(content))
+        elif content and role in {"developer", "system"}:
+            label = "Codex developer instructions" if role == "developer" else "Codex system instructions"
+            viewer.add_internal_instruction(turn, label, content)
         elif content and role in {"assistant", "model"}:
             turn["assistant"].append(str(content))
             if invocation is not None:

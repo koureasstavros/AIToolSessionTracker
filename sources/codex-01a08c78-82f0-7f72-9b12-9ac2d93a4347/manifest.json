@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "provider": "codex",
+  "files": [
+    {
+      "member": "sources/000000-rollout-2026-09-10T20-58-23-01a08c78-82f0-7f72-9b12-9ac2d93a4347.jsonl",
+      "target": "rollout-2026-09-10T20-58-23-01a08c78-82f0-7f72-9b12-9ac2d93a4347.jsonl",
+      "mtime": 1789063104.8710742
+    },
+    {
+      "member": "sources/000001-rollout-2026-09-10T20-58-36-01a08c78-b5cd-7b81-8250-4a6433a74ecd.jsonl",
+      "target": "subagents/rollout-2026-09-10T20-58-36-01a08c78-b5cd-7b81-8250-4a6433a74ecd.jsonl",
+      "mtime": 1789063116.6441395
+    },
+    {
+      "member": "sources/000002-rollout-2026-09-10T20-58-45-01a08c78-d747-70b3-9979-bd0db3fe8191.jsonl",
+      "target": "subagents/rollout-2026-09-10T20-58-45-01a08c78-d747-70b3-9979-bd0db3fe8191.jsonl",
+      "mtime": 1789063125.2205224
+    },
+    {
+      "member": "sources/000003-rollout-2026-09-10T20-58-50-01a08c78-ec60-7152-8673-885b6d85d758.jsonl",
+      "target": "subagents/rollout-2026-09-10T20-58-50-01a08c78-ec60-7152-8673-885b6d85d758.jsonl",
+      "mtime": 1789063130.6277688
+    }
+  ]
+}

@@ -326,7 +326,8 @@ def clean_session_prompt(text: str) -> str:
         "<command-name>", "<command-message>", "<command-args>",
         "<skill>", "skill launch:", "launching skill:",
         "<recommended_plugins>", "<available_plugins>", "<available_skills>",
-        "<workspace_info>", "<instructions>",
+        "<workspace_info>", "<instructions>", "<subagent_notification>",
+        "# agents.md instructions for ",
     )
     if lowered.startswith(skipped_prefixes):
         return ""
@@ -616,14 +617,15 @@ def add_internal_instruction(turn: dict, name: str, content: object) -> None:
     if not isinstance(content, str) or not content.strip():
         return
     instructions = turn.setdefault("internalInstructions", [])
-    key = (name, content)
+    normalized_content = content.strip()
+    key = (name, normalized_content)
     if not any((item.get("name"), item.get("content")) == key for item in instructions if isinstance(item, dict)):
-        instructions.append({"name": name, "content": content.strip()})
+        instructions.append({"name": name, "content": normalized_content})
 
 
 def context_instruction_blocks(value: object, provider: str) -> list[tuple[str, str]]:
     """Extract visible agent/skill/tool context without exposing unrelated metadata."""
-    keys = {"agent", "agents", "agentDefinitions", "skills", "skill", "slashCommands", "toolInstructions", "tools", "mcpInstructions"}
+    keys = {"agent", "agents", "agents_md", "agentDefinitions", "skills", "skill", "slashCommands", "toolInstructions", "tools", "mcpInstructions"}
     found: list[tuple[str, str]] = []
 
     def visit(item: object, path: str = "") -> None:
@@ -1187,6 +1189,15 @@ def fmt_cost(value: float | None) -> str:
     return "—" if value is None else f"${value:,.2f}"
 
 
+def fmt_cost_label(value: float | None) -> str:
+    """Keep small per-agent costs visible instead of rounding them to zero."""
+    if value is None:
+        return "—"
+    if value == 0 or abs(value) >= 0.01:
+        return fmt_cost(value)
+    return f"${value:,.6f}"
+
+
 def fmt_unit(value: float | int, currency: bool = False) -> str:
     """Format large values compactly for chart labels and hover text."""
     magnitude = abs(float(value))
@@ -1395,6 +1406,7 @@ def invocation_tools(invocation: dict) -> str:
             sections.append(f'<div class="tool-payload"><b>{label}</b><pre>{esc(text)}</pre></div>')
         agent = tool.get("subagent") if isinstance(tool.get("subagent"), dict) else None
         agent_markup = ""
+        agent_footer = ""
         summary_name = name
         if agent is not None:
             summary_name = agent.get("agentDescription") or agent.get("name") or name
@@ -1409,20 +1421,30 @@ def invocation_tools(invocation: dict) -> str:
                 for key in TOKEN_KEYS
             )
             usage_summary = (
-                f'{fmt(agent_total)} tokens · {fmt_cost(agent.get("costUsd"))}'
+                f'{fmt(agent_total)} tokens · {fmt_cost_label(agent.get("costUsd"))}'
                 if has_agent_usage else "Token usage unavailable"
             )
+            agent_instructions = []
+            for agent_turn in agent.get("turns", []):
+                if not isinstance(agent_turn, dict):
+                    continue
+                for instruction in agent_turn.get("internalInstructions", []):
+                    if isinstance(instruction, dict) and instruction not in agent_instructions:
+                        agent_instructions.append(instruction)
             agent_markup = (
                 '<section class="delegated-agent">'
                 f'<div class="delegated-agent-heading"><span>Delegated agent</span><b>{esc(display_model_name(agent_model))}</b>'
                 f'<strong>{esc(usage_summary)}</strong></div>'
+                f'{internal_instructions_markup(agent_instructions, "Subagent context")}'
+            )
+            agent_footer = (
                 f'{invocation_token_cards(own_tokens, agent_model, agent.get("tokenFlags"))}'
                 '</section>'
             )
         rendered.append(
             f'<details class="invocation-tool {"delegated-tool" if agent is not None else ""}"><summary><span class="tool-name">{esc(summary_name)}</span>'
             f'<span class="tool-status {esc(status)}">{esc(status)}</span></summary>'
-            f'<div class="invocation-tool-body">{agent_markup}{"".join(sections) or ("" if agent is not None else "No stored arguments or result.")}</div></details>'
+            f'<div class="invocation-tool-body">{agent_markup}{"".join(sections) or ("" if agent is not None else "No stored arguments or result.")}{agent_footer}</div></details>'
         )
     return response_markup + '<div class="invocation-tools">' + "".join(rendered) + '</div>'
 
@@ -1449,6 +1471,18 @@ def invocation_subagent_badge(invocation: dict) -> str:
     )
 
 
+def internal_instructions_markup(instructions: list, title: str = "CONTEXT") -> str:
+    """Render provider-generated instructions in their owning context."""
+    instruction_panels = "".join(
+        f'<details class="attached-file internal-instruction"><summary><span class="attached-file-icon">I</span><span><b>{esc(item.get("name") or "Internal instructions")}</b><small>Provider-generated tool instructions</small></span><span class="attached-file-arrow"></span></summary><pre>{esc(item.get("content") or "")}</pre></details>'
+        for item in instructions if isinstance(item, dict)
+    )
+    if not instruction_panels:
+        return ""
+    count = sum(1 for item in instructions if isinstance(item, dict))
+    return f'<div class="attached-files internal-instructions"><div class="attached-files-title">{esc(title)} <span>{count}</span></div>{instruction_panels}</div>'
+
+
 def user_files_markup(turn: dict) -> str:
     files = turn.get("files") if isinstance(turn.get("files"), list) else []
     instructions = turn.get("internalInstructions") if isinstance(turn.get("internalInstructions"), list) else []
@@ -1465,13 +1499,8 @@ def user_files_markup(turn: dict) -> str:
             f'<details class="attached-file"><summary><span class="attached-file-icon">F</span><span><b>{esc(name)}</b><small>{esc(path)}</small></span><span class="attached-file-arrow"></span></summary>'
             f'<pre>{esc(content if isinstance(content, str) else "File content is unavailable at the stored path.")}</pre></details>'
         )
-    instruction_panels = "".join(
-        f'<details class="attached-file internal-instruction"><summary><span class="attached-file-icon">I</span><span><b>{esc(item.get("name") or "Internal instructions")}</b><small>Provider-generated tool instructions</small></span><span class="attached-file-arrow"></span></summary><pre>{esc(item.get("content") or "")}</pre></details>'
-        for item in instructions if isinstance(item, dict)
-    )
     file_block = f'<div class="attached-files"><div class="attached-files-title">Attached files <span>{len(panels)}</span></div>{"".join(panels)}</div>' if panels else ""
-    instruction_block = f'<div class="attached-files internal-instructions"><div class="attached-files-title">Internal tool instructions <span>{len(instructions)}</span></div>{instruction_panels}</div>' if instruction_panels else ""
-    return file_block + instruction_block
+    return file_block + internal_instructions_markup(instructions)
 
 
 def explorer_content(turn: dict, metric: str | None) -> tuple[str, str, str]:

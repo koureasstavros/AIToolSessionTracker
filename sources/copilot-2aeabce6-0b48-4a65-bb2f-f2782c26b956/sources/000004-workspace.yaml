@@ -1,0 +1,17 @@
+id: 2aeabce6-0b48-4a65-bb2f-f2782c26b956
+cwd: C:\Users\redacted_username\Source\GitHub\redacted_repository_owner\AIToolSessionTracker
+git_root: C:\Users\redacted_username\Source\GitHub\redacted_repository_owner\AIToolSessionTracker
+repository: redacted_repository_owner/AIToolSessionTracker
+host_type: github
+branch: main
+client_name: github/cli
+name: Spin Up Three Agents
+user_named: false
+summary_count: 0
+fork_count: 0
+created_at: 2026-09-10T18:02:08.161Z
+updated_at: 2026-09-10T18:02:46.653Z
+remote_steerable: false
+mc_task_id: ee493855-ef08-4cc5-9e53-8628057f58d9
+mc_session_id: 2aeabce6-0b48-4a65-bb2f-f2782c26b956
+mc_last_event_id: 617c9b3d-a390-43c7-bacc-98d55a9037c8

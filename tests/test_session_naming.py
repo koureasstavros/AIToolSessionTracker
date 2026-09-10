@@ -22,6 +22,14 @@ class SessionNamingTests(unittest.TestCase):
         ]
         self.assertEqual(derived_conversation_name(records, "fallback"), "Improve the dashboard")
 
+    def test_codex_generated_user_records_are_skipped(self) -> None:
+        records = [
+            {"payload": {"role": "user", "content": "# AGENTS.md instructions for C:\\repo\nGenerated context"}},
+            {"payload": {"role": "user", "content": "Original human prompt"}},
+            {"payload": {"role": "user", "content": "<subagent_notification>generated result</subagent_notification>"}},
+        ]
+        self.assertEqual(derived_conversation_name(records, "fallback"), "Original human prompt")
+
 
 if __name__ == "__main__":
     unittest.main()

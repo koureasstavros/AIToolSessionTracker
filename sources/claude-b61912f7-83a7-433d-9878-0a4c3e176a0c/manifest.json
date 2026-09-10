@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "provider": "claude",
+  "files": [
+    {
+      "member": "sources/000000-b61912f7-83a7-433d-9878-0a4c3e176a0c.jsonl",
+      "target": "b61912f7-83a7-433d-9878-0a4c3e176a0c.jsonl",
+      "mtime": 1789063255.2883542
+    },
+    {
+      "member": "sources/000001-agent-a173ba7b90ee84085.jsonl",
+      "target": "subagents/agent-a173ba7b90ee84085.jsonl",
+      "mtime": 1789063248.9606376
+    },
+    {
+      "member": "sources/000002-agent-a64632c48715baa5a.jsonl",
+      "target": "subagents/agent-a64632c48715baa5a.jsonl",
+      "mtime": 1789063252.2661908
+    },
+    {
+      "member": "sources/000003-agent-ad323ba6719f15a83.jsonl",
+      "target": "subagents/agent-ad323ba6719f15a83.jsonl",
+      "mtime": 1789063250.4904337
+    }
+  ]
+}

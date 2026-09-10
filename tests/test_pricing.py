@@ -97,6 +97,31 @@ class PricingTests(unittest.TestCase):
     def test_openai_codex_session_cost_is_applied(self) -> None:
         self._assert_provider_session_cost("gpt-5.1-codex", 0.000625)
 
+    def test_subagent_session_cost_is_applied_recursively(self) -> None:
+        child_tokens = {
+            "inputTokens": 100,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "outputTokens": 50,
+            "reasoningTokens": 10,
+        }
+        child = {
+            "model": "gpt-5.6-luna",
+            "tokens": dict(child_tokens),
+            "turns": [{"tokens": dict(child_tokens), "invocations": []}],
+        }
+        parent = {
+            "model": "gpt-5.6-luna",
+            "tokens": dict(child_tokens),
+            "turns": [],
+            "subagents": [child],
+        }
+
+        pricing.apply_costs(parent)
+
+        self.assertAlmostEqual(child["costUsd"], 0.0004)
+        self.assertEqual(child["pricingModel"], "gpt-5.6-luna")
+
     def test_anthropic_claude_session_cost_is_applied(self) -> None:
         self._assert_provider_session_cost("claude-sonnet-4-5", 0.00069)
 
