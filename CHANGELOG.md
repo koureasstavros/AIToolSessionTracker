@@ -4,6 +4,14 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Explorer, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.23 — 2026-09-10
+
+- Fixed instructions file with proper version
+
+### Version v0.0.22 — 2026-09-10
+
+- Added compilation mechanism for platforms and packed releases.
+
 ### Version v0.0.21 — 2026-09-10
 
 - Improved the README.
