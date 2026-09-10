@@ -4,6 +4,14 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Explorer, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.25 — 2026-09-10
+
+- Fixed immediate shutdown of the app and added logging mechanism.
+
+### Version v0.0.24 — 2026-09-10
+
+- Added shutdown command to close app and handled multiple instances.
+
 ### Version v0.0.23 — 2026-09-10
 
 - Fixed instructions file with proper version

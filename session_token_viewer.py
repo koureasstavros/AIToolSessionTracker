@@ -6,6 +6,8 @@ Then open http://127.0.0.1:8765 in a browser.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import html
 import json
 import logging
@@ -101,6 +103,51 @@ PROVIDER_ADAPTERS = {
     "m365_copilot": m365_copilot_provider,
 }
 LOGGER = logging.getLogger(__name__)
+_INSTANCE_MUTEX: int | None = None
+
+
+def configure_logging() -> Path | None:
+    """Configure a persistent log file, including for the packaged GUI exe."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base_directories = [
+        Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local",
+        Path(tempfile.gettempdir()),
+    ]
+    for base_directory in base_directories:
+        log_directory = base_directory / "AI-Tool-Session-Explorer"
+        log_path = log_directory / "session-explorer.log"
+        try:
+            log_directory.mkdir(parents=True, exist_ok=True)
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+                force=True,
+            )
+            return log_path
+        except OSError:
+            continue
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
+    LOGGER.error("Unable to create an application log file")
+    return None
+
+
+def acquire_instance_mutex() -> bool:
+    """Allow only one packaged viewer process on Windows."""
+    global _INSTANCE_MUTEX
+    if os.name != "nt":
+        return True
+    kernel32 = ctypes.windll.kernel32
+    mutex = kernel32.CreateMutexW(None, False, "Local\\AI-Tool-Session-Explorer")
+    if not mutex:
+        return True
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(mutex)
+        return False
+    _INSTANCE_MUTEX = mutex
+    return True
+
+
 TOKEN_ALIASES = {
     "inputTokens": ("input_tokens", "prompt_tokens", "promptTokens", "inputTokens"),
     "cacheReadTokens": ("cached_tokens", "cachedTokens", "input_cached_tokens", "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"),
@@ -1006,10 +1053,18 @@ def load_session_index(root: Path, provider: str, show_empty: bool = False) -> l
     """Load provider summaries without parsing full transcripts or pricing."""
     adapter = PROVIDER_ADAPTERS[provider]
     normalized = []
-    for item in adapter.index(root):
-        item["provider"] = provider
-        summary = normalize_session_data(item)
-        normalized.append(summary)
+    try:
+        indexed_items = adapter.index(root)
+    except Exception:
+        LOGGER.exception("Unable to scan provider %s; continuing with an empty provider result", provider)
+        return []
+    for item in indexed_items:
+        try:
+            item["provider"] = provider
+            summary = normalize_session_data(item)
+            normalized.append(summary)
+        except Exception:
+            LOGGER.exception("Unable to normalize one %s session; skipping it", provider)
     normalized.sort(key=lambda item: item.get("updated", 0), reverse=True)
     if show_empty:
         return normalized
@@ -1019,8 +1074,13 @@ def load_session_index(root: Path, provider: str, show_empty: bool = False) -> l
         # absent. Parse such summaries before hiding them so conversations
         # containing prompts or responses but no token statistics remain
         # visible.
-        if item.get("_has_data") is not True and not session_has_content(adapter.details(item)):
-            continue
+        if item.get("_has_data") is not True:
+            try:
+                if not session_has_content(adapter.details(item)):
+                    continue
+            except Exception:
+                LOGGER.exception("Unable to inspect one %s session; skipping it", provider)
+                continue
         visible.append(item)
     return visible
 
@@ -1551,6 +1611,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         route = urlparse(self.path).path
+        if route == "/shutdown":
+            body = b"AI Tool Session Explorer has been closed. You can close this tab."
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            # shutdown() must run on another thread because the server cannot
+            # stop its serve_forever loop while it is handling this request.
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
         if route not in {"/delete", "/import"}:
             self.send_error(404)
             return
@@ -1672,7 +1744,8 @@ class Handler(BaseHTTPRequestHandler):
         show_empty = query.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
         try:
             body = render(self.root, selected, selected_turn, selected_metric, provider, show_empty, selected_raw, view, group, selected_group, time_range, import_error).encode("utf-8")
-        except OSError:
+        except Exception:
+            LOGGER.exception("Unable to render request for provider %s", provider)
             self.send_error(500, "Unable to read session files")
             return
         self.send_response(200)
@@ -1691,17 +1764,49 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    log_path = configure_logging()
     parser = argparse.ArgumentParser(description="View Copilot session token usage")
     parser.add_argument("--root", type=Path, default=github_copilot_provider.default_root(), help="Copilot/agent session root folder")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
+    LOGGER.info("Starting AI Tool Session Explorer")
+    if log_path:
+        LOGGER.info("Log file: %s", log_path)
+    if not acquire_instance_mutex():
+        # Reuse the running instance, but let a repeated launch bring the
+        # browser viewer back to the foreground/open it again.
+        url = f"http://127.0.0.1:{args.port}"
+        try:
+            if not webbrowser.open(url):
+                LOGGER.warning("The default browser could not be opened for %s", url)
+        except Exception:
+            LOGGER.exception("Unable to open the default browser for %s", url)
+        return
     Handler.root = args.root.expanduser().resolve()
     if not Handler.root.is_dir():
-        parser.error(f"root must be an existing directory: {Handler.root}")
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"Viewing {Handler.root} at http://127.0.0.1:{args.port}")
-    threading.Timer(0.3, lambda: webbrowser.open(f"http://127.0.0.1:{args.port}")).start()
+        LOGGER.warning("Configured Copilot root does not exist: %s; continuing with other providers", Handler.root)
+    url = f"http://127.0.0.1:{args.port}"
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError as error:
+        address_in_use = error.errno in {errno.EADDRINUSE, 10048}
+        if not address_in_use:
+            LOGGER.exception("Unable to start the local server on %s", url)
+            return
+        # A second launch should exit quietly. Opening the URL here would
+        # create another browser task/tab even though the viewer is already
+        # running.
+        print(f"The viewer is already running at {url}")
+        return
+    print(f"Viewing {Handler.root} at {url}")
+    def open_browser() -> None:
+        try:
+            if not webbrowser.open(url):
+                LOGGER.warning("The default browser could not be opened for %s", url)
+        except Exception:
+            LOGGER.exception("Unable to open the default browser for %s", url)
+
+    threading.Timer(0.3, open_browser).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1776,6 +1881,15 @@ PAGE = PAGE.replace("</style></head>", r'''<style>
 </style></head>''')
 
 PAGE = PAGE.replace('<div class="count">Sessions</div>__SESSION_ROWS__', '<div class="sessions-area"><div class="sessions-heading"><div class="count">Sessions</div><div class="sessions-heading-actions">__EMPTY_TOGGLE__<a class="refresh-sessions" href="__REFRESH_URL__" title="Refresh sessions" aria-label="Refresh sessions">↻</a></div></div>__SESSION_ROWS__</div>')
+PAGE = PAGE.replace(
+    '<div class="brand">Session explorer</div>',
+    '<div class="brand">Session explorer</div><form class="shutdown-form" action="/shutdown" method="post" onsubmit="return confirm(\'Close the local session explorer?\');"><button type="submit">Exit application</button></form>',
+)
+PAGE = PAGE.replace(
+    '</head>',
+    '<style>.shutdown-form{margin:0 10px 22px}.shutdown-form button{width:100%;padding:7px 9px;border:1px solid #7b3547;border-radius:7px;background:#3b1d2a;color:#ffbdc8;font:inherit;font-size:11px;cursor:pointer}.shutdown-form button:hover{background:#5b2534;color:#fff}</style></head>',
+    1,
+)
 
 PAGE = PAGE.replace('</head>', '<style>.turn header{display:flex;align-items:center;justify-content:space-between;gap:12px}.turn-kind{color:#9ed1ff;background:#1b4268;border:1px solid #326b9e;border-radius:999px;padding:3px 9px;font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;white-space:nowrap}.show-raw{display:block;margin:10px 16px 14px;padding:7px 12px;border:1px solid #315479;border-radius:6px;background:#142a43;color:#9ed1ff;text-align:center;text-decoration:none;font-size:11px}.show-raw:hover{background:#1b4268;color:#fff}.content-layout{align-items:stretch}.explorer{height:calc(100vh - 84px);max-height:calc(100vh - 84px);position:sticky;top:42px;overflow:hidden;display:flex;flex-direction:column}.explorer-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex:none;overflow:hidden;background:transparent;padding:10px 12px;border-bottom:1px solid #223753;z-index:1}.explorer-header h2{margin:0}.explorer-body{display:flex;flex:1;min-height:0;flex-direction:column;overflow-y:auto;overflow-x:hidden;padding-top:12px;scrollbar-width:thin;scrollbar-color:#416b98 #0c1627}.explorer-body>p{flex:none}.explorer-body>pre{flex:none;max-height:none;overflow:visible}.explorer details{display:block;flex:none}.explorer details pre{max-height:none;overflow:visible}@media(max-width:700px){.explorer{height:auto;max-height:none;position:static;overflow:visible}.explorer-header{position:static;border-bottom:0}.explorer-body{display:block;overflow:visible}.explorer-body>pre{max-height:60vh;overflow:auto}.explorer details{display:block}.explorer details pre{max-height:60vh;overflow:auto}}</style></head>')
 
@@ -1840,6 +1954,7 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
         <div class="sidebar-top">
             <div class="brand-row"><span class="brand-mark">AI</span><div><div class="brand">__APP_NAME__</div><div class="brand-subtitle">Local AI activity</div></div></div>
             __VIEW_TABS__
+            <form class="shutdown-form" action="/shutdown" method="post" onsubmit="return confirm('Close the local session explorer?');"><button type="submit">Exit application</button></form>
             <nav class="provider-menu" aria-label="AI providers">__PROVIDER_MENU__</nav>
             __STATS_SIDEBAR__
         </div>
@@ -1884,6 +1999,7 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
 
 PAGE = PAGE.replace('</style>\n</head>', '''<style>
 /* Compact invocation cards: tools stay vertical, metrics stay horizontal. */
+.shutdown-form{margin:14px 0 0}.stats-sidebar .shutdown-form{margin-bottom:14px}.shutdown-form button{width:100%;height:30px;border:1px solid #713243;border-radius:8px;background:#24121a;color:#ff9aaa;font-size:10px;font-weight:700;cursor:pointer}.shutdown-form button:hover{border-color:#a64b61;background:#351721;color:#fff}
 .turn-invocations{margin:12px 14px;padding:0;border:1px solid #263247;border-radius:11px;background:#0b1018;overflow:hidden}
 .turn-invocations>summary{padding:11px 13px;background:#111925}
 .invocations-list{display:grid;gap:8px;padding:8px}
@@ -1922,4 +2038,11 @@ PAGE = PAGE.replace('</style>\n</head>', '''<style>
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        try:
+            configure_logging()
+            LOGGER.exception("Unhandled application error")
+        except Exception:
+            pass

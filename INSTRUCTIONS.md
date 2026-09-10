@@ -6,6 +6,9 @@ gh auth login
 Second set the default directory:
 gh repo set-default koureasstavros/AIToolSessionTracker
 
+The generate the compiled binary based on the platform
+Run the script into packer/<platform>/*
+
 For generating release based on source code:
 gh release create v0.0.XX --notes-file README.md
 gh release delete v0.0.XX

@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "model", "llm", "slm", "session", "tracker", "turn", "invocation"]
 license: "apache-2.0"
-version: v0.0.23
+version: v0.0.25
 ---
 
 # AI Tool Session Explorer
@@ -56,6 +56,20 @@ script installs PyInstaller into the active Python environment if necessary and
 creates `dist\AI-Tool-Session-Explorer.exe`. The executable starts the local
 viewer and opens it in the default browser.
 
+The executable hosts the local web server while the viewer is in use, so its
+process remains running after the browser opens. Use **Exit application** in
+the viewer sidebar when finished; this shuts down the server cleanly. Closing
+the browser tab alone cannot reliably notify a local web server that it should
+stop. If the executable is launched again while it is already running, the
+the second launch reopens the existing viewer URL without starting another
+application process.
+
+Startup and runtime errors are written to
+`%LOCALAPPDATA%\AI-Tool-Session-Explorer\session-explorer.log`. The application
+continues when an individual provider's local storage folder does not exist;
+that provider simply shows no sessions while other available providers remain
+usable.
+
 The build includes the model pricing data required by the application. The
 executable must still be run on Windows because it reads provider data from
 Windows-local application storage.
@@ -83,6 +97,11 @@ documented separately:
 
 The viewer only reads local transcripts or user-provided exports. It does not
 download cloud-only chat history.
+
+Session availability can depend on the provider's subscription plan and the
+active application mode. Some plans or modes do not persist locally readable
+session records, so those sessions may not be traceable by this viewer even
+when the provider was used successfully.
 
 See [Provider storage and viewer support matrix](docs/provider-storage-matrix.md)
 for the supported chat and code surfaces, storage locations, and local-read
