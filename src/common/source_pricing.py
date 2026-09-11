@@ -7,16 +7,68 @@ from pathlib import Path
 from typing import Any
 
 _COSTS = json.loads((Path(__file__).with_name("model_costs.json")).read_text(encoding="utf-8"))
+MODEL_MAPPING_FILENAME = "model_mappings.json"
 
 
 def _canonical(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
+def mapping_config_path() -> Path:
+    """Return the user-editable model mapping file beside the running app."""
+    return Path.cwd() / MODEL_MAPPING_FILENAME
+
+
+def load_model_mappings(path: Path | None = None) -> dict[str, str]:
+    """Load deployment-to-pricing-model mappings without breaking startup."""
+    config_path = path or mapping_config_path()
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    mappings = payload.get("mappings") if isinstance(payload, dict) else None
+    if not isinstance(mappings, dict):
+        return {}
+    return {
+        str(deployment).strip(): str(model).strip()
+        for deployment, model in mappings.items()
+        if str(deployment).strip() and str(model).strip()
+    }
+
+
+def save_model_mappings(mappings: dict[str, str], path: Path | None = None) -> Path:
+    """Persist deployment mappings as JSON beside the running app."""
+    config_path = path or mapping_config_path()
+    cleaned = {
+        str(deployment).strip(): str(model).strip()
+        for deployment, model in mappings.items()
+        if str(deployment).strip() and str(model).strip()
+    }
+    config_path.write_text(
+        json.dumps({"mappings": dict(sorted(cleaned.items(), key=lambda item: item[0].lower()))}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return config_path
+
+
+def mapped_model(model: object) -> str | None:
+    """Return an explicitly configured pricing model for a deployment ID."""
+    if not isinstance(model, str) or not model.strip():
+        return None
+    wanted = _canonical(model)
+    for deployment, pricing_model in load_model_mappings().items():
+        if _canonical(deployment) == wanted:
+            return pricing_model
+    return None
+
+
 def find_model(model: object) -> dict[str, Any] | None:
     """Find a price row, tolerating provider prefixes and deployment suffixes."""
     if not isinstance(model, str) or not model.strip():
         return None
+    explicit_mapping = mapped_model(model)
+    if explicit_mapping:
+        model = explicit_mapping
     wanted = _canonical(model)
     exact = next((row for row in _COSTS if _canonical(row["model"]) == wanted), None)
     if exact:

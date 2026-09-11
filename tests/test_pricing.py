@@ -1,4 +1,7 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from src.common import source_pricing as pricing
 
@@ -17,6 +20,14 @@ class PricingTests(unittest.TestCase):
 
     def test_unknown_model_has_no_cost(self) -> None:
         self.assertIsNone(pricing.cost_for_tokens({"outputTokens": 10}, "deployment-abc"))
+
+    def test_explicit_deployment_mapping_resolves_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "model_mappings.json"
+            pricing.save_model_mappings({"TEST-GS": "gpt-5.6-luna"}, config_path)
+            with patch.object(pricing, "mapping_config_path", return_value=config_path):
+                self.assertEqual(pricing.mapped_model("TEST-GS"), "gpt-5.6-luna")
+                self.assertEqual(pricing.find_model("TEST-GS")["model"], "gpt-5.6-luna")
 
     def test_deployment_path_resolves_to_public_model_name(self) -> None:
         price = pricing.find_model("azure/Azure-APIM/GPT56SOL-GS")
