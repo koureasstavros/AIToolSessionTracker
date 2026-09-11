@@ -2,7 +2,12 @@
 
 [](https://github.com/koureasstavros/AIToolSessionTracker/blob/main/changelog.md#-changelog)
 
-This changelog provides a concise record of the updates made to AI Tool Session Explorer, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
+This changelog provides a concise record of the updates made to AI Tool Session Tracker, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
+
+### Version v0.0.29 — 2026-09-11
+
+- Reconciling token numbers and costs into different levels
+- Added model analysis overview per operational session and handling
 
 ### Version v0.0.28 — 2026-09-10
 

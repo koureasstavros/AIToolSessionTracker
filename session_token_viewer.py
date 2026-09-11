@@ -94,7 +94,7 @@ def token_accounting_note(provider: str, turn_count: int) -> str:
     )
 
 
-APP_NAME = "AI Tool Session Explorer"
+APP_NAME = "AI Tool Session Tracker"
 PROVIDER_ADAPTERS = {
     "copilot": github_copilot_provider,
     "codex": openai_codex_provider,
@@ -1275,10 +1275,21 @@ def token_warning_markup(flags: list[str] | None, key: str | None = None) -> str
     return f'<span class="token-warning" title="{esc(warning, quote=True)}" aria-label="{esc(warning, quote=True)}">⚠</span>'
 
 
+def displayed_token_value(tokens: dict[str, int | None], key: str) -> int | None:
+    """Return output excluding its thinking-token subset for display."""
+    value = tokens.get(key)
+    if key != "outputTokens" or not isinstance(value, int):
+        return value
+    reasoning = tokens.get("reasoningTokens")
+    if not isinstance(reasoning, int):
+        return value
+    return max(0, value - reasoning)
+
+
 def token_cards(tokens: dict[str, int | None], model: str | None = None, extra_class: str = "", costs: dict[str, float] | None = None, token_flags: list[str] | None = None) -> str:
     costs = costs if costs is not None else pricing.cost_breakdown(tokens, model)
     return "".join(
-        f'<div class="metric {extra_class}" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}{token_warning_markup(token_flags, key)}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
+        f'<div class="metric {extra_class}" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}{token_warning_markup(token_flags, key)}</span><strong>{fmt(displayed_token_value(tokens, key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
         for key in TOKEN_KEYS
     )
 
@@ -1288,7 +1299,7 @@ def invocation_token_cards(tokens: dict[str, int | None], model: str | None = No
     costs = costs if costs is not None else pricing.cost_breakdown(tokens, model)
     def cards(keys: tuple[str, ...]) -> str:
         return "".join(
-            f'<div class="metric compact" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}{token_warning_markup(token_flags, key)}</span><strong>{fmt(tokens.get(key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
+            f'<div class="metric compact" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}{token_warning_markup(token_flags, key)}</span><strong>{fmt(displayed_token_value(tokens, key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
             for key in keys
         )
 
@@ -1361,12 +1372,111 @@ def invocation_total_cards(invocation: dict, model: str | None, token_flags: lis
     return f'<section class="invocation-total"><div class="invocation-total-title"><span>Invocation total</span><b>{esc(label)}</b></div>{cards}</section>'
 
 
-def turn_token_cards(tokens: dict[str, int | None], model: str | None, session_id: str, provider: str, turn_index: int, selected_turn: int | None, selected_metric: str | None, show_empty: bool = False, token_flags: list[str] | None = None) -> str:
-    costs = pricing.cost_breakdown(tokens, model)
+def model_usage_breakdown(session: dict) -> list[dict]:
+    """Group session usage by the model that generated it without double counting."""
+    rows: dict[str, dict] = {}
+    accounted = {key: 0 for key in TOKEN_KEYS}
+    seen_agents: set[int] = set()
+
+    def add_usage(tokens: object, model: object, local: dict[str, int] | None = None) -> None:
+        if not isinstance(tokens, dict):
+            return
+        values = {
+            key: value
+            for key in TOKEN_KEYS
+            if isinstance((value := tokens.get(key)), int) and not isinstance(value, bool)
+        }
+        if not values:
+            return
+        price = pricing.find_model(model)
+        label = str(price["model"] if price else model or "Unavailable")
+        row = rows.setdefault(label, {
+            "model": label,
+            "tokens": blank_tokens(),
+            "costs": {key: 0.0 for key in TOKEN_KEYS},
+            "priced": price is not None,
+        })
+        token_costs = pricing.cost_breakdown(tokens, model)
+        for key, value in values.items():
+            row["tokens"][key] = (row["tokens"][key] or 0) + value
+            row["costs"][key] += token_costs.get(key) or 0.0
+            accounted[key] += value
+            if local is not None:
+                local[key] += value
+
+    def add_agent(agent: object, local: dict[str, int] | None = None) -> None:
+        if not isinstance(agent, dict) or id(agent) in seen_agents:
+            return
+        seen_agents.add(id(agent))
+        own_tokens = agent.get("ownTokens") if isinstance(agent.get("ownTokens"), dict) else agent.get("tokens", {})
+        add_usage(own_tokens, agent.get("agentModel") or agent.get("pricingModel") or agent.get("model"), local)
+        for child in agent.get("subagents", []) if isinstance(agent.get("subagents"), list) else []:
+            add_agent(child, local)
+
+    for turn in session.get("turns", []) if isinstance(session.get("turns"), list) else []:
+        if not isinstance(turn, dict):
+            continue
+        turn_accounted = {key: 0 for key in TOKEN_KEYS}
+        invocations = turn.get("invocations") if isinstance(turn.get("invocations"), list) else []
+        for invocation in invocations:
+            if not isinstance(invocation, dict):
+                continue
+            add_usage(invocation.get("tokens", {}), invocation.get("model") or turn.get("model") or session.get("model"), turn_accounted)
+            for tool in invocation.get("tools", []) if isinstance(invocation.get("tools"), list) else []:
+                if isinstance(tool, dict):
+                    add_agent(tool.get("subagent"), turn_accounted)
+        residual = {
+            key: max(0, (turn.get("tokens", {}).get(key) or 0) - turn_accounted[key])
+            for key in TOKEN_KEYS
+        }
+        if any(residual.values()):
+            add_usage(residual, turn.get("model") or session.get("model"))
+
+    for agent in session.get("subagents", []) if isinstance(session.get("subagents"), list) else []:
+        add_agent(agent)
+
+    residual = {
+        key: max(0, (session.get("tokens", {}).get(key) or 0) - accounted[key])
+        for key in TOKEN_KEYS
+    }
+    if any(residual.values()):
+        add_usage(residual, session.get("pricingModel") or session.get("model"))
+    return sorted(rows.values(), key=lambda row: sum(row["costs"].values()), reverse=True)
+
+
+def model_analysis_markup(session: dict) -> str:
+    """Render a top-level popover with token and cost cards for each model."""
+    model_rows = []
+    for row in model_usage_breakdown(session):
+        tokens = row["tokens"]
+        costs = row["costs"] if row["priced"] else {key: None for key in TOKEN_KEYS}
+        token_total = sum(tokens.get(key) or 0 for key in TOKEN_KEYS[:4])
+        total_cost = sum(row["costs"].values()) if row["priced"] else None
+        model_rows.append(
+            '<section class="model-analysis-row">'
+            f'<header><b>{esc(row["model"])}</b><span>{fmt(token_total)} tokens · {fmt_cost(total_cost)}</span></header>'
+            f'<div class="model-analysis-metrics">{token_cards(tokens, row["model"], costs=costs)}</div>'
+            '</section>'
+        )
+    if not model_rows:
+        return ""
+    count = len(model_rows)
+    return (
+        '<details class="model-analysis">'
+        f'<summary><span>Model analysis</span><b>{count}</b></summary>'
+        '<div class="model-analysis-popover"><header><div><span class="section-kicker">USAGE BY MODEL</span>'
+        '<h2>Model analysis</h2></div><small>Token counts and estimated costs grouped by the model that generated them.</small></header>'
+        f'{"".join(model_rows)}</div></details>'
+    )
+
+
+def turn_token_cards(tokens: dict[str, int | None], model: str | None, session_id: str, provider: str, turn_index: int, selected_turn: int | None, selected_metric: str | None, show_empty: bool = False, token_flags: list[str] | None = None, costs: dict[str, float] | None = None) -> str:
+    costs = costs if costs is not None else pricing.cost_breakdown(tokens, model)
     cards = []
     for key in TOKEN_KEYS:
         active = selected_turn == turn_index and selected_metric == key
         href = "/?" + esc(urlencode({
+            "view": "operational",
             "provider": provider,
             "show_empty": int(show_empty),
             "session": session_id,
@@ -1529,7 +1639,7 @@ def explorer_content(turn: dict, metric: str | None) -> tuple[str, str, str]:
 
 
 def render_session_row(item: dict, provider: str, selected: bool, show_empty: bool = False) -> str:
-    query = esc(urlencode({"provider": provider, "show_empty": int(show_empty), "session": item["id"]}), quote=True)
+    query = esc(urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "session": item["id"]}), quote=True)
     label = conversation_name(item.get("name"), item["id"])
     id_detail = "" if str(item["id"]).lower() in str(label).lower() else f'<small>{esc(item["id"])}</small>'
     metadata = (
@@ -1599,12 +1709,12 @@ def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "
     def markers(key: str, maximum: float, css_class: str) -> str:
         denominator = max(len(ordered) - 1, 1)
         return "".join(
-            f'<a class="stats-navigation" href="/?{urlencode({"provider": provider, "view": "statistics", "group": "timeline", "range": time_range, "group_value": label})}"><circle class="timeline-point {css_class}" cx="{left + chart_width * index / denominator:.1f}" cy="{top + chart_height * (1 - item[key] / maximum):.1f}" r="5"><title>{esc(label)} · {"Tokens" if key == "tokens" else "Cost"}: {fmt_unit(item[key], key == "cost")}</title></circle></a>'
+            f'<a class="stats-navigation" href="/?{urlencode({"view": "statistics", "provider": provider, "group": "timeline", "range": time_range, "group_value": label})}"><circle class="timeline-point {css_class}" cx="{left + chart_width * index / denominator:.1f}" cy="{top + chart_height * (1 - item[key] / maximum):.1f}" r="5"><title>{esc(label)} · {"Tokens" if key == "tokens" else "Cost"}: {fmt_unit(item[key], key == "cost")}</title></circle></a>'
             for index, (label, item) in enumerate(ordered)
         )
 
     labels = "".join(
-        f'<a class="stats-navigation" href="/?{urlencode({"provider": provider, "view": "statistics", "group": "timeline", "range": time_range, "group_value": label})}"><text class="timeline-date-link" x="{left + chart_width * index / max(len(ordered) - 1, 1):.1f}" y="{height - 22}" text-anchor="middle">{esc(label)}</text></a>'
+        f'<a class="stats-navigation" href="/?{urlencode({"view": "statistics", "provider": provider, "group": "timeline", "range": time_range, "group_value": label})}"><text class="timeline-date-link" x="{left + chart_width * index / max(len(ordered) - 1, 1):.1f}" y="{height - 22}" text-anchor="middle">{esc(label)}</text></a>'
         for index, (label, _) in enumerate(ordered)
     )
     token_ticks = "".join(
@@ -1640,40 +1750,47 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
     )
     for provider, summary in summaries:
         session = load_session_details(summary, provider)
-        bucket = groups.setdefault(statistics_group_key(session, group, provider, summary, time_range), {
-            "sessions": 0,
-            "tokens": {key: 0 for key in TOKEN_KEYS},
-            "costs": {key: 0.0 for key in TOKEN_KEYS},
-            "cost": 0.0,
-            "items": [],
-        })
-        bucket["sessions"] += 1
-        bucket["items"].append((provider, summary, session))
-        for key in TOKEN_KEYS:
-            value = session.get("tokens", {}).get(key)
-            if isinstance(value, int) and not isinstance(value, bool):
-                bucket["tokens"][key] += value
-                totals[key] += value
-        cost = session.get("costUsd")
-        if isinstance(cost, (int, float)):
-            bucket["cost"] += cost
-            total_cost += cost
+        model_rows = model_usage_breakdown(session) if group == "model" else [None]
+        for model_row in model_rows:
+            bucket_label = model_row["model"] if model_row is not None else statistics_group_key(session, group, provider, summary, time_range)
+            bucket = groups.setdefault(bucket_label, {
+                "sessions": 0,
+                "tokens": {key: 0 for key in TOKEN_KEYS},
+                "costs": {key: 0.0 for key in TOKEN_KEYS},
+                "cost": 0.0,
+                "items": [],
+            })
+            bucket["sessions"] += 1
+            bucket["items"].append((provider, summary, session, model_row) if model_row is not None else (provider, summary, session))
+            source_tokens = model_row["tokens"] if model_row is not None else session.get("tokens", {})
+            source_costs = model_row["costs"] if model_row is not None else session.get("costBreakdown")
+            if not isinstance(source_costs, dict):
+                source_costs = pricing.cost_breakdown(source_tokens, session.get("model"))
+            for key in TOKEN_KEYS:
+                value = source_tokens.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    bucket["tokens"][key] += value
+                    totals[key] += value
+                bucket["costs"][key] += source_costs.get(key) or 0.0
+                total_costs[key] += source_costs.get(key) or 0.0
+            numeric_costs = [value for value in source_costs.values() if isinstance(value, (int, float))]
+            source_cost = sum(numeric_costs) if numeric_costs else None
+            if isinstance(source_cost, (int, float)):
+                bucket["cost"] += source_cost
+                total_cost += source_cost
         timestamp = session.get("updated") or 0
         if timestamp:
             timeline_label = datetime.fromtimestamp(timestamp).strftime("%H:00") if time_range == "today" else datetime.fromtimestamp(timestamp).date().isoformat()
             timeline_bucket = timeline_points.setdefault(timeline_label, {"tokens": 0.0, "cost": 0.0})
             timeline_bucket["tokens"] += sum(value or 0 for value in session.get("tokens", {}).values())
-            timeline_bucket["cost"] += cost if isinstance(cost, (int, float)) else 0
-        for key, value in pricing.cost_breakdown(session.get("tokens", {}), session.get("model")).items():
-            bucket["costs"][key] += value
-            total_costs[key] += value
+            timeline_bucket["cost"] += session.get("costUsd") if isinstance(session.get("costUsd"), (int, float)) else 0
     ordered_groups = sorted(groups.items(), key=lambda item: item[0], reverse=True)
     heading = {"project": "Project", "today": "Hour", "day": "Day", "week": "Week", "month": "Month", "year": "Year", "tool": "Provider", "model": "Model", "timeline": "Timeline"}[group]
     session_count = len(summaries)
     average_tokens = sum(totals.values()) / session_count if session_count else 0
     average_cost = total_cost / session_count if session_count else 0
     rows = "".join(
-        f'<tr><td><a class="stats-group-link stats-navigation" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "group_value": label})}">{esc(label)}</a></td><td>{bucket["sessions"]:,}</td>'
+        f'<tr><td><a class="stats-group-link stats-navigation" href="/?{urlencode({"view": "statistics", "provider": provider, "group": group, "group_value": label})}">{esc(label)}</a></td><td>{bucket["sessions"]:,}</td>'
         + "".join(f'<td>{fmt(bucket["tokens"][key])}</td>' for key in TOKEN_KEYS)
         + "".join(f'<td>{fmt_cost(bucket["costs"][key])}</td>' for key in TOKEN_KEYS)
         + f'<td>{fmt(sum(bucket["tokens"].values()))}</td><td>{fmt_cost(bucket["cost"])}</td></tr>'
@@ -1681,10 +1798,16 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
     ) or '<tr><td colspan="14">No session data is available.</td></tr>'
     related = ""
     if selected_group in groups:
-        session_rows = "".join(
-            f'<tr><td><a class="stats-group-link stats-navigation" href="/?{urlencode({"provider": provider, "session": session.get("id", "")})}">{esc(session.get("id") or "Unavailable")}</a></td><td>{esc(session.get("name") or session.get("id"))}</td><td>{esc(PROVIDERS.get(provider, provider))}</td><td>{esc(session.get("pricingModel") or session.get("model") or "Unavailable")}</td><td>{fmt(sum(value or 0 for value in session.get("tokens", {}).values()))}</td><td>{fmt_cost(session.get("costUsd"))}</td></tr>'
-            for provider, summary, session in groups[selected_group]["items"]
-        )
+        if group == "model":
+            session_rows = "".join(
+                f'<tr><td><a class="stats-group-link stats-navigation" href="/?{urlencode({"view": "operational", "provider": provider, "session": session.get("id", "")})}">{esc(session.get("id") or "Unavailable")}</a></td><td>{esc(session.get("name") or session.get("id"))}</td><td>{esc(PROVIDERS.get(provider, provider))}</td><td>{esc(model_row["model"])}</td><td>{fmt(sum(value or 0 for value in model_row["tokens"].values()))}</td><td>{fmt_cost(sum(model_row["costs"].values()) if model_row["priced"] else None)}</td></tr>'
+                for provider, summary, session, model_row in groups[selected_group]["items"]
+            )
+        else:
+            session_rows = "".join(
+                f'<tr><td><a class="stats-group-link stats-navigation" href="/?{urlencode({"view": "operational", "provider": provider, "session": session.get("id", "")})}">{esc(session.get("id") or "Unavailable")}</a></td><td>{esc(session.get("name") or session.get("id"))}</td><td>{esc(PROVIDERS.get(provider, provider))}</td><td>{esc(session.get("pricingModel") or session.get("model") or "Unavailable")}</td><td>{fmt(sum(value or 0 for value in session.get("tokens", {}).values()))}</td><td>{fmt_cost(session.get("costUsd"))}</td></tr>'
+                for provider, summary, session in groups[selected_group]["items"]
+            )
         related = f'<section class="stats-related"><div class="section-heading"><div><span class="section-kicker">SELECTED GROUP</span><h2>Sessions in {esc(selected_group)}</h2></div></div><div class="stats-table-wrap"><table class="stats-table related-table"><thead><tr><th>Session ID</th><th>Session name</th><th>Provider</th><th>Model</th><th>Total tokens</th><th>Total cost</th></tr></thead><tbody>{session_rows}</tbody></table></div></section>'
     timeline_markup = f'<section class="timeline-section"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Tokens and cost over time</h2></div></div>{render_timeline_svg(timeline_points, time_range, provider)}</section>{related}'
     table_markup = f'<section class="stats-table-section"><div class="section-heading"><div><span class="section-kicker">BREAKDOWN</span><h2>By {heading.lower()}</h2></div></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>{heading}</th><th>Sessions</th>{"".join(f"<th>{esc(TOKEN_LABELS[key])}</th>" for key in TOKEN_KEYS)}{"".join(f"<th>{esc(TOKEN_LABELS[key])} cost</th>" for key in TOKEN_KEYS)}<th>Total tokens</th><th>Total cost</th></tr></thead><tbody>{rows}</tbody></table></div></section>{related}'
@@ -1701,7 +1824,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     chosen_summary = next((item for item in sessions if item["id"] == selected), None) if selected else None
     chosen = load_session_details(chosen_summary, provider) if chosen_summary else None
     provider_menu = "".join(
-        f'<a class="provider {"selected" if provider == key else ""}" data-provider="{esc(key)}" href="/?{esc(urlencode({"provider": key, "show_empty": int(show_empty)}), quote=True)}"><span class="provider-mark" aria-hidden="true"></span><span>{esc(label)}</span></a>'
+        f'<a class="provider {"selected" if provider == key else ""}" data-provider="{esc(key)}" href="/?{esc(urlencode({"view": "statistics" if view == "statistics" else "operational", "provider": key, "show_empty": int(show_empty)}), quote=True)}"><span class="provider-mark" aria-hidden="true"></span><span>{esc(label)}</span></a>'
         for key, label in PROVIDERS.items()
     )
     session_rows = "".join(
@@ -1739,7 +1862,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 ""
             )
             turn_label = turn.get("turn_index", index)
-            raw_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"], "turn": index, "raw": 1}), quote=True)
+            raw_url = esc("/?" + urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "session": chosen["id"], "turn": index, "raw": 1}), quote=True)
             invocation_markup = ""
             show_invocation_breakdown = len(invocations) > 1 or tools_are_nested
             if show_invocation_breakdown:
@@ -1761,7 +1884,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 <details class="message assistant turn-message assistant-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">AI</span><label>Assistant</label></summary><p>{esc(assistant)}</p></details>
                 {tool_markup}
                 {invocation_markup}
-                <div class="turn-footer"><div class="turn-metrics">{turn_token_cards(turn["tokens"], turn_model, chosen["id"], provider, index, selected_turn, selected_metric, show_empty, turn.get("tokenFlags") or chosen.get("tokenFlags"))}</div>
+                <div class="turn-footer"><div class="turn-metrics">{turn_token_cards(turn["tokens"], turn_model, chosen["id"], provider, index, selected_turn, selected_metric, show_empty, turn.get("tokenFlags") or chosen.get("tokenFlags"), turn.get("costBreakdown"))}</div>
                 <a class="show-raw clickable" href="{raw_url}"><span aria-hidden="true">&lt;/&gt;</span>View raw event data <span class="raw-arrow" aria-hidden="true">→</span></a></div></article>'''
     all_statistics_sessions = [
         (provider_key, summary)
@@ -1771,7 +1894,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     detail = render_statistics(all_statistics_sessions, group, selected_group, time_range, provider) if view == "statistics" else ""
     if view != "statistics" and chosen:
         turn_note = ""
-        refresh_conversation_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty), "session": chosen["id"]}), quote=True)
+        refresh_conversation_url = esc("/?" + urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "session": chosen["id"]}), quote=True)
         selected_content_turn = chosen["turns"][selected_turn - 1] if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else {}
         if selected_raw:
             explorer_title, explorer_text, explorer_raw = "Classified event data", "", raw_events_markup(selected_content_turn.get("raw", []))
@@ -1788,11 +1911,11 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         turn_count = len(chosen["turns"])
         average_tokens = token_total / turn_count if turn_count else 0
         average_cost = (chosen.get("costUsd") or 0) / turn_count if turn_count else 0
-        overview_costs = {key: 0.0 for key in TOKEN_KEYS}
-        for turn in chosen["turns"]:
-            turn_costs = pricing.cost_breakdown(turn.get("tokens", {}), turn.get("model") or chosen.get("pricingModel") or chosen.get("model"))
-            for key, value in turn_costs.items():
-                overview_costs[key] += value
+        overview_costs = chosen.get("costBreakdown")
+        if not isinstance(overview_costs, dict):
+            overview_costs = pricing.cost_breakdown(
+                chosen.get("tokens", {}), chosen.get("pricingModel") or chosen.get("model")
+            )
         subagents = chosen.get("subagents") if isinstance(chosen.get("subagents"), list) else []
         subagent_markup = ""
         unlinked_subagents = [agent for agent in subagents if not agent.get("toolUseId")]
@@ -1818,7 +1941,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         close_explorer_url = refresh_conversation_url
         detail = f'''<main class="detail"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>{esc(PROVIDERS.get(provider, provider))}</div><h1>{esc(chosen["name"])}</h1>
             <div class="header-chips"><span>Surface: {esc(session_tool(chosen_summary, provider))}</span><span>Timestamp: {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span><span>Model: {esc(chosen.get("pricingModel") or chosen.get("model") or "Unavailable")}</span></div>
-            </div><div class="detail-actions"><a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a><a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
+            </div><div class="detail-actions">{model_analysis_markup(chosen)}<a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a><a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
             <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
             <button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form></div></header>
             <section class="session-facts"><div><span>Session ID</span><code>{esc(chosen["id"])}</code><button type="button" class="copy-value" data-copy="{esc(chosen["id"], quote=True)}">Copy</button></div><div><span>Project</span><code>{esc(chosen.get("project") or "Unavailable")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("project") or "Unavailable", quote=True)}">Copy</button></div><div><span>Source</span><code>{esc(chosen.get("source") or "Unknown")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("source") or "Unknown", quote=True)}">Copy</button></div></section>
@@ -1844,8 +1967,8 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     )
     toggle = f'<a class="empty-toggle" href="{toggle_url}" title="{toggle_label}" aria-label="{toggle_label}">{toggle_icon}</a>'
     import_form = f'<form class="import-inline" method="post" action="/import" enctype="multipart/form-data"><input id="source-archive" name="archive" type="file" accept=".zip" required onchange="this.form.submit()"><input type="hidden" name="provider" value="{esc(provider)}"><label class="import-button" for="source-archive" title="Import one session archive" aria-label="Import one session archive">⇧</label></form>'
-    view_tabs = f'<style>.detail .message p{{font-size:12px}}.detail .muted{{font-size:11px}}.detail .section-kicker{{font-size:10px}}.detail .section-heading h2{{font-size:17px}}.detail .metric span{{font-size:10px}}.detail .metric strong{{font-size:20px}}.assistant .role>span{{width:22px;height:22px;border-radius:7px}}.view-tabs{{display:flex;gap:5px;margin:10px 0 16px;padding:3px;background:#0c1627;border:1px solid #223451;border-radius:8px}}.view-tab{{flex:1;padding:7px 8px;border-radius:6px;color:#8fa8c5;text-align:center;text-decoration:none;font-size:11px}}.view-tab:hover,.view-tab.selected{{background:#24558a;color:#fff}}.stats-group-menu,.stats-time-menu{{padding:4px;background:#0c1627;border:1px solid #223451;border-radius:11px}}.stats-time-menu{{margin-top:12px}}.stats-sidebar-title{{margin:4px 8px 8px;color:#91a8c7;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase}}.stats-sidebar-links{{display:grid;gap:4px}}.stats-sidebar-link{{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid transparent;border-radius:8px;color:#b8c9df;text-decoration:none;font-size:13px}}.stats-sidebar-link .provider-mark{{width:7px;height:7px;flex:none;border-radius:50%;background:#5ca8ff;box-shadow:0 0 0 3px rgba(92,168,255,.12)}}.stats-sidebar-link:hover,.stats-sidebar-link.selected{{border-color:#3b6b9d;background:#2c6aa5;box-shadow:0 4px 12px rgba(24,91,151,.25);color:#fff}}.stats-sidebar .provider-menu:empty,.stats-sidebar .sessions-area{{display:none}}.timeline-point{{cursor:pointer;stroke:#101a2a;stroke-width:2}}.tokens-point{{fill:#54c99f}}.cost-point{{fill:#f07878}}.timeline-hint{{margin-left:auto;color:#687990;font-size:10px}}.import-error{{position:fixed;z-index:30;top:20px;left:calc(var(--sidebar) + 24px);right:24px;width:auto;max-width:none;margin:0;padding:12px 16px;border:1px solid #8f3e4b;border-radius:9px;background:#351923;color:#ffb4c0;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.3)}}@media(max-width:700px){{.import-error{{left:20px;right:20px}}}}</style><nav class="view-tabs"><a class="view-tab {"selected" if view != "statistics" else ""}" href="/?{urlencode({"provider": provider, "show_empty": int(show_empty)})}">Operational</a><a class="view-tab {"selected" if view == "statistics" else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "range": time_range})}">Statistics</a></nav>'
-    view_tabs += '<style>.session-expand-controls{display:flex;gap:4px;margin-top:8px}.session-toggle{border:1px solid #40516c;background:#182538;color:#a9c9e9;cursor:pointer}.session-toggle:hover{border-color:#6c7fe2;background:#26365a;color:#fff}.turn-message{display:block!important;margin:12px 14px;width:auto;box-sizing:border-box;padding:0;border:1px solid var(--line);border-bottom:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-message>summary{display:flex;align-items:center;gap:7px;padding:10px 12px;border:0;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-message>summary::-webkit-details-marker{display:none}.turn-message>summary:after{margin-left:auto;color:#6f82a0;content:"▾"}.turn-message:not([open])>summary:after{content:"▸"}.turn-message>p{margin:0;padding:14px 16px;border-top:1px solid var(--line);background:rgba(15,23,34,.6)}.turn-invocations{width:auto;box-sizing:border-box;margin-left:14px;margin-right:14px}.turn-invocations>summary{justify-content:flex-start;gap:7px}.turn-invocations>summary>span:first-child{display:flex;align-items:center;gap:7px}.turn-invocations>summary .summary-count{margin-left:auto}.turn-invocations>summary:after{margin-left:4px;color:#6f82a0;content:"▾"}.turn-invocations:not([open])>summary:after{content:"▸"}.invocation-icon{display:grid;place-items:center;width:22px;height:22px;flex:0 0 22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800;letter-spacing:-.03em}</style><script>(function(){document.addEventListener("click",function(event){var summary=event.target.closest(".turn-message > summary");if(summary){event.preventDefault();summary.parentElement.open=!summary.parentElement.open;return;}var button=event.target.closest(".session-toggle");if(!button)return;var detail=button.closest(".detail");if(!detail)return;var target=button.getAttribute("data-target");var selectors=target==="all"?"details":target==="user"?"details.user-content":target==="assistant"?"details.assistant-content":"details.turn-invocations";var details=detail.querySelectorAll(selectors);var shouldOpen=Array.prototype.some.call(details,function(item){return !item.open});details.forEach(function(item){item.open=shouldOpen});});})();</script>'
+    view_tabs = f'<style>.detail .message p{{font-size:12px}}.detail .muted{{font-size:11px}}.detail .section-kicker{{font-size:10px}}.detail .section-heading h2{{font-size:17px}}.detail .metric span{{font-size:10px}}.detail .metric strong{{font-size:20px}}.assistant .role>span{{width:22px;height:22px;border-radius:7px}}.view-tabs{{display:flex;gap:5px;margin:10px 0 16px;padding:3px;background:#0c1627;border:1px solid #223451;border-radius:8px}}.view-tab{{flex:1;padding:7px 8px;border-radius:6px;color:#8fa8c5;text-align:center;text-decoration:none;font-size:11px}}.view-tab:hover,.view-tab.selected{{background:#24558a;color:#fff}}.stats-group-menu,.stats-time-menu{{padding:4px;background:#0c1627;border:1px solid #223451;border-radius:11px}}.stats-time-menu{{margin-top:12px}}.stats-sidebar-title{{margin:4px 8px 8px;color:#91a8c7;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase}}.stats-sidebar-links{{display:grid;gap:4px}}.stats-sidebar-link{{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid transparent;border-radius:8px;color:#b8c9df;text-decoration:none;font-size:13px}}.stats-sidebar-link .provider-mark{{width:7px;height:7px;flex:none;border-radius:50%;background:#5ca8ff;box-shadow:0 0 0 3px rgba(92,168,255,.12)}}.stats-sidebar-link:hover,.stats-sidebar-link.selected{{border-color:#3b6b9d;background:#2c6aa5;box-shadow:0 4px 12px rgba(24,91,151,.25);color:#fff}}.stats-sidebar .provider-menu:empty,.stats-sidebar .sessions-area{{display:none}}.timeline-point{{cursor:pointer;stroke:#101a2a;stroke-width:2}}.tokens-point{{fill:#54c99f}}.cost-point{{fill:#f07878}}.timeline-hint{{margin-left:auto;color:#687990;font-size:10px}}.import-error{{position:fixed;z-index:30;top:20px;left:calc(var(--sidebar) + 24px);right:24px;width:auto;max-width:none;margin:0;padding:12px 16px;border:1px solid #8f3e4b;border-radius:9px;background:#351923;color:#ffb4c0;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.3)}}@media(max-width:700px){{.import-error{{left:20px;right:20px}}}}</style><nav class="view-tabs"><a class="view-tab {"selected" if view != "statistics" else ""}" href="/?{urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty)})}">Operational</a><a class="view-tab {"selected" if view == "statistics" else ""}" href="/?{urlencode({"view": "statistics", "provider": provider, "group": group, "range": time_range})}">Statistics</a></nav>'
+    view_tabs += '<style>.session-expand-controls{display:flex;gap:4px;margin-top:8px}.session-toggle{margin-left:0;padding:6px 9px;border:1px solid #40516c;border-radius:8px;background:#182538;color:#a9c9e9;font-size:10px;text-transform:none;cursor:pointer}.session-toggle:hover{border-color:#6c7fe2;background:#26365a;color:#fff}.turn-message{display:block!important;margin:12px 14px;width:auto;box-sizing:border-box;padding:0;border:1px solid var(--line);border-bottom:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-message>summary{display:flex;align-items:center;gap:7px;padding:10px 12px;border:0;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-message>summary::-webkit-details-marker{display:none}.turn-message>summary:after{margin-left:auto;color:#6f82a0;content:"▾"}.turn-message:not([open])>summary:after{content:"▸"}.turn-message>p{margin:0;padding:14px 16px;border-top:1px solid var(--line);background:rgba(15,23,34,.6)}.turn-invocations{width:auto;box-sizing:border-box;margin-left:14px;margin-right:14px}.turn-invocations>summary{justify-content:flex-start;gap:7px}.turn-invocations>summary>span:first-child{display:flex;align-items:center;gap:7px}.turn-invocations>summary .summary-count{margin-left:auto}.turn-invocations>summary:after{margin-left:4px;color:#6f82a0;content:"▾"}.turn-invocations:not([open])>summary:after{content:"▸"}.invocation-icon{display:grid;place-items:center;width:22px;height:22px;flex:0 0 22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800;letter-spacing:-.03em}</style><script>(function(){document.addEventListener("click",function(event){var summary=event.target.closest(".turn-message > summary");if(summary){event.preventDefault();summary.parentElement.open=!summary.parentElement.open;return;}var button=event.target.closest(".session-toggle");if(!button)return;var detail=button.closest(".detail");if(!detail)return;var target=button.getAttribute("data-target");var selectors=target==="all"?".turn-message,.turn-invocations":target==="user"?"details.user-content":target==="assistant"?"details.assistant-content":"details.turn-invocations";var details=detail.querySelectorAll(selectors);var shouldOpen=Array.prototype.some.call(details,function(item){return !item.open});details.forEach(function(item){item.open=shouldOpen});});})();</script>'
     view_tabs += '<style>.turn-message>summary,.turn-invocations>summary{min-height:44px;box-sizing:border-box}</style>'
     view_tabs += '<style>.timeline-date-link{cursor:pointer}.timeline-date-link:hover{fill:#fff!important}.timeline-point:hover{stroke:#fff;stroke-width:3}</style>'
     view_tabs += '<style>.session-facts>div{position:relative;padding-right:58px}.copy-value{position:absolute;right:10px;bottom:10px;padding:4px 7px;border:1px solid var(--line-strong);border-radius:6px;background:var(--surface-2);color:#9eb5d0;font-size:9px;cursor:pointer}.copy-value:hover{background:var(--surface-3);color:#fff}</style><script>(function(){document.addEventListener("click",function(event){var button=event.target.closest(".copy-value");if(!button)return;var value=button.getAttribute("data-copy")||"";var done=function(){var original=button.textContent;button.textContent="Copied";setTimeout(function(){button.textContent=original},1200)};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(value).then(done).catch(function(){done()})}else{var area=document.createElement("textarea");area.value=value;document.body.appendChild(area);area.select();document.execCommand("copy");area.remove();done()}});})();</script>'
@@ -1853,14 +1976,14 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     stats_sidebar = (
         '<div class="stats-group-menu"><div class="stats-sidebar-title">Group by</div><nav class="stats-sidebar-links">'
         + "".join(
-                f'<a class="stats-sidebar-link stats-navigation {"selected" if group == option else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": option, "range": time_range})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
+                f'<a class="stats-sidebar-link stats-navigation {"selected" if group == option else ""}" href="/?{urlencode({"view": "statistics", "provider": provider, "group": option, "range": time_range})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
             for option, label in (("today", "Today"), ("day", "Day"), ("week", "Week"), ("month", "Month"), ("year", "Year"), ("project", "Project"), ("tool", "Provider"), ("model", "Model"), ("timeline", "Timeline"))
         )
         + '</nav></div>'
         + (
             '<div class="stats-time-menu"><div class="stats-sidebar-title">Time range</div><nav class="stats-sidebar-links">'
             + "".join(
-                f'<a class="stats-sidebar-link stats-navigation {"selected" if time_range == option else ""}" href="/?{urlencode({"provider": provider, "view": "statistics", "group": group, "range": option})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
+                f'<a class="stats-sidebar-link stats-navigation {"selected" if time_range == option else ""}" href="/?{urlencode({"view": "statistics", "provider": provider, "group": group, "range": option})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
                 for option, label in (("all", "All time"), ("today", "Today"), ("7d", "Last 7 days"), ("30d", "Last 30 days"), ("90d", "Last 90 days"), ("365d", "Last year"))
             )
             + '</nav></div>'
@@ -1877,7 +2000,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         route = urlparse(self.path).path
         if route == "/shutdown":
-            body = b"AI Tool Session Explorer has been closed. You can close this tab."
+            body = b"AI Tool Session Tracker has been closed. You can close this tab."
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -2034,7 +2157,7 @@ def main() -> None:
     parser.add_argument("--root", type=Path, default=github_copilot_provider.default_root(), help="Copilot/agent session root folder")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
-    LOGGER.info("Starting AI Tool Session Explorer")
+    LOGGER.info("Starting AI Tool Session Tracker")
     if log_path:
         LOGGER.info("Log file: %s", log_path)
     if not acquire_instance_mutex():
@@ -2219,7 +2342,6 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
         <div class="sidebar-top">
             <div class="brand-row"><span class="brand-mark">AI</span><div><div class="brand">__APP_NAME__</div><div class="brand-subtitle">Local AI activity</div></div></div>
             __VIEW_TABS__
-            <form class="shutdown-form" action="/shutdown" method="post" onsubmit="return confirm('Close the local session explorer?');"><button type="submit">Exit application</button></form>
             <nav class="provider-menu" aria-label="AI providers">__PROVIDER_MENU__</nav>
             __STATS_SIDEBAR__
         </div>
@@ -2230,6 +2352,7 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
             </div>
             <div class="session-list">__SESSION_ROWS__<div class="empty-search" hidden>No matching sessions</div></div>
         </div>
+        <form class="shutdown-form" action="/shutdown" method="post" onsubmit="return confirm('Close the local session explorer?');"><button type="submit">Exit application</button></form>
     </aside>
     <button class="sidebar-scrim" type="button" aria-label="Close sessions"></button>
     __DETAIL__
@@ -2241,9 +2364,10 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
     document.querySelector('.menu-button').addEventListener('click',function(){body.classList.toggle('nav-open')});
     document.querySelector('.sidebar-scrim').addEventListener('click',closeNav);
     document.addEventListener('keydown',function(event){
-        if(event.key==='Escape') closeNav();
+        if(event.key==='Escape'){closeNav();document.querySelectorAll('.model-analysis[open]').forEach(function(panel){panel.removeAttribute('open')});}
         if(event.key==='/' && document.activeElement!==search){event.preventDefault();search.focus();}
     });
+    document.addEventListener('click',function(event){document.querySelectorAll('.model-analysis[open]').forEach(function(panel){if(!panel.contains(event.target))panel.removeAttribute('open')});});
     search.addEventListener('input',function(){
         var query=search.value.trim().toLowerCase(), visible=0;
         document.querySelectorAll('.session-row').forEach(function(row){var show=!query||row.textContent.toLowerCase().includes(query);row.hidden=!show;if(show)visible++;});
@@ -2264,7 +2388,7 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
 
 PAGE = PAGE.replace('</style>\n</head>', '''<style>
 /* Compact invocation cards: tools stay vertical, metrics stay horizontal. */
-.shutdown-form{margin:14px 0 0}.stats-sidebar .shutdown-form{margin-bottom:14px}.shutdown-form button{width:100%;height:30px;border:1px solid #713243;border-radius:8px;background:#24121a;color:#ff9aaa;font-size:10px;font-weight:700;cursor:pointer}.shutdown-form button:hover{border-color:#a64b61;background:#351721;color:#fff}
+.shutdown-form{margin:14px 0 0}.sidebar>.shutdown-form{margin:0 14px 16px;padding-top:12px;border-top:1px solid #202b3d}.stats-sidebar .shutdown-form{margin-bottom:14px}.shutdown-form button{display:flex;align-items:center;justify-content:center;gap:7px;width:100%;height:34px;border:1px solid #633346;border-radius:9px;background:linear-gradient(145deg,#291923,#21151e);box-shadow:0 5px 14px rgba(0,0,0,.16);color:#f0a6b4;font-size:10px;font-weight:750;letter-spacing:.02em;cursor:pointer;transition:border-color .15s,background .15s,transform .15s,box-shadow .15s}.shutdown-form button:before{content:"↪";font-size:13px;line-height:1}.shutdown-form button:hover{border-color:#bd6078;background:linear-gradient(145deg,#41202d,#321923);box-shadow:0 7px 18px rgba(78,25,44,.28);color:#fff;transform:translateY(-1px)}.shutdown-form button:active{transform:translateY(0);box-shadow:0 3px 9px rgba(0,0,0,.18)}
 .turn-invocations{margin:12px 14px;padding:0;border:1px solid #263247;border-radius:11px;background:#0b1018;overflow:hidden}
 .turn-invocations>summary{padding:11px 13px;background:#111925}
 .invocations-list{display:grid;gap:8px;padding:8px}
@@ -2301,10 +2425,48 @@ PAGE = PAGE.replace('</style>\n</head>', '''<style>
 .delegated-agent-heading>b{padding:3px 6px;border:1px solid #315b72;border-radius:999px;color:#a9dcef;font-size:8px}
 .delegated-agent-heading>strong{margin-left:auto;color:#c6d8e7;font-size:9px}
 .delegated-agent .invocation-usage{margin:0}
+.model-analysis{position:relative}
+.model-analysis>summary{display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border:1px solid #3e4b69;border-radius:9px;background:#171f31;color:#b9c6d9;font-size:10px;font-weight:700;cursor:pointer;list-style:none;white-space:nowrap}
+.model-analysis>summary::-webkit-details-marker{display:none}
+.model-analysis>summary:hover,.model-analysis[open]>summary{border-color:#6474bd;background:#252e51;color:#fff}
+.model-analysis>summary>b{display:grid;place-items:center;min-width:18px;height:18px;padding:0 5px;border-radius:999px;background:#333d68;color:#d8ddff;font-size:8px}
+.model-analysis-popover{position:fixed;z-index:40;top:84px;right:12px;display:grid;gap:9px;width:min(1040px,calc(100vw - 24px));max-height:min(72vh,680px);padding:13px;border:1px solid #3b4862;border-radius:12px;background:#0d131d;box-shadow:0 22px 65px rgba(0,0,0,.55);overflow:auto}
+.model-analysis-popover>header{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding:2px 2px 8px;border-bottom:1px solid #263247}
+.model-analysis-popover h2{margin:0;color:#e6edf7;font-size:15px}
+.model-analysis-popover>header small{max-width:360px;color:#718198;font-size:9px;line-height:1.45;text-align:right}
+.model-analysis-row{display:grid;gap:7px;padding:9px;border:1px solid #28354a;border-radius:9px;background:#111925}
+.model-analysis-row>header{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.model-analysis-row>header b{color:#c9d7e9;font-size:11px}
+.model-analysis-row>header span{color:#71849d;font-size:9px}
+.model-analysis-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}
+.model-analysis-metrics .metric{min-height:49px;padding:7px 8px;border-radius:8px}
+.model-analysis-metrics .metric strong{margin-top:5px;font-size:11px}
+.session-facts code{overflow-x:auto;text-overflow:clip;scrollbar-width:none}
+.session-facts code::-webkit-scrollbar{display:none}
+.sidebar-top .provider-menu{max-height:130px;overflow-y:auto;margin-right:-14px;padding-right:4px;scrollbar-width:thin;scrollbar-color:#344056 transparent}
+.sidebar-top{padding-left:14px;padding-right:14px}
+.sidebar-top .provider-menu{padding:10px 4px 10px 0;border:0;border-top:1px solid #202b3d;border-bottom:1px solid #202b3d;border-radius:0;background:transparent}
+.sidebar-top .provider{height:auto;min-height:34px;padding:8px 10px;border:1px solid transparent;border-radius:11px;color:#b9c4d3;font-size:12px;font-weight:650}
+.sidebar-top .provider:hover{background:#131a26;color:#dce5f2}
+.sidebar-top .provider.selected{border-color:#293750;background:linear-gradient(100deg,#182235,#131a27);box-shadow:none;color:#fff}
+.sidebar-top .provider-menu::-webkit-scrollbar{width:7px}
+.sidebar-top .provider-menu::-webkit-scrollbar-track{background:transparent;border-radius:8px}
+.sidebar-top .provider-menu::-webkit-scrollbar-thumb{background:#344056;border-radius:8px}
+.sidebar-top .provider-menu::-webkit-scrollbar-thumb:hover{background:#52617b}
 .invocation-usage{grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:7px}
 .invocation-metric-group{padding:7px;background:#0d141f}
 .invocation-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}
 .output-group .invocation-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+/* Token-card hierarchy: session > turn > invocation > delegated agent. */
+.overview>.metrics .metric{min-height:70px;padding:14px 15px}
+.overview>.metrics .metric strong{font-size:19px}
+.turn-metrics .metric{min-height:64px;padding:12px 13px}
+.turn-metrics .metric strong{font-size:17px}
+.turn-invocation .invocation-usage .metric.compact{min-height:58px;padding:9px 10px}
+.turn-invocation .invocation-usage .metric.compact strong{font-size:14px}
+.turn-invocation .delegated-agent .invocation-usage .metric.compact{min-height:52px;padding:8px 9px}
+.turn-invocation .delegated-agent .invocation-usage .metric.compact strong{font-size:12px}
+.turn-invocation .delegated-agent .invocation-usage .metric.compact span{font-size:8px}
 .raw-event{margin:0 0 10px;border:1px solid #263247;border-radius:9px;background:#101722;overflow:hidden}
 .raw-event>summary{display:flex;align-items:center;gap:8px;padding:9px 10px;cursor:pointer;list-style:none;color:#b7c5d9}
 .raw-event>summary::-webkit-details-marker{display:none}
@@ -2320,7 +2482,7 @@ PAGE = PAGE.replace('</style>\n</head>', '''<style>
 .raw-event-context{border-color:#3d355f}
 .raw-event-context>summary{background:#171327}
 .raw-event-metadata,.raw-event-instructions,.raw-event-raw{border-color:#263247}
-@media(max-width:620px){.turn-invocation{display:block}.invocation-name{margin-bottom:7px}.invocation-usage{grid-template-columns:1fr}}
+@media(max-width:620px){.turn-invocation{display:block}.invocation-name{margin-bottom:7px}.invocation-usage{grid-template-columns:1fr}.model-analysis-popover{position:fixed;top:64px;right:12px;left:12px;width:auto;max-height:calc(100vh - 78px)}.model-analysis-popover>header{align-items:flex-start;flex-direction:column}.model-analysis-popover>header small{text-align:left}.model-analysis-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.model-analysis-metrics .metric:last-child{grid-column:1/-1}}
 </style></head>''')
 
 

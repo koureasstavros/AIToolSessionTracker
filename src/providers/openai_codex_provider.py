@@ -325,10 +325,13 @@ def details(summary: dict) -> dict:
     result["ownTokens"] = dict(result["tokens"])
     result["subagentTokens"] = viewer.blank_tokens()
     tools_by_agent_id: dict[str, dict] = {}
+    turn_by_tool_id: dict[str, dict] = {}
     for turn in result["turns"]:
         for tool in turn.get("tools", []):
             if not isinstance(tool, dict) or tool.get("name") != "spawn_agent":
                 continue
+            if tool.get("id"):
+                turn_by_tool_id[str(tool["id"])] = turn
             output = tool.get("result")
             try:
                 output = json.loads(output) if isinstance(output, str) else output
@@ -350,6 +353,12 @@ def details(summary: dict) -> dict:
         result["subagents"].append(child)
         if tool is not None:
             tool["subagent"] = child
+            owner_turn = turn_by_tool_id.get(str(tool.get("id")))
+            if owner_turn is not None:
+                for key in viewer.TOKEN_KEYS:
+                    value = child.get("tokens", {}).get(key)
+                    if isinstance(value, int):
+                        owner_turn["tokens"][key] = (owner_turn["tokens"][key] or 0) + value
         for key in viewer.TOKEN_KEYS:
             value = child.get("tokens", {}).get(key)
             if isinstance(value, int):

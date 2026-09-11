@@ -1,11 +1,11 @@
 ---
 language: ["en"]
-tags: ["ai", "tool", "model", "tracker", "llm", "slm", "session", "turn", "invocation"]
+tags: ["ai", "tool", "tracker", "llm", "slm", "model", "session", "turn", "invocation", "agents", "tools", "context"]
 license: "apache-2.0"
-version: v0.0.28
+version: v0.0.29
 ---
 
-# AI Tool Session Explorer
+# AI Tool Session Tracker
 
 A local, read-only browser app for exploring AI coding-agent sessions, turns, content, raw events, and token usage.
 
@@ -53,7 +53,7 @@ can run the packaged executable without installing Python.
 
 On Windows, double-click `packer\windows\build_windows_exe.bat`. The
 script installs PyInstaller into the active Python environment if necessary and
-creates `dist\AI-Tool-Session-Explorer.exe`. The executable starts the local
+creates `dist\AI-Tool-Session-Tracker.exe`. The executable starts the local
 viewer and opens it in the default browser.
 
 The executable hosts the local web server while the viewer is in use, so its
@@ -65,7 +65,7 @@ the second launch reopens the existing viewer URL without starting another
 application process.
 
 Startup and runtime errors are written to
-`%LOCALAPPDATA%\AI-Tool-Session-Explorer\session-explorer.log`. The application
+`%LOCALAPPDATA%\AI-Tool-Session-Tracker\session-explorer.log`. The application
 continues when an individual provider's local storage folder does not exist;
 that provider simply shows no sessions while other available providers remain
 usable.
@@ -83,6 +83,35 @@ The **Operational** view presents detailed session information, including turns,
 invocations, usage, costs, context, and other available metadata. The
 **Statistics** view summarizes activity across providers, with aggregated usage
 and cost information that can be grouped and explored at a higher level.
+
+### Hierarchy Handling
+
+The viewer uses the following hierarchy when presenting provider activity:
+
+- **Session:** One persisted conversation or provider transcript, including all
+	of its turns, usage, tools, and delegated work.
+- **Turn:** One user interaction and the assistant activity that follows it.
+	A turn can contain several model responses and tool operations.
+- **Invocation:** One model interaction or execution cycle within a turn. It
+	contains the model usage for that response and any tools requested by it.
+- **Sub-invocation:** A nested model interaction created by delegated work. A
+	tool call can start an agent, and that agent has its own turn and invocation
+	while remaining linked to the parent invocation.
+
+The relationship is therefore commonly represented as:
+
+```text
+Session
+└── Turn
+    └── Invocation
+        ├── Tool call
+        └── Delegated agent
+            └── Sub-invocation
+```
+
+Delegated-agent usage is linked back to the owning turn and invocation for
+display and totals, while each model interaction retains its own token and
+cost information.
 
 ## Supported providers
 

@@ -129,6 +129,10 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         linked_agent = session["turns"][0]["invocations"][0]["tools"][0]["subagent"]
         self.assertEqual(linked_agent["agentDescription"], "Review delegated work")
         self.assertEqual(linked_agent["ownTokens"]["outputTokens"], 2)
+        self.assertEqual(session["turns"][0]["tokens"]["inputTokens"], 5)
+        self.assertEqual(session["turns"][0]["tokens"]["outputTokens"], 5)
+        self.assertEqual(session["tokens"]["inputTokens"], 5)
+        self.assertEqual(session["tokens"]["outputTokens"], 5)
         self.assertEqual(
             linked_agent["turns"][0]["internalInstructions"][0]["name"],
             "Claude prompt_snapshot",
@@ -221,6 +225,49 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(len(turn["invocations"]), 2)
         self.assertEqual(turn["tools"][0]["result"], "Delegated result")
         self.assertEqual(turn["assistant"][-1], "The agent finished.")
+
+    def test_final_duplicate_usage_replaces_partial_usage(self) -> None:
+        records = [
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "sessionId": "session-1",
+                "message": {"role": "user", "content": "Write a haiku"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "assistant-partial",
+                "message": {
+                    "id": "message-1",
+                    "role": "assistant",
+                    "content": "A partial response",
+                    "usage": {"input_tokens": 10, "output_tokens": 4},
+                },
+            },
+            {
+                "type": "assistant",
+                "uuid": "assistant-final",
+                "message": {
+                    "id": "message-1",
+                    "role": "assistant",
+                    "content": "A final response",
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 273,
+                        "output_tokens_details": {"thinking_tokens": 249},
+                    },
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session-1.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+            session = anthropic_claude_provider.details({"_source": path})
+
+        self.assertEqual(session["tokens"]["outputTokens"], 273)
+        self.assertEqual(session["tokens"]["reasoningTokens"], 249)
+        self.assertEqual(session["turns"][0]["invocations"][0]["tokens"]["outputTokens"], 273)
 
     def test_synthetic_error_does_not_replace_or_inherit_real_model_for_pricing(self) -> None:
         records = [

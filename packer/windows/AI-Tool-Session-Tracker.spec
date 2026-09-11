@@ -28,7 +28,7 @@ exe = EXE(
     analysis.binaries,
     analysis.datas,
     [],
-    name="AI-Tool-Session-Explorer",
+    name="AI-Tool-Session-Tracker",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

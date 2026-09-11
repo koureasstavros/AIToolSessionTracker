@@ -13,8 +13,8 @@ if errorlevel 1 (
     )
 )
 
-echo Building AI Tool Session Explorer...
-python -m PyInstaller --clean --noconfirm "packer\windows\AI-Tool-Session-Explorer.spec"
+echo Building AI Tool Session Tracker...
+python -m PyInstaller --clean --noconfirm --distpath "dist\windows" "packer\windows\AI-Tool-Session-Tracker.spec"
 if errorlevel 1 (
     echo Build failed.
     exit /b 1
@@ -22,5 +22,5 @@ if errorlevel 1 (
 
 echo.
 echo Build complete:
-echo dist\AI-Tool-Session-Explorer.exe
+echo dist\windows\AI-Tool-Session-Tracker.exe
 endlocal

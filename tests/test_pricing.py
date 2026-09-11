@@ -122,6 +122,55 @@ class PricingTests(unittest.TestCase):
         self.assertAlmostEqual(child["costUsd"], 0.0004)
         self.assertEqual(child["pricingModel"], "gpt-5.6-luna")
 
+    def test_mixed_model_session_uses_each_agents_actual_model_rate(self) -> None:
+        parent_tokens = {
+            "inputTokens": 100,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "outputTokens": 50,
+            "reasoningTokens": 10,
+        }
+        agent_tokens = {
+            "inputTokens": 20,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "outputTokens": 10,
+            "reasoningTokens": 2,
+        }
+        aggregate_tokens = {
+            key: parent_tokens[key] + agent_tokens[key]
+            for key in parent_tokens
+        }
+        agent = {
+            "model": "claude-haiku-4-5",
+            "tokens": dict(agent_tokens),
+            "turns": [{"tokens": dict(agent_tokens), "invocations": []}],
+        }
+        session = {
+            "model": "claude-sonnet-4-5",
+            "tokens": dict(aggregate_tokens),
+            "turns": [{
+                "model": "claude-sonnet-4-5",
+                "tokens": dict(aggregate_tokens),
+                "invocations": [{
+                    "tokens": dict(parent_tokens),
+                    "tools": [{"subagent": agent}],
+                }],
+            }],
+            "subagents": [agent],
+        }
+
+        pricing.apply_costs(session)
+
+        expected = (
+            pricing.cost_for_tokens(parent_tokens, "claude-sonnet-4-5")
+            + pricing.cost_for_tokens(agent_tokens, "claude-haiku-4-5")
+        )
+        self.assertAlmostEqual(session["costUsd"], expected)
+        self.assertAlmostEqual(session["turns"][0]["costUsd"], expected)
+        self.assertEqual(session["pricingModel"], "Mixed")
+        self.assertAlmostEqual(sum(session["costBreakdown"].values()), expected)
+
     def test_anthropic_claude_session_cost_is_applied(self) -> None:
         self._assert_provider_session_cost("claude-sonnet-4-5", 0.00069)
 

@@ -1,14 +1,14 @@
-# AI Tool Session Explorer
+# AI Tool Session Tracker
 
 ## Introduction
 
-AI Tool Session Explorer is a local, read-only web application for browsing AI coding-agent sessions from popular providers such as GitHub Copilot, OpenAI Codex, Anthropic Claude Code, and Microsoft 365 Copilot. It displays conversations, turns, raw events, token usage, cost usage with plenty of information like surfage, models, projects while keeping all data on the user’s machine. The tool also supports provider-specific source archive export and import, with validation to help protect local files.
+AI Tool Session Tracker is a local, read-only web application for browsing AI coding-agent sessions from popular providers such as GitHub Copilot, OpenAI Codex, Anthropic Claude Code, and Microsoft 365 Copilot. It displays conversations, turns, raw events, token usage, cost usage with plenty of information like surfage, models, projects while keeping all data on the user’s machine. The tool also supports provider-specific source archive export and import, with validation to help protect local files.
 
 ## AI Tool Session Tracker
 
-AI Tool Session Explorer provides a convenient way to understand and manage local AI assistant activity. It brings session history from multiple providers into one interface, making it easier to review conversations, inspect token consumption, compare model usage, estimate costs, and organize transcript archives without sending data to the cloud.
+AI Tool Session Tracker provides a convenient way to understand and manage local AI assistant activity. It brings session history from multiple providers into one interface, making it easier to review conversations, inspect token consumption, compare model usage, estimate costs, and organize transcript archives without sending data to the cloud.
 
-![AI Tool Session Explorer](material/documentation/0b32779a-d984-4aeb-af71-e6f1d7e681aa.png)
+![AI Tool Session Tracker](material/documentation/0b32779a-d984-4aeb-af71-e6f1d7e681aa.png)
 
 ## Select View Mode
 

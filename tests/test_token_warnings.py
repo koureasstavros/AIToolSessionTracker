@@ -94,6 +94,12 @@ class TokenWarningTests(unittest.TestCase):
         self.assertIn("Price is not accurate", markup)
         self.assertIn("⚠", markup)
 
+    def test_output_card_shows_non_thinking_output(self) -> None:
+        markup = token_cards({"outputTokens": 1_412, "reasoningTokens": 547})
+
+        self.assertIn("865 /", markup)
+        self.assertNotIn("1,412 /", markup)
+
 
 if __name__ == "__main__":
     unittest.main()

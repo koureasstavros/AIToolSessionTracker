@@ -161,6 +161,10 @@ class CodexInvocationGroupingTests(unittest.TestCase):
         self.assertNotIn("internalInstructions", session["turns"][0])
         self.assertEqual(tool["subagent"]["tokens"]["inputTokens"], 10)
         self.assertEqual(tool["subagent"]["tokens"]["outputTokens"], 5)
+        self.assertEqual(session["turns"][0]["tokens"]["inputTokens"], 20)
+        self.assertEqual(session["turns"][0]["tokens"]["cacheReadTokens"], 80)
+        self.assertEqual(session["turns"][0]["tokens"]["cacheWriteTokens"], 50)
+        self.assertEqual(session["turns"][0]["tokens"]["outputTokens"], 15)
 
 
 if __name__ == "__main__":

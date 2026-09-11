@@ -31,3 +31,14 @@ Recent commits use short, task-focused summaries such as `Fixing and testing imp
 ## Security & Privacy Tips
 
 The app reads sensitive local transcripts and must remain local-only. Do not add telemetry, cloud uploads, or sample session data containing real prompts, paths, tool results, or secrets. Preserve archive path-traversal validation and treat deletion behavior as destructive and irreversible.
+
+## UI Token Card Hierarchy
+
+Keep token cards visually smaller as their scope becomes more specific:
+
+1. Session totals — largest cards.
+2. Turn totals — smaller than session cards.
+3. Invocation totals — smaller than turn cards.
+4. Delegated-agent totals — smallest cards.
+
+When changing token-card styles, preserve this order using the existing scope selectors: `.overview > .metrics`, `.turn-metrics`, `.invocation-total`/`.invocation-parent-body`, and `.delegated-agent`. The hierarchy applies to card dimensions, padding, and value typography while retaining readable labels and accessible contrast.

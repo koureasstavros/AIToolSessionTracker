@@ -1,6 +1,7 @@
+import inspect
 import unittest
 
-from session_token_viewer import PAGE, render_timeline_svg
+from session_token_viewer import PAGE, render, render_timeline_svg
 
 
 class StatisticsNavigationTests(unittest.TestCase):
@@ -17,6 +18,11 @@ class StatisticsNavigationTests(unittest.TestCase):
     def test_view_tabs_use_the_loading_overlay(self) -> None:
         self.assertIn("a.view-tab", PAGE)
         self.assertIn("loading('Loading session data…')", PAGE)
+
+    def test_all_toggle_targets_only_top_level_turn_panels(self) -> None:
+        render_source = inspect.getsource(render)
+        self.assertIn('target==="all"?".turn-message,.turn-invocations"', render_source)
+        self.assertNotIn('target==="all"?"details"', render_source)
 
 
 if __name__ == "__main__":

@@ -890,6 +890,23 @@ def details(summary: dict) -> dict:
             if isinstance(value, int):
                 result["subagentTokens"][key] = (result["subagentTokens"][key] or 0) + value
                 result["tokens"][key] = (result["tokens"][key] or 0) + value
+    # Keep turn cards consistent with invocation rollups. Delegated usage is
+    # already included in the session total, but must also be attached to the
+    # turn that owns the corresponding tool call.
+    linked_turns: dict[int, dict] = {}
+    for turn in result.get("turns", []):
+        for tool in turn.get("tools", []) if isinstance(turn.get("tools"), list) else []:
+            agent = tool.get("subagent") if isinstance(tool, dict) else None
+            if isinstance(agent, dict):
+                linked_turns[id(agent)] = turn
+    for child in result["subagents"]:
+        owner_turn = linked_turns.get(id(child))
+        if owner_turn is None:
+            continue
+        for key in viewer.TOKEN_KEYS:
+            value = child.get("tokens", {}).get(key)
+            if isinstance(value, int):
+                owner_turn["tokens"][key] = (owner_turn["tokens"][key] or 0) + value
     result["source"] = str(summary.get("_source", ""))
     return result
 

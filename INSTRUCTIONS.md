@@ -14,5 +14,5 @@ gh release create v0.0.XX --notes-file README.md
 gh release delete v0.0.XX
 
 For generating release based on source code and a compiled binary:
-gh release create v0.0.XX dist/AI-Tool-Session-Explorer.exe --title "v0.0.XX" --notes-file README.md
+gh release create v0.0.XX dist/windows/AI-Tool-Session-Tracker.exe --title "v0.0.XX" --notes-file README.md
 gh release delete v0.0.XX

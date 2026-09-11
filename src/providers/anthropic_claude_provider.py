@@ -208,7 +208,11 @@ def details(summary: dict) -> dict:
     turns: dict[str, dict] = {}
     tool_calls: dict[str, tuple[dict, dict, dict]] = {}
     message_invocations: dict[str, tuple[dict, dict]] = {}
-    seen_usage_records: set[str] = set()
+    # Claude can emit a partial assistant record and a later final record
+    # with the same message ID. Keep the latest normalized usage so final
+    # output and thinking-token counts replace the partial values instead of
+    # being discarded by message-level deduplication.
+    seen_usage_records: dict[str, dict[str, int | None]] = {}
     session_token_fields: set[str] = set()
     current_turn: dict | None = None
     previous_was_tool_result = False
@@ -393,14 +397,22 @@ def details(summary: dict) -> dict:
             usage_id = message_id or record.get("requestId")
             if usage_id is None:
                 usage_id = record.get("uuid")
-            if usage_id is None or str(usage_id) not in seen_usage_records:
-                if usage_id is not None:
-                    seen_usage_records.add(str(usage_id))
-                for key, value in viewer.usage_from(usage).items():
-                    if value is not None:
-                        turn["tokens"][key] = (turn["tokens"][key] or 0) + value
-                        if invocation is not None:
-                            invocation["tokens"][key] = (invocation["tokens"][key] or 0) + value
+            normalized_usage = viewer.usage_from(usage)
+            if usage_id is None:
+                usage_delta = normalized_usage
+            else:
+                usage_key = str(usage_id)
+                previous_usage = seen_usage_records.get(usage_key, viewer.blank_tokens())
+                usage_delta = {
+                    key: (normalized_usage[key] or 0) - (previous_usage[key] or 0)
+                    for key in viewer.TOKEN_KEYS
+                }
+                seen_usage_records[usage_key] = normalized_usage
+            for key, value in usage_delta.items():
+                if value is not None:
+                    turn["tokens"][key] = (turn["tokens"][key] or 0) + value
+                    if invocation is not None:
+                        invocation["tokens"][key] = (invocation["tokens"][key] or 0) + value
         if not result["model"] and payload.get("model"):
             result["model"] = payload["model"]
         previous_was_tool_result = False
@@ -422,6 +434,7 @@ def details(summary: dict) -> dict:
     children = summary.get("_children") if isinstance(summary.get("_children"), list) else []
     subagents = []
     subagent_tokens = viewer.blank_tokens()
+    unlinked_subagent_tokens = viewer.blank_tokens()
     for child_summary in children:
         if not isinstance(child_summary, dict) or not isinstance(child_summary.get("_source"), Path):
             continue
@@ -436,6 +449,21 @@ def details(summary: dict) -> dict:
         reference = tool_calls.get(str(child["toolUseId"])) if child.get("toolUseId") else None
         if reference is not None:
             reference[2]["subagent"] = child
+            # A turn's usage must represent all work initiated by that turn,
+            # not only the parent Claude response.  Invocation cards already
+            # roll delegated usage into their totals; mirror that aggregation
+            # on the owning turn so the turn and session cards reconcile with
+            # the invocation cards.
+            owner_turn = reference[0]
+            for key in viewer.TOKEN_KEYS:
+                value = child.get("tokens", {}).get(key)
+                if isinstance(value, int):
+                    owner_turn["tokens"][key] = (owner_turn["tokens"][key] or 0) + value
+        else:
+            for key in viewer.TOKEN_KEYS:
+                value = child.get("tokens", {}).get(key)
+                if isinstance(value, int):
+                    unlinked_subagent_tokens[key] = (unlinked_subagent_tokens[key] or 0) + value
         for key in viewer.TOKEN_KEYS:
             value = child.get("tokens", {}).get(key)
             if isinstance(value, int):
@@ -444,8 +472,17 @@ def details(summary: dict) -> dict:
     result["subagents"] = subagents
     result["subagentTokens"] = subagent_tokens
     for key in viewer.TOKEN_KEYS:
-        if subagent_tokens[key] is not None:
-            result["tokens"][key] = (result["tokens"][key] or 0) + subagent_tokens[key]
+        # Recompute after delegated usage has been attached to its owning
+        # turn; the earlier session sum intentionally runs before children
+        # are discovered.
+        turn_values = [
+            turn["tokens"][key]
+            for turn in result["turns"]
+            if turn["tokens"][key] is not None
+        ]
+        result["tokens"][key] = sum(turn_values) if turn_values else None
+        if unlinked_subagent_tokens[key] is not None:
+            result["tokens"][key] = (result["tokens"][key] or 0) + unlinked_subagent_tokens[key]
     return result
 
 

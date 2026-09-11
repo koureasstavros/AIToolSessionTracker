@@ -65,20 +65,97 @@ def cost_breakdown(tokens: dict[str, object], model: object) -> dict[str, float]
 
 
 def apply_costs(session: dict) -> dict:
-    """Annotate a normalized session, turns, and invocations with USD costs."""
+    """Annotate usage with model-aware costs, including delegated agents."""
+    token_keys = ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens", "reasoningTokens")
     model = session.get("model")
     pricing_models: set[str] = set()
+    subagents = session.get("subagents", []) if isinstance(session.get("subagents"), list) else []
+    for subagent in subagents:
+        if isinstance(subagent, dict):
+            apply_costs(subagent)
+            subagent_model = subagent.get("pricingModel")
+            if isinstance(subagent_model, str) and subagent_model != "Mixed":
+                pricing_models.add(subagent_model)
+
+    def empty_breakdown() -> dict[str, float]:
+        return {key: 0.0 for key in token_keys}
+
+    def add_component(
+        target_costs: dict[str, float],
+        target_tokens: dict[str, int],
+        tokens: object,
+        component_model: object,
+    ) -> bool:
+        if not isinstance(tokens, dict):
+            return False
+        component_costs = cost_breakdown(tokens, component_model)
+        for key in token_keys:
+            value = tokens.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                target_tokens[key] += value
+            target_costs[key] += component_costs.get(key) or 0.0
+        return bool(component_costs)
+
+    linked_agents: set[int] = set()
+    session_costs = empty_breakdown()
+    session_accounted = {key: 0 for key in token_keys}
+    session_has_pricing = False
     for turn in session.get("turns", []):
         turn_model = turn.get("model") or model
         turn["model"] = turn_model
         turn_price = find_model(turn_model)
         if turn_price:
             pricing_models.add(turn_price["model"])
+        turn_costs = empty_breakdown()
+        turn_accounted = {key: 0 for key in token_keys}
+        turn_has_pricing = False
         for invocation in turn.get("invocations", []) if isinstance(turn.get("invocations"), list) else []:
             invocation_model = invocation.get("model") or turn_model
             invocation["model"] = invocation_model
             invocation["costUsd"] = cost_for_tokens(invocation.get("tokens", {}), invocation_model)
-        turn["costUsd"] = cost_for_tokens(turn.get("tokens", {}), turn_model)
+            invocation_price = find_model(invocation_model)
+            if invocation_price:
+                pricing_models.add(invocation_price["model"])
+            turn_has_pricing = add_component(
+                turn_costs, turn_accounted, invocation.get("tokens", {}), invocation_model
+            ) or turn_has_pricing
+            for tool in invocation.get("tools", []) if isinstance(invocation.get("tools"), list) else []:
+                agent = tool.get("subagent") if isinstance(tool, dict) and isinstance(tool.get("subagent"), dict) else None
+                if agent is None or id(agent) in linked_agents:
+                    continue
+                linked_agents.add(id(agent))
+                agent_model = agent.get("pricingModel") or agent.get("agentModel") or agent.get("model")
+                turn_has_pricing = add_component(
+                    turn_costs, turn_accounted, agent.get("tokens", {}), agent_model
+                ) or turn_has_pricing
+        residual = {
+            key: max(0, (turn.get("tokens", {}).get(key) or 0) - turn_accounted[key])
+            for key in token_keys
+        }
+        if any(residual.values()):
+            turn_has_pricing = add_component(turn_costs, turn_accounted, residual, turn_model) or turn_has_pricing
+        turn["costBreakdown"] = turn_costs if turn_has_pricing else {key: None for key in token_keys}
+        turn["costUsd"] = sum(turn_costs.values()) if turn_has_pricing else None
+        for key in token_keys:
+            session_costs[key] += turn_costs[key]
+            session_accounted[key] += turn.get("tokens", {}).get(key) or 0
+        session_has_pricing = session_has_pricing or turn_has_pricing
+
+    for subagent in subagents:
+        if not isinstance(subagent, dict) or id(subagent) in linked_agents:
+            continue
+        agent_costs = subagent.get("costBreakdown") if isinstance(subagent.get("costBreakdown"), dict) else {}
+        for key in token_keys:
+            session_costs[key] += agent_costs.get(key) or 0.0
+            session_accounted[key] += subagent.get("tokens", {}).get(key) or 0
+        session_has_pricing = session_has_pricing or subagent.get("costUsd") is not None
+
+    session_residual = {
+        key: max(0, (session.get("tokens", {}).get(key) or 0) - session_accounted[key])
+        for key in token_keys
+    }
+    if any(session_residual.values()):
+        session_has_pricing = add_component(session_costs, session_accounted, session_residual, model) or session_has_pricing
     # Some providers use placeholders such as ``<synthetic>`` at session
     # level while storing the real model on each turn. Promote a single
     # priced turn model so aggregate cards and sessions without turns can be
@@ -86,11 +163,8 @@ def apply_costs(session: dict) -> dict:
     if find_model(model) is None and len(pricing_models) == 1:
         model = next(iter(pricing_models))
         session["model"] = model
-    if session.get("turns"):
-        costs = [turn.get("costUsd") for turn in session["turns"]]
-        session["costUsd"] = sum(value for value in costs if isinstance(value, (int, float))) if any(value is not None for value in costs) else None
-    else:
-        session["costUsd"] = cost_for_tokens(session.get("tokens", {}), model)
+    session["costBreakdown"] = session_costs if session_has_pricing else {key: None for key in token_keys}
+    session["costUsd"] = sum(session_costs.values()) if session_has_pricing else None
     if not pricing_models:
         price = find_model(model)
         session["pricingModel"] = price["model"] if price else None
@@ -98,7 +172,4 @@ def apply_costs(session: dict) -> dict:
         session["pricingModel"] = next(iter(pricing_models))
     else:
         session["pricingModel"] = "Mixed"
-    for subagent in session.get("subagents", []) if isinstance(session.get("subagents"), list) else []:
-        if isinstance(subagent, dict):
-            apply_costs(subagent)
     return session
