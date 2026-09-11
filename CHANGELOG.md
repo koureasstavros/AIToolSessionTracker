@@ -4,6 +4,10 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Tracker, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.30 — 2026-09-11
+
+- Incorporating progressive lazy loading for sessions
+
 ### Version v0.0.29 — 2026-09-11
 
 - Reconciling token numbers and costs into different levels

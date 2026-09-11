@@ -912,37 +912,40 @@ def details(summary: dict) -> dict:
 
 
 def delete(summary: dict) -> None:
-    viewer = _viewer()
-    if summary["_kind"] != "copilot-db":
-        source = summary["_source"]
-        if summary.get("relation") == "subagent":
-            if summary["_kind"] == "copilot-session-state":
-                import shutil
-                shutil.rmtree(source)
-            else:
-                source.unlink()
-            return
-        for child in summary.get("_children", []):
+    """Delete every local representation of a Copilot conversation."""
+    import shutil
+
+    sources = summary.get("_sources") or [summary]
+    deleted: set[tuple[str, str, str]] = set()
+    for source_summary in sources:
+        kind = source_summary["_kind"]
+        source = source_summary["_source"]
+        key = (kind, str(source), str(source_summary.get("_session_id", "")))
+        if key in deleted:
+            continue
+        deleted.add(key)
+        if kind == "copilot-db":
+            session_id = source_summary["_session_id"]
+            with closing(sqlite3.connect(source)) as db, db:
+                db.execute("PRAGMA foreign_keys = ON")
+                tables = db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+                for (table,) in tables:
+                    if table == "sessions" or not table.replace("_", "").isalnum():
+                        continue
+                    columns = {row[1] for row in db.execute(f'PRAGMA table_info("{table}")')}
+                    if "session_id" in columns:
+                        db.execute(f'DELETE FROM "{table}" WHERE session_id = ?', (session_id,))
+                db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            continue
+        for child in source_summary.get("_children", []):
             child_source = child.get("_source") if isinstance(child, dict) else None
             if isinstance(child_source, Path):
                 child_source.unlink(missing_ok=True)
-        if summary["_kind"] == "copilot-session-state":
-            import shutil
-            shutil.rmtree(source)
+        if kind == "copilot-session-state":
+            if source.exists():
+                shutil.rmtree(source)
         else:
-            source.unlink()
-        return
-    session_id, db_path = summary["_session_id"], summary["_source"]
-    with sqlite3.connect(db_path) as db:
-        db.execute("PRAGMA foreign_keys = ON")
-        tables = db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
-        for (table,) in tables:
-            if table == "sessions" or not table.replace("_", "").isalnum():
-                continue
-            columns = {row[1] for row in db.execute(f'PRAGMA table_info("{table}")')}
-            if "session_id" in columns:
-                db.execute(f'DELETE FROM "{table}" WHERE session_id = ?', (session_id,))
-        db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            source.unlink(missing_ok=True)
 
 
 def export_source_files(summary: dict, archive: Path) -> Path:

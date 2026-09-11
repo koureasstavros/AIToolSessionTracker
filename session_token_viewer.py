@@ -16,6 +16,7 @@ import re
 import sqlite3
 import tempfile
 import threading
+import time
 import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1116,8 +1117,8 @@ def read_external_session(path: Path, provider: str) -> dict:
     return parse_export_session(path, provider)
 
 
-def load_session_index(root: Path, provider: str, show_empty: bool = False) -> list[dict]:
-    """Load provider summaries without parsing full transcripts or pricing."""
+def load_session_index(root: Path, provider: str, show_empty: bool = False, limit: int | None = None, offset: int = 0) -> list[dict]:
+    """Load newest summaries first, optionally using a lazy page."""
     adapter = PROVIDER_ADAPTERS[provider]
     normalized = []
     try:
@@ -1134,22 +1135,138 @@ def load_session_index(root: Path, provider: str, show_empty: bool = False) -> l
             LOGGER.exception("Unable to normalize one %s session; skipping it", provider)
     normalized.sort(key=lambda item: item.get("updated", 0), reverse=True)
     if show_empty:
-        return normalized
-    visible = []
-    for item in normalized:
-        # A provider's cheap scan may only know that usage statistics are
-        # absent. Parse such summaries before hiding them so conversations
-        # containing prompts or responses but no token statistics remain
-        # visible.
-        if item.get("_has_data") is not True:
-            try:
-                if not session_has_content(adapter.details(item)):
+        visible = normalized
+    else:
+        visible = []
+        target = None if limit is None else max(0, offset) + max(0, limit) + 1
+        for item in normalized:
+            # Do not inspect older transcripts until a later page is asked
+            # for. The newest summaries are therefore always parsed first.
+            if target is not None and len(visible) >= target:
+                break
+            if item.get("_has_data") is not True:
+                try:
+                    if not session_has_content(adapter.details(item)):
+                        continue
+                except Exception:
+                    LOGGER.exception("Unable to inspect one %s session; skipping it", provider)
                     continue
+            visible.append(item)
+    if limit is None:
+        return visible[offset:]
+    return visible[offset:offset + max(0, limit)]
+
+
+class BackgroundScanManager:
+    """Scan providers in order and publish summaries as each item completes."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._lock = threading.Lock()
+        self._sessions: dict[str, list[dict]] = {provider: [] for provider in PROVIDERS}
+        self._all_sessions: dict[str, list[dict]] = {provider: [] for provider in PROVIDERS}
+        self._statistics_sessions: dict[str, list[tuple[str, dict]]] = {provider: [] for provider in PROVIDERS}
+        self._status: dict[str, str] = {provider: "pending" for provider in PROVIDERS}
+        self._deleted_sessions: set[tuple[str, str]] = set()
+        self._provider_locks: dict[str, threading.Lock] = {provider: threading.Lock() for provider in PROVIDERS}
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            if all(status == "complete" for status in self._status.values()):
+                return
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(target=self._scan, name="session-scan", daemon=True)
+            self._thread.start()
+
+    def is_complete(self) -> bool:
+        with self._lock:
+            return all(status == "complete" for status in self._status.values())
+
+    def _scan(self) -> None:
+        for provider in PROVIDERS:
+            with self._lock:
+                self._status[provider] = "scanning"
+            try:
+                with self._provider_locks[provider]:
+                    indexed = PROVIDER_ADAPTERS[provider].index(self.root)
+                normalized = []
+                for item in indexed:
+                    try:
+                        item["provider"] = provider
+                        summary = normalize_session_data(item)
+                        with self._provider_locks[provider]:
+                            details = load_session_details(summary, provider)
+                        with self._lock:
+                            if (provider, str(summary.get("id"))) in self._deleted_sessions:
+                                continue
+                            self._all_sessions[provider].append(summary)
+                            self._statistics_sessions[provider].append((provider, {**summary, "_loaded_details": details}))
+                        if summary.get("_has_data") is not True:
+                            if not session_has_content(details):
+                                continue
+                        normalized.append(summary)
+                        normalized.sort(key=lambda value: value.get("updated", 0), reverse=True)
+                        with self._lock:
+                            self._sessions[provider] = [
+                                value for value in normalized
+                                if (provider, str(value.get("id"))) not in self._deleted_sessions
+                            ]
+                    except Exception:
+                        LOGGER.exception("Unable to normalize one %s session", provider)
             except Exception:
-                LOGGER.exception("Unable to inspect one %s session; skipping it", provider)
-                continue
-        visible.append(item)
-    return visible
+                LOGGER.exception("Unable to scan provider %s", provider)
+            with self._lock:
+                self._status[provider] = "complete"
+
+    def snapshot(self, provider: str, show_empty: bool = False) -> tuple[list[dict], dict[str, str]]:
+        with self._lock:
+            source = self._all_sessions if show_empty else self._sessions
+            sessions = list(source.get(provider, []))
+            sessions.sort(key=lambda value: value.get("updated", 0), reverse=True)
+            return sessions, dict(self._status)
+
+    def remove_session(self, provider: str, session_id: str) -> None:
+        """Remove a deleted session from current and in-flight scan results."""
+        with self._lock:
+            self._deleted_sessions.add((provider, session_id))
+            self._sessions[provider] = [item for item in self._sessions.get(provider, []) if item.get("id") != session_id]
+            self._all_sessions[provider] = [item for item in self._all_sessions.get(provider, []) if item.get("id") != session_id]
+            self._statistics_sessions[provider] = [
+                item for item in self._statistics_sessions.get(provider, []) if item[1].get("id") != session_id
+            ]
+
+    def delete_provider_session(self, provider: str, session_id: str) -> bool:
+        """Delete against a fresh summary without racing scanners or file locks."""
+        with self._provider_locks[provider]:
+            retry_delays = (0.25, 0.5, 1.0, 2.0)
+            for attempt in range(len(retry_delays) + 1):
+                summaries = load_session_index(self.root, provider, show_empty=True)
+                summary = next((item for item in summaries if item["id"] == session_id), None)
+                if summary is None:
+                    if attempt == 0:
+                        return False
+                    break
+                try:
+                    delete_session(summary)
+                    break
+                except (OSError, sqlite3.Error):
+                    if attempt == len(retry_delays):
+                        raise
+                    # A provider can briefly hold a transcript or SQLite file
+                    # while it writes an event. Refresh the summary and retry
+                    # instead of requiring the user to reload the sidebar.
+                    time.sleep(retry_delays[attempt])
+        self.remove_session(provider, session_id)
+        return True
+
+    def all_sessions(self, show_empty: bool = False) -> list[tuple[str, dict]]:
+        with self._lock:
+            items = [item for provider in PROVIDERS for item in self._statistics_sessions[provider]]
+            if show_empty:
+                return items
+            return [(provider, summary) for provider, summary in items if any(summary.get("id") == item.get("id") for item in self._sessions.get(provider, []))]
 
 
 def load_session_details(summary: dict, provider: str) -> dict:
@@ -1210,6 +1327,8 @@ def fmt_unit(value: float | int, currency: bool = False) -> str:
             break
     prefix = "$" if currency else ""
     sign = "-" if value < 0 else ""
+    if currency:
+        return f"{sign}{prefix}{scaled:,.2f}{suffix}"
     return f"{sign}{prefix}{scaled:.1f}{suffix}" if suffix else f"{sign}{prefix}{scaled:,.0f}"
 
 
@@ -1749,7 +1868,9 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
         if group == "timeline" and time_range == "today" else {}
     )
     for provider, summary in summaries:
-        session = load_session_details(summary, provider)
+        session = summary.get("_loaded_details")
+        if not isinstance(session, dict):
+            session = load_session_details(summary, provider)
         model_rows = model_usage_breakdown(session) if group == "model" else [None]
         for model_row in model_rows:
             bucket_label = model_row["model"] if model_row is not None else statistics_group_key(session, group, provider, summary, time_range)
@@ -1811,7 +1932,8 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
         related = f'<section class="stats-related"><div class="section-heading"><div><span class="section-kicker">SELECTED GROUP</span><h2>Sessions in {esc(selected_group)}</h2></div></div><div class="stats-table-wrap"><table class="stats-table related-table"><thead><tr><th>Session ID</th><th>Session name</th><th>Provider</th><th>Model</th><th>Total tokens</th><th>Total cost</th></tr></thead><tbody>{session_rows}</tbody></table></div></section>'
     timeline_markup = f'<section class="timeline-section"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Tokens and cost over time</h2></div></div>{render_timeline_svg(timeline_points, time_range, provider)}</section>{related}'
     table_markup = f'<section class="stats-table-section"><div class="section-heading"><div><span class="section-kicker">BREAKDOWN</span><h2>By {heading.lower()}</h2></div></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>{heading}</th><th>Sessions</th>{"".join(f"<th>{esc(TOKEN_LABELS[key])}</th>" for key in TOKEN_KEYS)}{"".join(f"<th>{esc(TOKEN_LABELS[key])} cost</th>" for key in TOKEN_KEYS)}<th>Total tokens</th><th>Total cost</th></tr></thead><tbody>{rows}</tbody></table></div></section>{related}'
-    return f'''<main class="detail statistics"><style>.stats-toolbar{{display:flex;align-items:center;gap:16px;margin:28px 0 18px;padding:12px 14px;border:1px solid #223753;border-radius:9px;background:#101d30}}.stats-filters{{display:flex;gap:7px;flex-wrap:wrap}}.stats-filter{{padding:7px 11px;border:1px solid #315479;border-radius:7px;color:#a9c9e9;text-decoration:none;font-size:12px}}.stats-filter:hover,.stats-filter.selected{{background:#24558a;color:#fff}}.stats-table-section,.stats-related,.timeline-section{{width:100%;max-width:1500px;margin:30px auto 0}}.stats-table-wrap{{width:100%;overflow:auto;border:1px solid #223753;border-radius:9px}}.stats-table{{width:100%;min-width:0;table-layout:fixed;border-collapse:collapse;background:#101a2a}}.stats-table th,.stats-table td{{width:auto;padding:11px 8px;border-bottom:1px solid #22304a;text-align:right;font-size:11px;white-space:normal;overflow-wrap:anywhere}}.stats-table th:first-child,.stats-table td:first-child{{text-align:left}}.stats-table th{{color:#91a8c7;font-size:10px;text-transform:uppercase;letter-spacing:.5px}}.stats-table td{{color:#cbd8e8}}.stats-table tr:last-child td{{border-bottom:0}}.stats-group-link{{color:#9ed1ff;text-decoration:none}}.stats-group-link:hover{{color:#fff;text-decoration:underline}}.timeline-chart{{padding:16px;border:1px solid #223753;border-radius:9px;background:#101a2a}}.timeline-chart svg{{display:block;width:100%;height:auto}}.timeline-axis{{stroke:#34445c;stroke-width:1}}.timeline-chart text{{fill:#7e8ea5;font-size:11px}}.timeline-tokens,.timeline-cost{{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}}.timeline-tokens{{stroke:#54c99f}}.timeline-cost{{stroke:#f07878}}.tokens-axis-label,.tokens-axis-title{{fill:#54c99f!important}}.cost-axis-label,.cost-axis-title{{fill:#f07878!important}}.timeline-legend{{display:flex;gap:18px;margin:0 0 8px;font-size:11px}}.timeline-key:before{{display:inline-block;width:9px;height:9px;margin-right:6px;border-radius:50%;content:""}}.tokens-key:before{{background:#54c99f}}.cost-key:before{{background:#f07878}}.timeline-empty{{padding:28px;border:1px dashed #34445c;border-radius:9px;color:#7e8ea5;text-align:center}}.statistics-link{{margin-top:8px;border-top:1px solid #223451}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>All providers</div><h1>Statistics</h1><p class="muted">Aggregate token and cost information across loaded sessions.</p></div></header>
+    refresh_url = esc("/?" + urlencode({"view": "statistics", "provider": provider, "group": group, "range": time_range, "refresh": 1}), quote=True)
+    return f'''<main class="detail statistics"><style>.stats-toolbar{{display:flex;align-items:center;gap:16px;margin:28px 0 18px;padding:12px 14px;border:1px solid #223753;border-radius:9px;background:#101d30}}.stats-filters{{display:flex;gap:7px;flex-wrap:wrap}}.stats-filter{{padding:7px 11px;border:1px solid #315479;border-radius:7px;color:#a9c9e9;text-decoration:none;font-size:12px}}.stats-filter:hover,.stats-filter.selected{{background:#24558a;color:#fff}}.stats-table-section,.stats-related,.timeline-section{{width:100%;max-width:1500px;margin:30px auto 0}}.stats-table-wrap{{width:100%;overflow:auto;border:1px solid #223753;border-radius:9px}}.stats-table{{width:100%;min-width:0;table-layout:fixed;border-collapse:collapse;background:#101a2a}}.stats-table th,.stats-table td{{width:auto;padding:11px 8px;border-bottom:1px solid #22304a;text-align:right;font-size:11px;white-space:normal;overflow-wrap:anywhere}}.stats-table th:first-child,.stats-table td:first-child{{text-align:left}}.stats-table th{{color:#91a8c7;font-size:10px;text-transform:uppercase;letter-spacing:.5px}}.stats-table td{{color:#cbd8e8}}.stats-table tr:last-child td{{border-bottom:0}}.stats-group-link{{color:#9ed1ff;text-decoration:none}}.stats-group-link:hover{{color:#fff;text-decoration:underline}}.timeline-chart{{padding:16px;border:1px solid #223753;border-radius:9px;background:#101a2a}}.timeline-chart svg{{display:block;width:100%;height:auto}}.timeline-axis{{stroke:#34445c;stroke-width:1}}.timeline-chart text{{fill:#7e8ea5;font-size:11px}}.timeline-tokens,.timeline-cost{{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}}.timeline-tokens{{stroke:#54c99f}}.timeline-cost{{stroke:#f07878}}.tokens-axis-label,.tokens-axis-title{{fill:#54c99f!important}}.cost-axis-label,.cost-axis-title{{fill:#f07878!important}}.timeline-legend{{display:flex;gap:18px;margin:0 0 8px;font-size:11px}}.timeline-key:before{{display:inline-block;width:9px;height:9px;margin-right:6px;border-radius:50%;content:""}}.tokens-key:before{{background:#54c99f}}.cost-key:before{{background:#f07878}}.timeline-empty{{padding:28px;border:1px dashed #34445c;border-radius:9px;color:#7e8ea5;text-align:center}}.statistics-link{{margin-top:8px;border-top:1px solid #223451}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>All providers</div><h1>Statistics</h1><p class="muted">Aggregate token and cost information across loaded sessions.</p></div><div class="detail-actions"><a class="icon-button detail-refresh" href="{refresh_url}" title="Scan sessions again" aria-label="Scan sessions again">↻</a></div></header>
         <section class="overview"><div class="section-heading"><div><span class="section-kicker">TOTAL</span><h2>All providers</h2></div><div class="overview-stats"><span><b>{session_count:,}</b> sessions</span><span><b>{fmt_unit(sum(totals.values()))}</b> tokens</span><span><b>{fmt_unit(total_cost, True)}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/session</span><span><b>{fmt_cost(average_cost)}</b> avg cost/session</span></div></div><div class="metrics">{token_cards(totals, costs=total_costs)}</div></section>
         {timeline_markup if group == "timeline" else table_markup}</main>'''
 def session_tool(summary: dict, provider: str) -> str:
@@ -1819,8 +1941,9 @@ def session_tool(summary: dict, provider: str) -> str:
     return PROVIDER_ADAPTERS[provider].tool(summary)
 
 
-def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False, selected_raw: bool = False, view: str = "sessions", group: str = "today", selected_group: str | None = None, time_range: str = "all", import_error: str | None = None) -> str:
-    sessions = load_session_index(root, provider, show_empty)
+def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False, selected_raw: bool = False, view: str = "sessions", group: str = "today", selected_group: str | None = None, time_range: str = "all", import_error: str | None = None, session_offset: int = 0, sessions_override: list[dict] | None = None, statistics_override: list[tuple[str, dict]] | None = None, scan_bootstrap: str = "") -> str:
+    sessions = (load_session_index(root, provider, show_empty)
+                if sessions_override is None else sessions_override)
     chosen_summary = next((item for item in sessions if item["id"] == selected), None) if selected else None
     chosen = load_session_details(chosen_summary, provider) if chosen_summary else None
     provider_menu = "".join(
@@ -1886,12 +2009,15 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 {invocation_markup}
                 <div class="turn-footer"><div class="turn-metrics">{turn_token_cards(turn["tokens"], turn_model, chosen["id"], provider, index, selected_turn, selected_metric, show_empty, turn.get("tokenFlags") or chosen.get("tokenFlags"), turn.get("costBreakdown"))}</div>
                 <a class="show-raw clickable" href="{raw_url}"><span aria-hidden="true">&lt;/&gt;</span>View raw event data <span class="raw-arrow" aria-hidden="true">→</span></a></div></article>'''
-    all_statistics_sessions = [
+    all_statistics_sessions = statistics_override if statistics_override is not None else [
         (provider_key, summary)
         for provider_key in PROVIDERS
         for summary in load_session_index(root, provider_key, show_empty)
     ] if view == "statistics" else []
-    detail = render_statistics(all_statistics_sessions, group, selected_group, time_range, provider) if view == "statistics" else ""
+    if scan_bootstrap and (view != "statistics" or not all_statistics_sessions):
+        detail = f'<main class="detail progressive-scan {"statistics" if view == "statistics" else ""}"><div class="empty-hero"><span class="hero-icon">↻</span><span class="section-kicker">__APP_NAME__</span><h1>Scanning local sessions</h1><p>Sessions and statistics will appear progressively as local files are processed.</p></div></main>'
+    else:
+        detail = render_statistics(all_statistics_sessions, group, selected_group, time_range, provider) if view == "statistics" else ""
     if view != "statistics" and chosen:
         turn_note = ""
         refresh_conversation_url = esc("/?" + urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "session": chosen["id"]}), quote=True)
@@ -1951,13 +2077,13 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             <section class="conversation"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Conversation turns</h2></div><span class="muted">{len(chosen["turns"])} turns{esc(turn_note)}</span></div>
             <div class="content-layout"><div class="turns">{turns or '<div class="empty"><b>No turns yet</b><span>No conversation events were found for this session.</span></div>'}</div>
             <aside class="explorer {"is-active" if selected_turn else ""}"><div class="explorer-header"><div><span class="section-kicker">INSPECTOR</span><h2>{esc(explorer_title)}</h2></div><a href="{close_explorer_url}" class="explorer-close" aria-label="Close inspector">×</a></div><div class="explorer-body">{f'<p>{esc(explorer_text)}</p>' if explorer_text else ''}{explorer_raw if explorer_raw and selected_raw else ''}</div></aside></div></section></main>'''
-    elif view != "statistics":
+    elif view != "statistics" and not scan_bootstrap:
         if sessions:
             detail = '<main class="detail no-sessions"><div class="empty-hero"><span class="hero-icon">↗</span><span class="section-kicker">__APP_NAME__</span><h1>Select a session</h1><p>Choose a conversation to inspect its turns, model invocations, token usage, tools, and raw events.</p></div></main>'
         else:
             detail = '<main class="detail no-sessions"><div class="empty-hero"><span class="hero-icon">○</span><span class="section-kicker">__APP_NAME__</span><h1>No sessions found</h1><p>No local conversations were found for this provider. Try showing empty sessions or refresh the source.</p></div></main>'
 
-    refresh_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(show_empty)}), quote=True)
+    refresh_url = esc("/?" + urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "refresh": 1}), quote=True)
     toggle_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(not show_empty)}), quote=True)
     toggle_label = "Hide empty sessions" if show_empty else "Show empty sessions"
     toggle_icon = (
@@ -1991,11 +2117,12 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         )
     ) if view == "statistics" else ""
     message = f'<div class="import-error" role="alert">{esc(import_error)}</div>' if import_error else ""
-    return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__SIDEBAR_CLASS__", "stats-sidebar" if view == "statistics" else "").replace("__PROVIDER_MENU__", "" if view == "statistics" else provider_menu).replace("__VIEW_TABS__", view_tabs).replace("__STATS_SIDEBAR__", stats_sidebar).replace("__SESSION_ROWS__", "" if view == "statistics" else session_rows).replace("__SESSION_COUNT__", str(len(sessions))).replace("__DETAIL__", message + detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", toggle).replace("__ROOT__", esc(provider_path(root, provider))).replace("__IMPORT_FORM__", import_form)
+    return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__SIDEBAR_CLASS__", "stats-sidebar" if view == "statistics" else "").replace("__PROVIDER_MENU__", "" if view == "statistics" else provider_menu).replace("__VIEW_TABS__", view_tabs).replace("__STATS_SIDEBAR__", stats_sidebar).replace("__SESSION_ROWS__", "" if view == "statistics" else session_rows).replace("__SESSION_COUNT__", str(len(sessions))).replace("__DETAIL__", message + detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", toggle).replace("__ROOT__", esc(provider_path(root, provider))).replace("__IMPORT_FORM__", import_form).replace("__SCAN_BOOTSTRAP__", scan_bootstrap)
 
 
 class Handler(BaseHTTPRequestHandler):
     root = Path(".")
+    scan_manager: BackgroundScanManager | None = None
 
     def do_POST(self) -> None:
         route = urlparse(self.path).path
@@ -2054,8 +2181,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             finally:
                 temporary.unlink(missing_ok=True)
+            # Imported files are not part of the current scan snapshot.
+            # Start a new progressive scan so they appear immediately.
+            type(self).scan_manager = None
             self.send_response(303)
-            self.send_header("Location", f"/?{urlencode({'provider': provider, 'show_empty': 1})}")
+            self.send_header("Location", f"/?{urlencode({'provider': provider, 'show_empty': 1, 'refresh': 1})}")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
@@ -2066,16 +2196,36 @@ class Handler(BaseHTTPRequestHandler):
         if provider not in PROVIDERS or not session_id:
             self.send_error(400, "Invalid delete request")
             return
-        summaries = load_session_index(self.root, provider, show_empty=True)
-        summary = next((item for item in summaries if item["id"] == session_id), None)
-        if summary is None:
-            self.send_error(404, "Session not found")
-            return
         try:
-            delete_session(summary)
+            manager = type(self).scan_manager
+            if manager is not None:
+                deleted = manager.delete_provider_session(provider, session_id)
+            else:
+                summaries = load_session_index(self.root, provider, show_empty=True)
+                summary = next((item for item in summaries if item["id"] == session_id), None)
+                deleted = summary is not None
+                if summary is not None:
+                    delete_session(summary)
         except (OSError, sqlite3.Error) as error:
             LOGGER.warning("Unable to delete session %s: %s", session_id, error)
+            if self.headers.get("X-Requested-With") == "XMLHttpRequest":
+                payload = json.dumps({"error": type(error).__name__}).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             self.send_error(500, "Unable to delete session")
+            return
+        if not deleted:
+            self.send_error(404, "Session not found")
+            return
+        if self.headers.get("X-Requested-With") == "XMLHttpRequest":
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             return
         self.send_response(303)
         self.send_header("Location", f"/?{urlencode({'provider': provider, 'show_empty': int(show_empty)})}")
@@ -2084,6 +2234,42 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
+        if parsed_url.path == "/api/scan":
+            query = parse_qs(parsed_url.query)
+            provider = query.get("provider", ["copilot"])[0]
+            if provider not in PROVIDERS:
+                provider = "copilot"
+            manager = type(self).scan_manager
+            if manager is None:
+                self.send_error(503, "Session scan is not available")
+                return
+            show_empty = query.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
+            sessions, statuses = manager.snapshot(provider, show_empty)
+            scan_complete = all(status == "complete" for status in statuses.values())
+            view = query.get("view", ["sessions"])[0]
+            page = render(
+                self.root,
+                query.get("session", [None])[0],
+                provider=provider,
+                show_empty=show_empty,
+                view=view,
+                group=query.get("group", ["today"])[0],
+                time_range=query.get("range", ["all"])[0],
+                sessions_override=sessions,
+                statistics_override=manager.all_sessions(show_empty),
+                scan_bootstrap="" if scan_complete else "<!-- scanning -->",
+            )
+            payload = json.dumps({
+                "html": page,
+                "done": scan_complete,
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if parsed_url.path == "/export":
             query = parse_qs(parsed_url.query)
             provider = query.get("provider", [""])[0]
@@ -2127,11 +2313,23 @@ class Handler(BaseHTTPRequestHandler):
         group = query.get("group", ["today"])[0]
         selected_group = query.get("group_value", [None])[0]
         time_range = query.get("range", ["all"])[0]
+        offset_value = query.get("offset", ["0"])[0]
+        session_offset = int(offset_value) if offset_value.isdigit() else 0
         import_error = query.get("import_error", [None])[0]
+        refresh_requested = query.get("refresh", ["0"])[0] in {"1", "true", "yes"}
         selected_raw = query.get("raw", ["0"])[0] in {"1", "true", "yes"}
         show_empty = query.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
         try:
-            body = render(self.root, selected, selected_turn, selected_metric, provider, show_empty, selected_raw, view, group, selected_group, time_range, import_error).encode("utf-8")
+            if refresh_requested:
+                type(self).scan_manager = None
+            if type(self).scan_manager is None:
+                type(self).scan_manager = BackgroundScanManager(self.root)
+            manager = type(self).scan_manager
+            manager.start()
+            current_sessions, _ = manager.snapshot(provider, show_empty)
+            scan_complete = manager.is_complete()
+            bootstrap = "" if scan_complete else "<script>(function(){var timer=setInterval(function(){fetch('/api/scan'+location.search).then(function(r){return r.json()}).then(function(data){var doc=new DOMParser().parseFromString(data.html,'text/html');document.querySelector('.app').replaceWith(doc.querySelector('.app'));if(data.done)clearInterval(timer);}).catch(function(){});},250);})();</script>"
+            body = render(self.root, selected, selected_turn, selected_metric, provider, show_empty, selected_raw, view, group, selected_group, time_range, import_error, session_offset, sessions_override=current_sessions, statistics_override=manager.all_sessions(show_empty), scan_bootstrap=bootstrap).encode("utf-8")
         except Exception:
             LOGGER.exception("Unable to render request for provider %s", provider)
             self.send_error(500, "Unable to read session files")
@@ -2378,8 +2576,25 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
     list.addEventListener('scroll',function(){sessionStorage.setItem(scrollKey,String(list.scrollTop))},{passive:true});
     var detailKey='session-detail:'+(params.get('session')||'');var position=sessionStorage.getItem(detailKey);if(position)requestAnimationFrame(function(){scrollTo(0,Number(position))});
     function loading(text){if(document.querySelector('.loading'))return;var layer=document.createElement('div');layer.className='loading';layer.innerHTML='<div class="loading-card"><span class="spinner"></span><span>'+text+'</span></div>';body.appendChild(layer);}
-    document.querySelectorAll('a.session-link,a.provider,a.view-tab,a.clickable,a.stats-navigation,a.refresh-sessions,a.empty-toggle').forEach(function(link){link.addEventListener('click',function(){sessionStorage.setItem(detailKey,String(scrollY));loading('Loading session data…');});});
-    document.querySelectorAll('form[action="/delete"]').forEach(function(form){form.addEventListener('submit',function(event){if(event.defaultPrevented)return;loading('Deleting conversation…');var button=form.querySelector('button');if(button)button.disabled=true;});});
+    document.addEventListener('click',function(event){var link=event.target.closest('a.session-link,a.provider,a.view-tab,a.clickable,a.stats-navigation,a.empty-toggle');if(!link)return;sessionStorage.setItem(detailKey,String(scrollY));loading('Loading session data…');});
+    document.querySelectorAll('form[action="/delete"]').forEach(function(form){form.addEventListener('submit',function(event){
+        if(event.defaultPrevented)return;
+        event.preventDefault();
+        var button=form.querySelector('button'), sessionInput=form.querySelector('input[name="session"]'), sessionId=sessionInput?sessionInput.value:'';
+        loading('Deleting conversation…');if(button)button.disabled=true;
+        fetch(form.action,{method:'POST',body:new URLSearchParams(new FormData(form)),headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-Requested-With':'XMLHttpRequest'}}).then(function(response){
+            if(!response.ok)return response.json().catch(function(){return {error:'HTTP '+response.status};}).then(function(data){throw new Error(data.error||'HTTP '+response.status);});
+            document.querySelectorAll('form[action="/delete"] input[name="session"]').forEach(function(input){if(input.value===sessionId){var row=input.closest('.session-row');if(row)row.remove();}});
+            var count=document.querySelector('.sessions-heading .count b');if(count)count.textContent=String(document.querySelectorAll('.session-row').length);
+            if(params.get('session')===sessionId||form.classList.contains('detail-delete')){
+                params.delete('session');history.replaceState(null,'',location.pathname+(params.toString()?'?'+params.toString():''));
+                var detail=document.querySelector('.detail');if(detail)detail.outerHTML='<main class="detail no-sessions"><div class="empty-hero"><span class="hero-icon">✓</span><span class="section-kicker">'+document.title+'</span><h1>Session deleted</h1><p>Select another conversation from the session list.</p></div></main>';
+            }
+            var layer=document.querySelector('.loading');if(layer)layer.remove();body.classList.remove('is-loading');
+        }).catch(function(error){
+            var layer=document.querySelector('.loading');if(layer)layer.remove();body.classList.remove('is-loading');if(button)button.disabled=false;alert('Unable to delete the conversation ('+(error&&error.message?error.message:'request failed')+').');
+        });
+    });});
     if(sidebar){sidebar.addEventListener('click',function(event){if(event.target.closest('.session-link')&&innerWidth<=900)closeNav();});}
 })();
 </script>
@@ -2485,6 +2700,10 @@ PAGE = PAGE.replace('</style>\n</head>', '''<style>
 @media(max-width:620px){.turn-invocation{display:block}.invocation-name{margin-bottom:7px}.invocation-usage{grid-template-columns:1fr}.model-analysis-popover{position:fixed;top:64px;right:12px;left:12px;width:auto;max-height:calc(100vh - 78px)}.model-analysis-popover>header{align-items:flex-start;flex-direction:column}.model-analysis-popover>header small{text-align:left}.model-analysis-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.model-analysis-metrics .metric:last-child{grid-column:1/-1}}
 </style></head>''')
 
+PAGE = PAGE.replace('</head>', '<style>.progressive-scan{position:fixed;inset:0 0 0 var(--sidebar);display:grid;place-items:center;width:auto;min-height:0;margin:0;padding:24px}.progressive-scan .empty-hero{width:min(500px,100%);margin:0 auto;text-align:center}@media(max-width:900px){.progressive-scan{left:0}}</style></head>', 1)
+
+
+PAGE = PAGE.replace("</body>", "__SCAN_BOOTSTRAP__</body>")
 
 if __name__ == "__main__":
     try:

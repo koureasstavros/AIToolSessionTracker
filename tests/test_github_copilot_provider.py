@@ -36,6 +36,36 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
             "Extension",
         )
 
+    def test_delete_removes_all_merged_session_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "session-1"
+            state.mkdir()
+            (state / "events.jsonl").write_text("", encoding="utf-8")
+            database = root / "session-store.db"
+            with closing(sqlite3.connect(database)) as db:
+                db.execute("CREATE TABLE sessions (id TEXT, summary TEXT, updated_at TEXT)")
+                db.execute("CREATE TABLE turns (session_id TEXT, content TEXT)")
+                db.execute("INSERT INTO sessions VALUES ('session-1', 'Merged session', '')")
+                db.execute("INSERT INTO turns VALUES ('session-1', 'content')")
+                db.commit()
+            summary = {
+                "id": "session-1",
+                "_kind": "copilot-session-state",
+                "_source": state,
+                "_sources": [
+                    {"id": "session-1", "_kind": "copilot-session-state", "_source": state},
+                    {"id": "session-1", "_kind": "copilot-db", "_source": database, "_session_id": "session-1"},
+                ],
+            }
+
+            github_copilot_provider.delete(summary)
+
+            self.assertFalse(state.exists())
+            with closing(sqlite3.connect(database)) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM sessions WHERE id = 'session-1'").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM turns WHERE session_id = 'session-1'").fetchone()[0], 0)
+
     def test_tools_are_attached_to_the_assistant_invocation_that_started_them(self) -> None:
         interaction_id = "interaction-1"
         records = [
