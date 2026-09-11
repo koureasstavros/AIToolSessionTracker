@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 import re
 
+from src.common.source_paths import claude_desktop_roots
 from src.common.source_archive import create_archive, inject_archive
 
 
@@ -52,7 +53,7 @@ def _files() -> list[Path]:
     locations = (
         (Path.home() / ".claude" / "sessions", "*.json"),
         (Path.home() / ".claude" / "projects", "*.jsonl"),
-        (Path.home() / "AppData" / "Local" / "Claude-3p" / "local-agent-mode-sessions", "audit.jsonl"),
+        *((root, "audit.jsonl") for root in claude_desktop_roots()),
     )
     files: list[Path] = []
     for location, pattern in locations:

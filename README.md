@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "tracker", "llm", "slm", "model", "session", "turn", "invocation", "agents", "tools", "context"]
 license: "apache-2.0"
-version: v0.0.30
+version: v0.0.31
 ---
 
 # AI Tool Session Tracker
@@ -46,15 +46,32 @@ The app opens at `http://127.0.0.1:9000`.
 
 Stop the server with `Ctrl+C`.
 
-## Windows executable
+## Packaged applications
 
 Python is required only on the computer that builds the application. End users
 can run the packaged executable without installing Python.
 
-On Windows, double-click `packer\windows\build_windows_exe.bat`. The
-script installs PyInstaller into the active Python environment if necessary and
-creates `dist\AI-Tool-Session-Tracker.exe`. The executable starts the local
-viewer and opens it in the default browser.
+Build on the target operating system; PyInstaller does not produce native
+Windows, Linux, and macOS artifacts from one operating system. The build
+scripts install PyInstaller into the active Python environment if necessary.
+
+| Platform | Build command | Output |
+| --- | --- | --- |
+| Windows | Double-click `packer\windows\build_windows_app.bat` | `dist\windows\AI-Tool-Session-Tracker.exe` |
+| Linux | `bash packer/linux/build_linux_app.sh` | `dist/linux/AI-Tool-Session-Tracker` |
+| macOS | `bash packer/macos/build_macos_app.sh` | `dist/macos/AI-Tool-Session-Tracker.app` |
+
+On Linux and macOS, make the script executable first if preferred:
+
+```text
+chmod +x packer/linux/build_linux_app.sh
+chmod +x packer/macos/build_macos_app.sh
+```
+
+The Linux executable and macOS application start the local viewer and open it
+in the default browser. macOS builds produce an `.app` bundle suitable for
+launching from Finder. Build separately for each CPU architecture that you
+intend to distribute.
 
 The executable hosts the local web server while the viewer is in use, so its
 process remains running after the browser opens. Use **Exit application** in
@@ -64,15 +81,22 @@ stop. If the executable is launched again while it is already running, the
 the second launch reopens the existing viewer URL without starting another
 application process.
 
-Startup and runtime errors are written to
-`%LOCALAPPDATA%\AI-Tool-Session-Tracker\session-explorer.log`. The application
-continues when an individual provider's local storage folder does not exist;
-that provider simply shows no sessions while other available providers remain
-usable.
+Startup and runtime errors are written to a platform-local application data
+directory when available, with the system temporary directory as a fallback.
+The application continues when an individual provider's local storage folder
+does not exist; that provider simply shows no sessions while other available
+providers remain usable.
 
 The build includes the model pricing data required by the application. The
-executable must still be run on Windows because it reads provider data from
-Windows-local application storage.
+packaged application must still be run on the matching operating system because
+it reads provider data from that operating system's local application storage.
+
+Provider discovery also follows native storage locations: VS Code uses
+`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, and
+`$XDG_CONFIG_HOME` or `~/.config` on Linux. Claude Desktop audit files use the
+corresponding platform application-data directory. Codex, Claude Code, GitHub
+Copilot CLI/Desktop, and Antigravity home-directory storage are discovered from
+their standard `~/.<tool>` locations on all three platforms.
 
 ## Description
 

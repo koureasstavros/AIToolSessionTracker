@@ -4,7 +4,10 @@
 
 The provider scans:
 
-- Extension / CLI / Desktop `%USERPROFILE%\\.codex\\sessions\\**\\*.jsonl`
+- Extension / CLI / Desktop `~/.codex/sessions/**/*.jsonl`.
+
+`Path.home()` resolves this location on Windows, macOS, and Linux, so no
+platform-specific path configuration is required.
 
 The exact rollout path is retained as `_source` and displayed as the information source. The source label is OpenAI Codex and the tool surface is reported as `Extension`, `CLI`, `Desktop`, or `Mixed`.
 

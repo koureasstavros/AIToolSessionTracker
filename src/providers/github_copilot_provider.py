@@ -1,12 +1,12 @@
 """GitHub Copilot session sources and persistence operations."""
 from __future__ import annotations
 
-import sqlite3
 import json
-import os
+import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from src.common.source_paths import extension_roots
 from src.common.source_archive import create_archive, inject_archive
 
 
@@ -531,10 +531,7 @@ def _read_db(session_id: str, db_path: Path) -> dict:
 
 
 def default_root() -> Path:
-    app_data = os.environ.get("APPDATA")
-    if app_data:
-        return Path(app_data) / "Code" / "User" / "workspaceStorage"
-    return Path.home() / ".config" / "Code" / "User" / "workspaceStorage"
+    return extension_roots()[0] / "workspaceStorage"
 
 
 def display_root(root: Path) -> Path:
@@ -573,11 +570,12 @@ def identity(record: dict, fallback: str) -> tuple[str, str]:
 
 
 def _roots(root: Path) -> list[Path]:
-    roots = [root, Path.home() / ".copilot" / "session-state", default_root()]
-    app_data = os.environ.get("APPDATA")
-    global_root = (Path(app_data) / "Code" / "User" / "globalStorage" / "emptyWindowChatSessions"
-                   if app_data else Path.home() / ".config" / "Code" / "User" / "globalStorage" / "emptyWindowChatSessions")
-    roots.append(global_root)
+    roots = [root, Path.home() / ".copilot" / "session-state"]
+    for user_root in extension_roots():
+        roots.extend([
+            user_root / "workspaceStorage",
+            user_root / "globalStorage" / "emptyWindowChatSessions",
+        ])
     return list(dict.fromkeys(path for path in roots if path.is_dir()))
 
 

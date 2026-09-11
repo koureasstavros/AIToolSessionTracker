@@ -4,13 +4,21 @@
 
 The provider scans:
 
-- Antigravity IDE: `%USERPROFILE%\.gemini\antigravity-ide\brain\*\.system_generated\logs\transcript.jsonl` (reported in the viewer as **IDE**)
-- Antigravity (Desktop): `%USERPROFILE%\.gemini\antigravity\brain\*\.system_generated\logs\transcript.jsonl`
-- Antigravity CLI: `%USERPROFILE%\.gemini\antigravity-cli\**\*.jsonl` (reported in the viewer as **CLI**)
-- Imported archives: `%USERPROFILE%\.gemini\antigravity-ide\brain\imported\**\*.jsonl`
+- Antigravity IDE: `~/.gemini/antigravity-ide/brain/*/.system_generated/logs/transcript.jsonl` (reported in the viewer as **IDE**)
+- Antigravity (Desktop): `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl`
+- Antigravity CLI: `~/.gemini/antigravity-cli/**/*.jsonl` (reported in the viewer as **CLI**)
+- Imported archives: `~/.gemini/antigravity-ide/brain/imported/**/*.jsonl`
 - Custom storage roots configured via `--root` or the `ANTIGRAVITY_ROOT` environment variable.
 
-The exact transcript path is retained as `_source` and displayed as the information source. The tool surface is reported as `IDE`, `Desktop`, or `CLI` based on the path, so sessions discovered below `antigravity-ide` are identified as **IDE**, while sessions below `antigravity-cli` are identified as **CLI**. Companion SQLite databases in `~/.gemini/antigravity-ide/conversations/<id>.db` or `~/.gemini/antigravity/conversations/<id>.db` are read to extract authoritative project roots and active model names.
+These `~/.gemini` paths are resolved from the user's home directory on Windows,
+macOS, and Linux. The exact transcript path is retained as `_source` and
+displayed as the information source. The tool surface is reported as `IDE`,
+`Desktop`, or `CLI` based on the path, so sessions discovered below
+`antigravity-ide` are identified as **IDE**, while sessions below
+`antigravity-cli` are identified as **CLI**. Companion SQLite databases in
+`~/.gemini/antigravity-ide/conversations/<id>.db` or
+`~/.gemini/antigravity/conversations/<id>.db` are read to extract authoritative
+project roots and active model names.
 
 ## Actions
 

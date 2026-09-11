@@ -4,9 +4,12 @@
 
 The provider scans:
 
-- Extension / CLI / Desktop `%USERPROFILE%\\.claude\\projects\\**\\*.jsonl`
-- Extension / CLI / Desktop session metadata `%USERPROFILE%\\.claude\\sessions\\*.json`
-- Desktop audit records `%LOCALAPPDATA%\\Claude-3p\\local-agent-mode-sessions\\**\\audit.jsonl`
+- Extension / CLI / Desktop `~/.claude/projects/**/*.jsonl`
+- Extension / CLI / Desktop session metadata `~/.claude/sessions/*.json`
+- Desktop audit records from the platform application-data directory:
+	`%LOCALAPPDATA%/Claude-3p/local-agent-mode-sessions` on Windows,
+	`~/Library/Application Support/Claude/local-agent-mode-sessions` on macOS,
+	or `$XDG_CONFIG_HOME/Claude/local-agent-mode-sessions` on Linux.
 
 The exact transcript or audit path is retained as `_source` and displayed as the
 information source. The source label is Anthropic Claude Code, and the tool

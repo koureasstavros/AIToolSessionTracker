@@ -4,11 +4,17 @@
 
 The provider scans:
 
-- Extension sessions: `%APPDATA%\\Code\\User\\globalStorage\\github.copilot-chat\\session-store.db`
-- Extension project sessions and metadata: `%APPDATA%\\Code\\User\\workspaceStorage\\*\\chatSessions\\*.jsonl`
-- Extension non-project sessions and metadata: `%APPDATA%\\Code\\User\\globalStorage\\emptyWindowChatSessions\\*.jsonl`
-- Copilot Desktop / CLI session and metadata from `%USERPROFILE%\\.copilot\\session-store.db`
-- Copilot Desktop / CLI session and metadata from `%USERPROFILE%\.copilot\session-state\<session-id>\` containing `workspace.yaml`, `events.jsonl`, and optional per-session database files
+- Extension sessions: `<Extension storage>/globalStorage/github.copilot-chat/session-store.db`
+- Extension project sessions and metadata: `<Extension storage>/workspaceStorage/*/chatSessions/*.jsonl`
+- Extension non-project sessions and metadata: `<Extension storage>/globalStorage/emptyWindowChatSessions/*.jsonl`
+- Copilot Desktop / CLI session and metadata from `~/.copilot/session-store.db`
+- Copilot Desktop / CLI session and metadata from `~/.copilot/session-state/<session-id>/` containing `workspace.yaml`, `events.jsonl`, and optional per-session database files
+
+`<Extension storage>` is `%APPDATA%/Code/User` on Windows,
+`~/Library/Application Support/Code/User` on macOS, and
+`$XDG_CONFIG_HOME/Code/User` or `~/.config/Code/User` on Linux. The equivalent
+`Code - Insiders/User` extension storage is also checked. `Path.home()` resolves the
+`~/.copilot` locations on all supported platforms.
 
 The source path is retained in `_source` and displayed as the information source. The source label identifies `Extension` for VS Code chat files. Session-state `workspace.yaml` files can identify CLI sessions through `client_name: github/cli`, and Desktop sessions through `client_name: github/autopilot`. When that marker is absent, the shared session-state and database sources are labelled `Mixed` because they can contain CLI and Desktop sessions without a reliable client identifier.
 When the same session ID exists in more than one source, all matching sources

@@ -5,7 +5,7 @@
 The provider reads local JSON and JSONL transcript exports from:
 
 - `M365_COPILOT_ROOT`, when set
-- `%USERPROFILE%\\m365-copilot\\sessions`, by default
+- `~/m365-copilot/sessions`, by default on Windows, macOS, and Linux
 
 Microsoft 365 Copilot's cloud conversation history and Office/WebView cache are not treated as stable transcript sources. The exact export path is retained as `_source` and displayed as the information source.
 
@@ -17,7 +17,7 @@ delete the account conversation. For a local JSON/JSONL export, the viewer's
 conversation in Microsoft 365 or delete the cloud history.
 
 Imported transcripts are written to the `imported` subfolder of
-`M365_COPILOT_ROOT`, or to the default local export directory. Existing
+`M365_COPILOT_ROOT`, or in the default local export directory. Existing
 filenames are preserved when possible; filename collisions receive a generated
 suffix. Imported archives are validated for provider ownership and path
 traversal before any file is written.
