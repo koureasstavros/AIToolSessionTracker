@@ -147,6 +147,20 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(totals["inputTokens"], 5)
         self.assertEqual(totals["outputTokens"], 5)
 
+    def test_captures_assistant_reasoning_effort(self) -> None:
+        records = [
+            {"sessionId": "session-1", "type": "user", "message": {"role": "user", "content": "Analyze this"}},
+            {"sessionId": "session-1", "type": "assistant", "effort": "high", "message": {"id": "message-1", "model": "claude-test", "role": "assistant", "content": "Done"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session-1.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+            session = anthropic_claude_provider.details({"_source": path})
+
+        self.assertEqual(session["reasoningEffort"], "high")
+        self.assertEqual(session["turns"][0]["reasoningEffort"], "high")
+        self.assertEqual(session["turns"][0]["invocations"][0]["reasoningEffort"], "high")
+
     def test_pre_turn_attachments_are_visible_as_internal_instructions(self) -> None:
         records = [
             {

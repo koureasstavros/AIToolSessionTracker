@@ -96,6 +96,7 @@ def token_accounting_note(provider: str, turn_count: int) -> str:
 
 
 APP_NAME = "AI Tool Session Tracker"
+LIVE_SESSION_WINDOW_SECONDS = 60
 PROVIDER_ADAPTERS = {
     "copilot": github_copilot_provider,
     "codex": openai_codex_provider,
@@ -165,6 +166,7 @@ class SessionData(TypedDict, total=False):
     turns: list[dict]
     tokens: dict[str, int | None]
     model: str | None
+    reasoningEffort: str | None
     deployment: str | None
     project: str | None
     source: str
@@ -174,6 +176,7 @@ class SessionData(TypedDict, total=False):
     provider: str
     tokenFlags: list[str]
     tokenFields: list[str]
+    live: bool
 
 
 def normalize_session_data(value: dict) -> SessionData:
@@ -193,8 +196,10 @@ def normalize_session_data(value: dict) -> SessionData:
         "turns": value.get("turns") if isinstance(value.get("turns"), list) else [],
         "tokens": tokens,
         "model": value.get("model") if isinstance(value.get("model"), str) else None,
+        "reasoningEffort": normalize_reasoning_effort(value.get("reasoningEffort")),
         "deployment": value.get("deployment") if isinstance(value.get("deployment"), str) else None,
         "project": value.get("project") if isinstance(value.get("project"), str) else None,
+        "live": bool(value.get("live", False)),
     }
     result["costUsd"] = value.get("costUsd") if isinstance(value.get("costUsd"), (int, float)) else None
     result["pricingModel"] = value.get("pricingModel") if isinstance(value.get("pricingModel"), str) else None
@@ -382,6 +387,74 @@ def new_session(session_id: str, name: str, updated: float, model: str | None = 
 
 def new_turn(turn_id: str) -> dict:
     return {"id": turn_id, "user": "", "assistant": [], "tokens": blank_tokens(), "raw": []}
+
+
+def normalize_reasoning_effort(value: object) -> str | None:
+    """Return a persisted reasoning-effort setting when it is a usable label."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if value else None
+
+
+def reasoning_effort_from_record(record: object) -> str | None:
+    """Read provider-specific reasoning-effort fields from a transcript event."""
+    effort_keys = ("reasoningEffort", "reasoning_effort", "perTurnEffort", "effort")
+
+    def visit(value: object) -> str | None:
+        if isinstance(value, dict):
+            for key in effort_keys:
+                effort = normalize_reasoning_effort(value.get(key))
+                if effort:
+                    return effort
+            for child in value.values():
+                effort = visit(child)
+                if effort:
+                    return effort
+        elif isinstance(value, list):
+            for child in value:
+                effort = visit(child)
+                if effort:
+                    return effort
+        return None
+
+    return visit(record)
+
+
+def reasoning_effort_from_records(records: list[dict]) -> str | None:
+    """Return the latest persisted reasoning-effort setting in a session."""
+    effort = None
+    for record in records:
+        value = reasoning_effort_from_record(record)
+        if value:
+            effort = value
+    return effort
+
+
+def session_reasoning_effort_from_records(records: list[dict]) -> str | None:
+    """Resolve session effort, preserving Mixed when models use different settings."""
+    latest_effort = None
+    model_efforts: dict[str, set[str]] = {}
+    for record in records:
+        effort = reasoning_effort_from_record(record)
+        if not effort:
+            continue
+        latest_effort = effort
+        model = model_from_records([record])
+        if not model and record.get("k") == ["inputState", "selectedModel"]:
+            selected = record.get("v")
+            model = selected.get("identifier") if isinstance(selected, dict) else None
+        if not model:
+            root_value = record.get("v")
+            input_state = root_value.get("inputState") if isinstance(root_value, dict) else None
+            selected = input_state.get("selectedModel") if isinstance(input_state, dict) else None
+            model = selected.get("identifier") if isinstance(selected, dict) else None
+        if isinstance(model, str) and model.strip():
+            model_efforts.setdefault(model.strip(), set()).add(effort)
+    distinct_efforts = {
+        effort for efforts in model_efforts.values() for effort in efforts
+    }
+    return "Mixed" if len(model_efforts) > 1 and len(distinct_efforts) > 1 else latest_effort
 
 
 def raw_event_kind(raw: str, previous_was_tool_result: bool = False) -> tuple[str, str]:
@@ -910,12 +983,58 @@ def latest_chat_field(path: Path, field: str) -> object:
     return value
 
 
+def _session_source_updated(path: Path, kind: str, fallback: float = 0) -> float:
+    """Return the most recent write time for the files that carry a session."""
+    paths = [path]
+    if path.is_dir():
+        paths.extend(path / name for name in ("events.jsonl", "workspace.yaml"))
+    latest = fallback
+    for candidate in paths:
+        try:
+            latest = max(latest, candidate.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
+
+
+def detect_live_session(path: Path, kind: str, updated: float | None = None, now: float | None = None) -> bool:
+    """Identify sessions whose most recent activity occurred within one minute.
+
+    A recent source write is used as the persisted last-activity timestamp for
+    every provider. Copilot session-state
+    sources additionally become inactive after a terminal ``session.shutdown``
+    event, which avoids flagging an old, recently touched folder as live.
+    """
+    current_time = time.time() if now is None else now
+    source_updated = _session_source_updated(path, kind, updated or 0)
+    if not source_updated or current_time - source_updated > LIVE_SESSION_WINDOW_SECONDS:
+        return False
+    if kind != "copilot-session-state":
+        return True
+    events = path / "events.jsonl"
+    last_event = None
+    try:
+        with events.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if line.strip():
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict):
+                        last_event = record.get("type")
+    except OSError:
+        return False
+    return last_event != "session.shutdown"
+
+
 def session_summary(path: Path, provider: str, kind: str) -> dict:
     try:
         updated = path.stat().st_mtime
     except OSError:
         updated = 0
     summary = new_session(path.stem, path.stem, updated, provider)
+    summary["live"] = detect_live_session(path, kind, updated=updated)
     summary["_source"] = path
     summary["_kind"] = kind
     summary["_source_label"] = {
@@ -1371,6 +1490,12 @@ def display_model_name(model: object) -> str:
     return str(price["model"] if price else model or "Unavailable")
 
 
+def display_effort_label(reasoning_effort: object) -> str | None:
+    """Format a persisted reasoning-effort setting for an independent UI label."""
+    effort = normalize_reasoning_effort(reasoning_effort)
+    return f"Effort: {effort}" if effort else None
+
+
 def esc(value: object, quote: bool = True) -> str:
     return html.escape(str(value), quote=quote)
 
@@ -1653,6 +1778,10 @@ def invocation_tools(invocation: dict) -> str:
                 f'{fmt(agent_total)} tokens · {fmt_cost_label(agent.get("costUsd"))}'
                 if has_agent_usage else "Token usage unavailable"
             )
+            agent_effort_label = display_effort_label(agent.get("reasoningEffort"))
+            agent_effort_markup = (
+                f'<b>{esc(agent_effort_label)}</b>' if agent_effort_label else ""
+            )
             agent_instructions = []
             for agent_turn in agent.get("turns", []):
                 if not isinstance(agent_turn, dict):
@@ -1663,6 +1792,7 @@ def invocation_tools(invocation: dict) -> str:
             agent_markup = (
                 '<section class="delegated-agent">'
                 f'<div class="delegated-agent-heading"><span>Delegated agent</span><b>{esc(display_model_name(agent_model))}</b>'
+                f'{agent_effort_markup}'
                 f'<strong>{esc(usage_summary)}</strong></div>'
                 f'{internal_instructions_markup(agent_instructions, "Subagent context")}'
             )
@@ -1698,6 +1828,26 @@ def invocation_subagent_badge(invocation: dict) -> str:
         '<div class="invocation-parent-body"><p>Usage for the parent response that created the Agent tool calls.</p>'
         f'{invocation_token_cards(tokens, invocation.get("model"), invocation.get("tokenFlags"))}</div></details>'
     )
+
+
+def invocation_model_markup(invocation: dict, turn: dict, session: dict) -> str:
+    """Render the model and optional effort as independent invocation labels."""
+    model = invocation.get("model") or turn.get("model") or session.get("model")
+    effort = normalize_reasoning_effort(
+        invocation.get("reasoningEffort")
+        or turn.get("reasoningEffort")
+        or session.get("reasoningEffort")
+    )
+    markup = (
+        '<span class="invocation-model"><small>Model</small>'
+        f'<b>{esc(display_model_name(model))}</b></span>'
+    )
+    if effort:
+        markup += (
+            '<span class="invocation-model"><small>Effort</small>'
+            f'<b>{esc(effort)}</b></span>'
+        )
+    return markup
 
 
 def internal_instructions_markup(instructions: list, title: str = "CONTEXT") -> str:
@@ -1761,12 +1911,15 @@ def render_session_row(item: dict, provider: str, selected: bool, show_empty: bo
     query = esc(urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "session": item["id"]}), quote=True)
     label = conversation_name(item.get("name"), item["id"])
     id_detail = "" if str(item["id"]).lower() in str(label).lower() else f'<small>{esc(item["id"])}</small>'
+    live_badge = '<span class="live-badge" title="Last activity was within the past minute" aria-label="Live session"><span class="live-badge-dot" aria-hidden="true"></span>Live</span>' if item.get("live") else ""
     metadata = (
-        f'<small class="session-meta">{esc(item.get("_source_label", PROVIDERS.get(provider, provider)))} · '
-        f'{esc(format_timestamp(item["updated"]))}</small>'
+        f'<small class="session-meta"><span class="session-source">'
+        f'{esc(item.get("_source_label", PROVIDERS.get(provider, provider)))} · </span>'
+        f'<span class="session-timestamp">{esc(format_timestamp(item["updated"]))}</span>'
+        f'{live_badge}</small>'
     )
     return (
-        f'<div class="session-row"><a class="session session-link {"selected" if selected else ""}" href="/?{query}">'
+        f'<div class="session-row"><a class="session session-link {"selected" if selected else ""}{" live-session" if item.get("live") else ""}" href="/?{query}">'
         f'<span class="session-glyph" aria-hidden="true">{esc(str(label)[:1].upper() or "S")}</span><span class="session-copy"><b>{esc(label)}</b>{id_detail}{metadata}</span></a>'
         f'<form method="post" action="/delete" onsubmit="return confirm(\'Delete this conversation and its stored data?\');">'
         f'<input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}">'
@@ -2020,7 +2173,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 invocation_markup = '<details class="turn-invocations"><summary><span><span class="invocation-icon" aria-hidden="true">I</span> Invocations</span><span class="summary-count">' + str(len(invocations)) + '</span></summary><div class="invocations-list">' + "".join(
                     f'<div class="turn-invocation"><div class="invocation-name"><span><i></i>Invocation {esc(invocation.get("index", invocation_index))}</span>'
                     f'{" <span class=\"turn-kind\">Usage summary</span>" if invocation.get("kind") == "usage_summary" else ""}'
-                    f'<span class="invocation-model"><small>Model</small><b>{esc(display_model_name(invocation.get("model") or turn.get("model") or chosen.get("model")))}</b></span></div><div class="invocation-content">{invocation_subagent_badge(invocation)}{invocation_tools(invocation)}{invocation_total_cards(invocation, invocation.get("model") or turn.get("model") or chosen.get("model"), invocation.get("tokenFlags") or turn.get("tokenFlags") or chosen.get("tokenFlags"))}</div></div>'
+                    f'{invocation_model_markup(invocation, turn, chosen)}</div><div class="invocation-content">{invocation_subagent_badge(invocation)}{invocation_tools(invocation)}{invocation_total_cards(invocation, invocation.get("model") or turn.get("model") or chosen.get("model"), invocation.get("tokenFlags") or turn.get("tokenFlags") or chosen.get("tokenFlags"))}</div></div>'
                     for invocation_index, invocation in enumerate(invocations, 1) if isinstance(invocation, dict)
                 ) + '</div></details>'
             invocation_label = f'{len(invocations)} {"invocation" if len(invocations) == 1 else "invocations"}'
@@ -2028,8 +2181,15 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             turn_token_total = sum(turn.get("tokens", {}).get(key) or 0 for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens"))
             turn_model = turn.get("model") or chosen.get("model")
             turn_model_label = display_model_name(turn_model)
+            turn_effort_label = display_effort_label(
+                turn.get("reasoningEffort") or chosen.get("reasoningEffort"),
+            )
+            turn_effort_markup = (
+                f'<span class="invocation-count">{esc(turn_effort_label)}</span>'
+                if turn_effort_label else ""
+            )
             turn_time_label = format_timestamp(turn_timestamp(turn, chosen.get("updated", 0)))
-            turn_total_badges = f'<span class="invocation-count">Time {esc(turn_time_label)}</span><span class="invocation-count">Model {esc(turn_model_label)}</span><span class="invocation-count">Invocations {len(invocations)}</span><span class="invocation-count">Tools {len(tools)}</span><span class="invocation-count">Tokens {fmt_unit(turn_token_total)}</span><span class="invocation-count">Cost {fmt_cost(turn.get("costUsd"))}</span>'
+            turn_total_badges = f'<span class="invocation-count">Time {esc(turn_time_label)}</span><span class="invocation-count">Model {esc(turn_model_label)}</span>{turn_effort_markup}<span class="invocation-count">Invocations {len(invocations)}</span><span class="invocation-count">Tools {len(tools)}</span><span class="invocation-count">Tokens {fmt_unit(turn_token_total)}</span><span class="invocation-count">Cost {fmt_cost(turn.get("costUsd"))}</span>'
             turns += f'''<article class="turn" id="turn-{index}"><header><div class="turn-number"><span>{index:02d}</span><div><b>Turn {esc(turn_label)}</b><small>Turn activity</small></div></div><div class="turn-badges">{turn_total_badges}{kind_label}</div></header>
                 <details class="message user turn-message user-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">U</span><label>User</label></summary><p>{esc(turn["user"] or "(no user message)")}</p>{files_markup}</details>
                 <details class="message assistant turn-message assistant-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">AI</span><label>Assistant</label></summary><p>{esc(assistant)}</p></details>
@@ -2093,8 +2253,12 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             subagent_markup = f'<section class="subagents-section"><div class="section-heading"><div><span class="section-kicker">DELEGATED WORK</span><h2>Unlinked sub-agents</h2></div><span class="muted">These transcripts could not be matched to an invocation</span></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th>Agent</th><th>Total tokens</th><th>Cost</th></tr></thead><tbody>{subagent_rows}</tbody></table></div></section>'
         session_expand_buttons = '<span class="session-expand-controls"><button type="button" class="invocation-count session-toggle" data-target="user">User</button><button type="button" class="invocation-count session-toggle" data-target="assistant">Assistant</button><button type="button" class="invocation-count session-toggle" data-target="invocations">Invocations</button><button type="button" class="invocation-count session-toggle" data-target="all">All</button></span>'
         close_explorer_url = refresh_conversation_url
+        session_effort_label = display_effort_label(chosen.get("reasoningEffort"))
+        session_effort_markup = (
+            f'<span>{esc(session_effort_label)}</span>' if session_effort_label else ""
+        )
         detail = f'''<main class="detail"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>{esc(PROVIDERS.get(provider, provider))}</div><h1>{esc(chosen["name"])}</h1>
-            <div class="header-chips"><span>Surface: {esc(session_tool(chosen_summary, provider))}</span><span>Timestamp: {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span><span>Model: {esc(chosen.get("pricingModel") or chosen.get("model") or "Unavailable")}</span></div>
+            <div class="header-chips"><span>Surface: {esc(session_tool(chosen_summary, provider))}</span><span>Timestamp: {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span><span>Model: {esc(display_model_name(chosen.get("pricingModel") or chosen.get("model")))}</span>{session_effort_markup}</div>
             </div><div class="detail-actions">{model_analysis_markup(chosen)}<a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a><a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
             <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
             <button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form><a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>{exit_action()}</div></header>
@@ -2460,6 +2624,9 @@ PAGE = PAGE.replace("</style></head>", r'''<style>
 /* Keep long provider/session identifiers inside their cards. */
 .session > span:last-child{min-width:0;flex:1;overflow:hidden}
 .session b,.session small,.session .session-meta{max-width:100%;overflow:hidden;text-overflow:ellipsis}
+.live-badge{display:inline-flex;align-items:center;margin-left:5px;padding:2px 5px;border:1px solid #2fb87d;border-radius:999px;background:#123c2c;color:#81f1ba;font-size:8px;font-weight:700;letter-spacing:.06em;line-height:1;text-transform:uppercase;vertical-align:middle;animation:live-glow 1.8s ease-in-out infinite}
+@keyframes live-glow{50%{box-shadow:0 0 7px rgba(53,232,154,.55)}}
+.session{position:relative}
 .session-row{min-width:0;width:100%;overflow:hidden}
 .id{overflow-wrap:anywhere;word-break:break-word}
 .detail-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:24px}
@@ -2647,6 +2814,13 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
 
 PAGE = PAGE.replace('</style>\n</head>', '''<style>
 /* Compact invocation cards: tools stay vertical, metrics stay horizontal. */
+.session{position:relative}
+.session .session-meta{display:flex;align-items:center;gap:0;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:clip}
+.session .session-meta .session-source{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.session .session-meta .session-timestamp{flex:none;white-space:nowrap}
+.session .session-meta .live-badge{position:absolute;right:8px;bottom:4px;display:inline-flex;align-items:center;gap:4px;margin:0;padding:2px 5px;border:1px solid #2fb87d;border-radius:999px;background:#123c2c;color:#81f1ba;font:700 8px/1 Inter,"Segoe UI",system-ui,sans-serif;letter-spacing:.06em;text-transform:uppercase;line-height:1;white-space:nowrap;overflow:visible;animation:live-glow 1.8s ease-in-out infinite}
+.session .session-meta .live-badge-dot{display:block;width:6px;height:6px;flex:none;margin:0;border-radius:50%;background:#35e89a;box-shadow:0 0 5px 2px rgba(53,232,154,.85)}
+@keyframes live-glow{50%{box-shadow:0 0 7px rgba(53,232,154,.55)}}
 .shutdown-form{margin:14px 0 0}.sidebar>.shutdown-form{margin:0 14px 16px;padding-top:12px;border-top:1px solid #202b3d}.stats-sidebar .shutdown-form{margin-bottom:14px}.shutdown-form button{display:flex;align-items:center;justify-content:center;gap:7px;width:100%;height:34px;border:1px solid #633346;border-radius:9px;background:linear-gradient(145deg,#291923,#21151e);box-shadow:0 5px 14px rgba(0,0,0,.16);color:#f0a6b4;font-size:10px;font-weight:750;letter-spacing:.02em;cursor:pointer;transition:border-color .15s,background .15s,transform .15s,box-shadow .15s}.shutdown-form button:before{content:"↪";font-size:13px;line-height:1}.shutdown-form button:hover{border-color:#bd6078;background:linear-gradient(145deg,#41202d,#321923);box-shadow:0 7px 18px rgba(78,25,44,.28);color:#fff;transform:translateY(-1px)}.shutdown-form button:active{transform:translateY(0);box-shadow:0 3px 9px rgba(0,0,0,.18)}
 .turn-invocations{margin:12px 14px;padding:0;border:1px solid #263247;border-radius:11px;background:#0b1018;overflow:hidden}
 .turn-invocations>summary{padding:11px 13px;background:#111925}

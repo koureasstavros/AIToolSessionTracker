@@ -116,6 +116,21 @@ class CodexInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(turn["tokens"]["inputTokens"], 20)
         self.assertEqual([invocation["tokens"]["inputTokens"] for invocation in turn["invocations"]], [10, 10])
 
+    def test_captures_reasoning_effort_from_collaboration_settings(self) -> None:
+        records = [
+            {"type": "session_meta", "payload": {"id": "session-1", "collaboration_mode": {"settings": {"reasoning_effort": "medium"}}}},
+            {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": "Done", "reasoning_effort": "high"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session-1.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+            session = openai_codex_provider.details({"_source": path})
+
+        self.assertEqual(session["reasoningEffort"], "high")
+        self.assertEqual(session["turns"][0]["reasoningEffort"], "high")
+        self.assertEqual(session["turns"][0]["invocations"][0]["reasoningEffort"], "high")
+
     def test_spawned_rollout_is_nested_under_owning_invocation(self) -> None:
         parent_id = "11111111-1111-4111-8111-111111111111"
         child_id = "22222222-2222-4222-8222-222222222222"

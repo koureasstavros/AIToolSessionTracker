@@ -163,6 +163,7 @@ def details(summary: dict) -> dict:
     result = viewer.new_session(path.stem, path.stem, updated)
     records = viewer.safe_json_lines(path)
     result["project"] = viewer.project_from_records(records)
+    result["reasoningEffort"] = viewer.session_reasoning_effort_from_records(records)
     turns: dict[str, dict] = {}
     tool_calls: dict[str, tuple[dict, dict]] = {}
     session_token_fields: set[str] = set()
@@ -233,6 +234,9 @@ def details(summary: dict) -> dict:
         if not relevant or (not current_turn_id and not turn_id):
             continue
         turn = get_turn(str(turn_id) if turn_id else None)
+        effort = viewer.reasoning_effort_from_record(record)
+        if effort:
+            turn["reasoningEffort"] = effort
         turn_model = viewer.model_from_records([record])
         if turn_model:
             turn["model"] = turn_model
@@ -252,6 +256,8 @@ def details(summary: dict) -> dict:
         )
         invocation = get_invocation(turn) if creates_invocation else None
         if invocation is not None:
+            if effort:
+                invocation["reasoningEffort"] = effort
             invocation.setdefault("tokenFields", [])
             invocation["tokenFields"] = list(set(invocation["tokenFields"]) | set(usage_fields))
         if payload_type == "function_call":

@@ -31,6 +31,7 @@ class SubagentInvocationTests(unittest.TestCase):
                 "subagent": {
                     "agentDescription": "Worker",
                     "model": "gpt-test",
+                    "reasoningEffort": "high",
                     "costUsd": 0.00330665,
                     "tokens": {"inputTokens": 1},
                     "turns": [{
@@ -47,6 +48,7 @@ class SubagentInvocationTests(unittest.TestCase):
         self.assertIn("Codex developer instructions", markup)
         self.assertIn("Child-only &lt;context&gt;", markup)
         self.assertIn("$0.003307", markup)
+        self.assertIn("Effort: high", markup)
         self.assertLess(markup.index("Subagent context"), markup.index("Arguments"))
         self.assertLess(markup.index("Arguments"), markup.index("Result"))
         self.assertLess(markup.index("Result"), markup.index("invocation-usage"))

@@ -39,6 +39,7 @@ def _read_session_state(folder: Path) -> dict:
         return session
     records = viewer.safe_json_lines(events)
     session["project"] = viewer.project_from_records(records)
+    session["reasoningEffort"] = viewer.session_reasoning_effort_from_records(records)
     turns: dict[str, dict] = {}
     turn_interactions: dict[str, str] = {}
     output_total = 0
@@ -93,6 +94,10 @@ def _read_session_state(folder: Path) -> dict:
             turn["raw"].append(json.dumps(event, indent=2, ensure_ascii=False))
         if event_type == "session.start":
             session["model"] = data.get("model") or data.get("modelId") or data.get("selectedModel")
+            session["reasoningEffort"] = (
+                viewer.reasoning_effort_from_record(event)
+                or session.get("reasoningEffort")
+            )
         elif event_type == "system.message":
             content = data.get("content")
             if interaction_id and isinstance(content, str) and content.strip():
@@ -113,12 +118,17 @@ def _read_session_state(folder: Path) -> dict:
             viewer.add_attached_files(turn, viewer.files_from_content(data.get("attachments")))
         elif event_type == "assistant.message":
             turn = get_turn(interaction_id)
+            effort = viewer.reasoning_effort_from_record(event)
+            if effort:
+                turn["reasoningEffort"] = effort
             if isinstance(data.get("model"), str) and data["model"]:
                 turn["model"] = data["model"]
             elif isinstance(data.get("modelId"), str) and data["modelId"]:
                 turn["model"] = data["modelId"]
             turn["_event_invocation_count"] = turn.get("_event_invocation_count", 0) + 1
             invocation = get_invocation(turn, turn["_event_invocation_count"])
+            if effort:
+                invocation["reasoningEffort"] = effort
             if data.get("content"):
                 turn["assistant"].append(str(data["content"]))
                 invocation["assistant"].append(str(data["content"]))
@@ -207,6 +217,9 @@ def _read_session_state(folder: Path) -> dict:
                 assigned += value
                 turn["tokens"][key] = value
     session["deployment"] = viewer.deployment_from_records(records)
+    resolved_effort = viewer.session_reasoning_effort_from_records(records)
+    if resolved_effort == "Mixed":
+        session["reasoningEffort"] = resolved_effort
     return session
 
 
@@ -228,6 +241,7 @@ def _read_chat(path: Path) -> dict:
     if not session["project"]:
         session["project"] = viewer.workspace_project_path(path.parent.parent)
     requests = [dict(item) for item in metadata.get("requests", []) if isinstance(item, dict)]
+    session["reasoningEffort"] = viewer.session_reasoning_effort_from_records(records)
     context_blocks = viewer.context_instruction_blocks(records, "Copilot")
     session_token_fields: set[str] = set()
     embedded_subagents: list[dict] = []
@@ -251,6 +265,9 @@ def _read_chat(path: Path) -> dict:
             requests[key[1]][str(key[2])] = value
     for index, request in enumerate(requests, 1):
         turn = viewer.new_turn(str(request.get("requestId") or index))
+        effort = viewer.reasoning_effort_from_record(request)
+        if effort:
+            turn["reasoningEffort"] = effort
         if index == 1:
             for block_name, block_content in context_blocks:
                 viewer.add_internal_instruction(turn, block_name, block_content)
@@ -322,6 +339,12 @@ def _read_chat(path: Path) -> dict:
                     "tools": [],
                     "assistant": [str(round_data["response"])] if round_data.get("response") else [],
                 }
+                invocation_effort = (
+                    viewer.reasoning_effort_from_record(round_data)
+                    or effort
+                )
+                if invocation_effort:
+                    invocation["reasoningEffort"] = invocation_effort
                 for call in round_data.get("toolCalls") or []:
                     if not isinstance(call, dict):
                         continue
@@ -368,6 +391,10 @@ def _read_chat(path: Path) -> dict:
                         child["relation"] = "subagent"
                         child["agentDescription"] = arguments.get("description") or child["name"]
                         child["agentModel"] = str(agent_model)
+                        child["reasoningEffort"] = (
+                            viewer.reasoning_effort_from_record(arguments)
+                            or invocation_effort
+                        )
                         child["spawnDepth"] = 1
                         child["toolUseId"] = call_id
                         tool["subagent"] = child
@@ -408,6 +435,10 @@ def _read_chat(path: Path) -> dict:
         for key in ("inputTokens", "outputTokens"):
             session["tokens"][key] = (session["tokens"][key] or 0) + (turn["tokens"][key] or 0)
     session["model"] = str(next((request.get("modelId") for request in requests if request.get("modelId")), "model unavailable"))
+    session["reasoningEffort"] = (
+        viewer.session_reasoning_effort_from_records(requests)
+        or session.get("reasoningEffort")
+    )
     session["deployment"] = viewer.deployment_from_records(records)
     session["tokenFields"] = [key for key in viewer.TOKEN_KEYS if key in session_token_fields]
     session["_embedded_subagents"] = embedded_subagents
@@ -761,6 +792,10 @@ def details(summary: dict) -> dict:
                     child["relation"] = "subagent"
                     child["agentDescription"] = info.get("agentDescription") or arguments.get("description") or name
                     child["agentModel"] = model
+                    child["reasoningEffort"] = (
+                        viewer.reasoning_effort_from_record(info)
+                        or (child_turn.get("reasoningEffort") if isinstance(child_turn, dict) else None)
+                    )
                     child["spawnDepth"] = 1
                     child["toolUseId"] = tool_call_id
                     viewer.subtract_cached_input(child)

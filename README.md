@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "tracker", "llm", "slm", "model", "session", "turn", "invocation", "agents", "tools", "context"]
 license: "apache-2.0"
-version: v0.0.32
+version: v0.0.33
 ---
 
 # AI Tool Session Tracker
@@ -224,7 +224,7 @@ storage and transcript formats.
 
 Every provider returns conversations using the same normalized fields:
 
-- `id`, `name`, `updated`, `model`, `project` and `source`
+- `id`, `name`, `updated`, `model`, `reasoningEffort`, `project` and `source`
 - `provider`, the provider (ai tool family)
 - `surface`, the harness (ai tool inteface)
 - `turns`, including user content, assistant content
@@ -286,8 +286,11 @@ The left-hand provider menu selects the data source. The session list then shows
 	provider's local storage for newly created, modified, or removed sessions.
 - Use the session filter to quickly narrow the current provider's list by
 	conversation name, ID, source, or other visible session details.
+- Sessions with activity written within the past minute display a **Live**
+	badge after their timestamp. Copilot session-state sessions stop displaying
+	the badge after a recorded shutdown event.
 - Use **Show empty** or **Hide empty** beside refresh to control whether sessions without a meaningful turn appear. A session is non-empty when at least one turn has user input, assistant output, or a numeric token value (including zero). The preference is preserved while switching providers and inspecting token content.
-- The selected session header shows its GUID, associated project directory when available, model, and the exact transcript or database source path used to load it.
+- The selected session header shows its GUID, associated project directory when available, model and persisted reasoning effort, and the exact transcript or database source path used to load it.
 - The main content area shows token totals, turn cards, and the **Content Explorer** side panel.
 - Expand and collapse controls help manage conversation turns, tool events,
 	raw records, and content sections when reviewing long sessions.
@@ -341,6 +344,13 @@ token values even when the corresponding readable prompt or internal context
 is unavailable. Missing content therefore does not imply missing token usage;
 it only means that the provider did not store that content in a readable local
 form.
+
+When present in a local transcript, the viewer displays the configured effort
+in a separate label at session, turn, and invocation scope. If records associate
+different models with different effort settings, the session label displays
+`Mixed`. This is a provider setting (for example, `low`, `medium`, or
+`high`), rather than a measurement of work performed; actual reasoning usage is
+represented separately by output reasoning tokens.
 
 ## Model cost calculation
 

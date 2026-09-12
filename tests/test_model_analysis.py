@@ -1,6 +1,11 @@
 import unittest
 
-from session_token_viewer import model_analysis_markup, model_usage_breakdown
+from session_token_viewer import (
+    display_effort_label,
+    model_analysis_markup,
+    model_usage_breakdown,
+    session_reasoning_effort_from_records,
+)
 
 
 class ModelAnalysisTests(unittest.TestCase):
@@ -71,6 +76,28 @@ class ModelAnalysisTests(unittest.TestCase):
         self.assertIn("claude-sonnet-4-5", markup)
         self.assertIn("15 /", markup)
         self.assertIn("$", markup)
+
+    def test_effort_has_an_independent_label(self) -> None:
+        self.assertEqual(
+            display_effort_label("high"),
+            "Effort: high",
+        )
+
+    def test_session_effort_is_mixed_for_models_with_different_efforts(self) -> None:
+        records = [
+            {"data": {"model": "model-a", "reasoningEffort": "low"}},
+            {"data": {"model": "model-b", "reasoningEffort": "high"}},
+        ]
+
+        self.assertEqual(session_reasoning_effort_from_records(records), "Mixed")
+
+    def test_session_effort_is_not_mixed_for_equal_model_efforts(self) -> None:
+        records = [
+            {"data": {"model": "model-a", "reasoningEffort": "medium"}},
+            {"data": {"model": "model-b", "reasoningEffort": "medium"}},
+        ]
+
+        self.assertEqual(session_reasoning_effort_from_records(records), "medium")
 
 
 if __name__ == "__main__":

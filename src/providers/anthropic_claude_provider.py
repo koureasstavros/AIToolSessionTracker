@@ -204,6 +204,7 @@ def details(summary: dict) -> dict:
     result = viewer.new_session(path.stem, path.stem, updated)
     records = viewer.safe_json_lines(path)
     result["project"] = viewer.project_from_records(records)
+    result["reasoningEffort"] = viewer.session_reasoning_effort_from_records(records)
     if result["project"] and "local-agent-mode-sessions" in result["project"].replace("/", "\\").lower():
         result["project"] = None
     turns: dict[str, dict] = {}
@@ -349,6 +350,9 @@ def details(summary: dict) -> dict:
             current_turn = turns.setdefault(logical_id, viewer.new_turn(logical_id))
 
         turn = current_turn
+        effort = viewer.reasoning_effort_from_record(record)
+        if effort:
+            turn["reasoningEffort"] = effort
         record_model = viewer.model_from_records([record])
         # Claude writes locally generated API errors as assistant messages
         # whose model is ``<synthetic>``. Preserve that marker on the
@@ -359,6 +363,8 @@ def details(summary: dict) -> dict:
         message_id_value = message.get("id") if isinstance(message, dict) else None
         message_id = str(message_id_value) if message_id_value else None
         invocation = new_invocation(turn, message_id) if role in {"assistant", "model"} or is_tool_use else None
+        if invocation is not None and effort:
+            invocation["reasoningEffort"] = effort
         if invocation is not None and record_model:
             existing_model = invocation.get("model")
             if not existing_model or (existing_model == "<synthetic>" and record_model != "<synthetic>"):

@@ -94,6 +94,61 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(turn["invocations"][0]["tools"][0]["result"], "# Project")
         self.assertEqual([invocation["tokens"]["outputTokens"] for invocation in turn["invocations"]], [10, 5])
 
+    def test_session_state_captures_reasoning_effort(self) -> None:
+        records = [
+            {"type": "session.start", "data": {"selectedModel": "gpt-test", "reasoningEffort": "high"}},
+            {"type": "user.message", "data": {"interactionId": "turn-1", "content": "Analyze this"}},
+            {"type": "assistant.message", "data": {"interactionId": "turn-1", "content": "Done", "reasoningEffort": "medium"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "session-1"
+            folder.mkdir()
+            (folder / "events.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records),
+                encoding="utf-8",
+            )
+            session = github_copilot_provider._read_session_state(folder)
+
+        self.assertEqual(session["reasoningEffort"], "high")
+        self.assertEqual(session["turns"][0]["reasoningEffort"], "medium")
+        self.assertEqual(session["turns"][0]["invocations"][0]["reasoningEffort"], "medium")
+
+    def test_session_state_captures_nested_checkpoint_effort(self) -> None:
+        records = [{
+            "type": "session.usage_checkpoint",
+            "data": {"promptCacheBreakState": [{
+                "models": {"gpt-test": {"model": "gpt-test", "reasoning_effort": "medium"}},
+            }]},
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "session-1"
+            folder.mkdir()
+            (folder / "events.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records),
+                encoding="utf-8",
+            )
+            session = github_copilot_provider._read_session_state(folder)
+
+        self.assertEqual(session["reasoningEffort"], "medium")
+
+    def test_extension_chat_captures_selected_model_effort(self) -> None:
+        records = [
+            {"v": {"sessionId": "session-1", "requests": [{
+                "requestId": "request-1",
+                "message": {"text": "Analyze this"},
+                "response": [{"value": "Done"}],
+            }], "inputState": {"selectedModel": {
+                "identifier": "gpt-test",
+                "modelConfiguration": {"reasoningEffort": "medium"},
+            }}}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session-1.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+            session = github_copilot_provider._read_chat(path)
+
+        self.assertEqual(session["reasoningEffort"], "medium")
+
     def test_chat_tool_rounds_include_final_no_tool_metrics(self) -> None:
         request = {
             "requestId": "request-1",
@@ -144,6 +199,7 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
                     "toolCallRounds": [
                         {
                             "modelId": "gpt-child",
+                            "reasoningEffort": "high",
                             "toolCalls": [{
                                 "id": call_id,
                                 "name": "runSubagent",
@@ -175,6 +231,7 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
         agent = session["turns"][0]["invocations"][0]["tools"][0]["subagent"]
         self.assertEqual(agent["name"], "Reviewer")
         self.assertEqual(agent["agentDescription"], "Review code")
+        self.assertEqual(agent["reasoningEffort"], "high")
         self.assertEqual(agent["turns"][0]["assistant"], ["Looks good"])
         self.assertTrue(all(value is None for value in agent["tokens"].values()))
 
