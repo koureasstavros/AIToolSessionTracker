@@ -2,12 +2,12 @@
 language: ["en"]
 tags: ["ai", "tool", "tracker", "llm", "slm", "model", "session", "turn", "invocation", "agents", "tools", "context"]
 license: "apache-2.0"
-version: v0.0.33
+version: v0.0.34
 ---
 
 # AI Tool Session Tracker
 
-A local, read-only browser app for exploring AI coding-agent sessions, turns, content, raw events, and token usage.
+A local, read-only browser app for exploring AI coding-agent sessions, turns, content, raw events, and token usage. It works both with local sessions (jsonl) and/or open telemetry (otel).
 
 ![AI Tool Session Tracker](material/readme/ai_tool_session_tracker.png)
 
@@ -25,6 +25,14 @@ easy to inspect.
 
 The invocations view breaks a session into model interactions and shows their
 associated token usage, tool calls, results, and estimated costs.
+
+## 💖 Sponsor
+
+This project is freely available to everyone, but your support as a sponsor can make a real difference. By sponsoring, you help us unlock the resources needed to explore new experimental directions—ranging from advanced session trace to token / cost inspection.
+
+[🏷️ Sponshor this Project through GitHub](https://github.com/sponsors/koureasstavros) --and let your support shine through GitHub.
+
+[🏷️ Sponshor this Project through PayPal](https://www.paypal.com/donate/?hosted_button_id=HNWFJR47DAJQE) --If you're looking for a donation platform other than GitHub.
 
 ## Run
 
@@ -212,6 +220,51 @@ Deletion cannot be undone by this application.
 The application separates the provider-neutral viewer from provider-specific
 storage and transcript formats.
 
+## Settings
+
+### Model costs
+
+**Settings → Model costs** manages model pricing in USD per one million tokens,
+including input, cache-read, cache-write, output, and reasoning-output rates.
+The bundled `src/common/model_costs.json` catalog seeds the configuration database on
+first launch. Subsequent additions and edits are stored in
+`AI-Tool-Session-Tracker-config.db`; **Model mappings** can then map provider-specific
+deployment names to entries in that catalog.
+
+### Model mappings
+
+**Settings → Model mappings** maps provider deployment names to model IDs in the
+cost catalog. The bundled `src/common/model_mapping.json` aliases are copied to
+the local `AI-Tool-Session-Tracker-config.db` database on first launch; after that, settings
+edits remain local and are never replaced by the bundled defaults. Exact
+deployment matches take precedence over automatic model matching.
+
+### Source Routing
+
+**Settings → Source Routing** selects the source independently for each
+provider: **Local storage** keeps the existing provider-specific discovery,
+while **OTEL service** shows only signals received for that provider. The
+bundled `src/common/source_routing.json` configuration seeds the local
+`source_routing` table on first launch and routes every provider to local
+storage by default.
+
+### Source OTEL
+
+**Settings → Source OTEL** configures one local OTLP/HTTP listener shared by
+all providers routed to OTEL. The bundled `src/common/source_otel.json`
+configuration seeds the separate local `source_otel` table on first
+launch. The default listener is `http://127.0.0.1:4318`; exporters use
+`/v1/traces`, `/v1/logs`, or `/v1/metrics` for the matching OTLP signal.
+Received OTEL data is stored locally in `AI-Tool-Session-Tracker-content.db`, while
+listener and routing settings remain in `AI-Tool-Session-Tracker-config.db`; no provider
+cloud API is contacted.
+
+Exporters should set `ai.session.provider` to `copilot`, `codex`, `claude`,
+`antigravity`, or `m365_copilot`, and can use `ai.session.id` to group spans
+into a session. The receiver recognizes common `gen_ai.usage.*_tokens` and
+`gen_ai.*.model` attributes. OTEL-backed sessions intentionally cannot be
+imported, exported, or deleted through the local-storage controls.
+
 ### Main application
 
 `session_token_viewer.py` owns the common application behavior:
@@ -247,11 +300,19 @@ native file or database format.
 
 Provider-specific behavior is implemented in:
 
-- `src/providers/github_copilot_provider.py`
-- `src/providers/openai_codex_provider.py`
-- `src/providers/anthropic_claude_provider.py`
-- `src/providers/google_antigravity_provider.py`
-- `src/providers/m365_copilot_provider.py`
+- `src/providers/github_copilot_local_provider.py`
+- `src/providers/openai_codex_local_provider.py`
+- `src/providers/anthropic_claude_local_provider.py`
+- `src/providers/google_antigravity_local_provider.py`
+- `src/providers/m365_copilot_local_provider.py`
+
+Provider-specific OTEL routing and metadata mapping is implemented in:
+
+- `src/providers/github_copilot_otel_provider.py`
+- `src/providers/openai_codex_otel_provider.py`
+- `src/providers/anthropic_claude_otel_provider.py`
+- `src/providers/google_antigravity_otel_provider.py`
+- `src/providers/m365_copilot_otel_provider.py`
 
 Each provider adapter under `src/providers/` exposes the same operations:
 

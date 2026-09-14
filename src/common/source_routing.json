@@ -1,0 +1,9 @@
+{
+  "providers": {
+    "copilot": "local",
+    "codex": "local",
+    "claude": "local",
+    "antigravity": "local",
+    "m365_copilot": "local"
+  }
+}

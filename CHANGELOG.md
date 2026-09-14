@@ -4,6 +4,11 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Tracker, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.34 — 2026-09-14
+
+- Added support for model / cost configuration
+- Added support for otel with settings and service (experimental)
+
 ### Version v0.0.33 — 2026-09-13
 
 - Added label live into currently active sessions

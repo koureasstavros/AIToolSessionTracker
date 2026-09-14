@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.providers import openai_codex_provider
+from src.providers import openai_codex_local_provider
 
 
 class CodexInvocationGroupingTests(unittest.TestCase):
@@ -42,7 +42,7 @@ class CodexInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-            session = openai_codex_provider.details({"_source": path})
+            session = openai_codex_local_provider.details({"_source": path})
 
         self.assertEqual(session["turns"][0]["user"], "Original human prompt")
         self.assertEqual(
@@ -61,7 +61,7 @@ class CodexInvocationGroupingTests(unittest.TestCase):
                 "payload": {"id": "cli-session", "originator": "codex_vscode", "source": "vscode"},
             }) + "\n", encoding="utf-8")
             with patch("pathlib.Path.home", return_value=home):
-                entries = openai_codex_provider.index(home)
+                entries = openai_codex_local_provider.index(home)
 
         self.assertEqual(entries[0]["_source_label"], "Extension")
 
@@ -77,13 +77,13 @@ class CodexInvocationGroupingTests(unittest.TestCase):
             path = sessions / "rollout-mixed.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
             with patch("pathlib.Path.home", return_value=home):
-                entries = openai_codex_provider.index(home)
+                entries = openai_codex_local_provider.index(home)
 
         self.assertEqual(entries[0]["_source_label"], "Mixed")
 
     def test_codex_tui_originator_is_cli(self) -> None:
         self.assertEqual(
-            openai_codex_provider._surface_from_records([
+            openai_codex_local_provider._surface_from_records([
                 {"type": "session_meta", "payload": {"originator": "codex-tui", "source": "cli"}},
             ]),
             "CLI",
@@ -105,7 +105,7 @@ class CodexInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-            session = openai_codex_provider.details({"_source": path})
+            session = openai_codex_local_provider.details({"_source": path})
 
         self.assertEqual(len(session["turns"]), 1)
         turn = session["turns"][0]
@@ -125,7 +125,7 @@ class CodexInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-            session = openai_codex_provider.details({"_source": path})
+            session = openai_codex_local_provider.details({"_source": path})
 
         self.assertEqual(session["reasoningEffort"], "high")
         self.assertEqual(session["turns"][0]["reasoningEffort"], "high")
@@ -161,8 +161,8 @@ class CodexInvocationGroupingTests(unittest.TestCase):
             parent.write_text("\n".join(json.dumps(record) for record in parent_records), encoding="utf-8")
             child.write_text("\n".join(json.dumps(record) for record in child_records), encoding="utf-8")
             with patch("pathlib.Path.home", return_value=home):
-                entries = openai_codex_provider.index(home)
-                session = openai_codex_provider.details(entries[0])
+                entries = openai_codex_local_provider.index(home)
+                session = openai_codex_local_provider.details(entries[0])
 
         self.assertEqual(len(entries), 1)
         self.assertEqual(len(entries[0]["_children"]), 1)

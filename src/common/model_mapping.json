@@ -1,0 +1,7 @@
+{
+  "mappings": {
+    "GPT56LUNA-GS": "gpt-5.6-luna",
+    "GPT56TERRA-GS": "gpt-5.6-terra",
+    "GPT56SOL-GS": "gpt-5.6-sol"
+  }
+}

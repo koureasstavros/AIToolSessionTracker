@@ -21,7 +21,9 @@ class StatisticsNavigationTests(unittest.TestCase):
             def details(self, summary):
                 return summary
 
-        with patch("session_token_viewer.PROVIDER_ADAPTERS", {"copilot": Adapter()}):
+        with patch("session_token_viewer.PROVIDER_ADAPTERS", {"copilot": Adapter()}), patch(
+            "session_token_viewer.source_mode", return_value="local"
+        ):
             page = load_session_index(Path("."), "copilot", limit=1, offset=0)
             older = load_session_index(Path("."), "copilot", limit=1, offset=1)
 
@@ -45,6 +47,13 @@ class StatisticsNavigationTests(unittest.TestCase):
     def test_view_tabs_use_the_loading_overlay(self) -> None:
         self.assertIn("a.view-tab", PAGE)
         self.assertIn("loading('Loading session data…')", PAGE)
+
+    def test_settings_lists_model_costs_before_mappings(self) -> None:
+        from session_token_viewer import render_settings_page
+
+        markup = render_settings_page()
+
+        self.assertLess(markup.index("Model costs"), markup.index("Model mappings"))
 
     def test_delete_removes_session_row_without_refresh(self) -> None:
         self.assertIn("'X-Requested-With':'XMLHttpRequest'", PAGE)
@@ -118,7 +127,9 @@ class StatisticsNavigationTests(unittest.TestCase):
 
         adapters = {provider: Adapter() for provider in ("copilot", "codex", "claude", "antigravity", "m365_copilot")}
         manager = BackgroundScanManager(Path("."))
-        with patch("session_token_viewer.PROVIDER_ADAPTERS", adapters):
+        with patch("session_token_viewer.PROVIDER_ADAPTERS", adapters), patch(
+            "session_token_viewer.source_mode", return_value="local"
+        ):
             manager.start()
             manager._thread.join(timeout=2)
 

@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -7,6 +9,27 @@ from src.common import source_pricing as pricing
 
 
 class PricingTests(unittest.TestCase):
+    def test_model_costs_seed_from_bundled_catalog_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker.db"
+            costs = pricing.load_model_costs(database_path)
+            with closing(sqlite3.connect(database_path)) as database:
+                count = database.execute("SELECT COUNT(*) FROM model_costs").fetchone()[0]
+
+        self.assertGreater(count, 1)
+        self.assertTrue(any(row["model"] == "gpt-4o" for row in costs))
+
+    def test_custom_model_costs_are_saved_and_used_for_pricing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker.db"
+            pricing.save_model_costs([{
+                "vendor": "Test", "model": "test-model", "input": 2, "cache_read": 0.5,
+                "cache_write": 1, "output": 4, "reasoning": 6,
+            }], database_path)
+            with patch.object(pricing, "mapping_config_path", return_value=database_path):
+                self.assertEqual(pricing.load_model_costs()[0]["model"], "test-model")
+                self.assertEqual(pricing.cost_for_tokens({"inputTokens": 1_000_000, "outputTokens": 1_000_000}, "test-model"), 6.0)
+
     def test_reasoning_tokens_use_reasoning_rate_instead_of_being_added_twice(self) -> None:
         tokens = {
             "inputTokens": 1_000_000,
@@ -18,16 +41,44 @@ class PricingTests(unittest.TestCase):
         # gpt-5.6-luna: 1 + .1 + 1.25 + 3.6 regular output + 2.4 reasoning.
         self.assertAlmostEqual(pricing.cost_for_tokens(tokens, "OpenAI/gpt-5.6-luna"), 8.35)
 
+    def test_separate_reasoning_output_is_priced_without_double_subtraction(self) -> None:
+        tokens = {"outputTokens": 600_000, "reasoningTokens": 400_000}
+
+        self.assertAlmostEqual(
+            pricing.cost_for_tokens(tokens, "gpt-5.6-luna", output_includes_reasoning=False),
+            6.0,
+        )
+
     def test_unknown_model_has_no_cost(self) -> None:
         self.assertIsNone(pricing.cost_for_tokens({"outputTokens": 10}, "deployment-abc"))
 
     def test_explicit_deployment_mapping_resolves_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "model_mappings.json"
+            config_path = Path(directory) / "AI-Tool-Session-Tracker.db"
             pricing.save_model_mappings({"TEST-GS": "gpt-5.6-luna"}, config_path)
+            with closing(sqlite3.connect(config_path)) as database:
+                self.assertEqual(
+                    database.execute("SELECT model FROM model_mappings WHERE deployment = 'TEST-GS'").fetchone()[0],
+                    "gpt-5.6-luna",
+                )
             with patch.object(pricing, "mapping_config_path", return_value=config_path):
                 self.assertEqual(pricing.mapped_model("TEST-GS"), "gpt-5.6-luna")
                 self.assertEqual(pricing.find_model("TEST-GS")["model"], "gpt-5.6-luna")
+
+    def test_model_mappings_seed_from_bundled_catalog_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker.db"
+
+            mappings = pricing.load_model_mappings(database_path)
+
+            self.assertEqual(mappings["GPT56LUNA-GS"], "gpt-5.6-luna")
+            with closing(sqlite3.connect(database_path)) as database:
+                self.assertEqual(
+                    database.execute(
+                        "SELECT value FROM tracker_metadata WHERE key = 'model_mapping_json_seeded'"
+                    ).fetchone()[0],
+                    "1",
+                )
 
     def test_deployment_path_resolves_to_public_model_name(self) -> None:
         price = pricing.find_model("azure/Azure-APIM/GPT56SOL-GS")

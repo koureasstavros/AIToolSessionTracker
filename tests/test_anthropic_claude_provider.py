@@ -6,13 +6,13 @@ from unittest.mock import patch
 
 import session_token_viewer
 from src.common import source_pricing as pricing
-from src.providers import anthropic_claude_provider
+from src.providers import anthropic_claude_local_provider
 
 
 class ClaudeInvocationGroupingTests(unittest.TestCase):
     def test_shared_transcript_without_surface_metadata_is_mixed(self) -> None:
         self.assertEqual(
-            anthropic_claude_provider.tool({"_source": Path("session.jsonl")}),
+            anthropic_claude_local_provider.tool({"_source": Path("session.jsonl")}),
             "Mixed",
         )
 
@@ -32,7 +32,7 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with patch("pathlib.Path.home", return_value=home):
-                entries = anthropic_claude_provider.index(home)
+                entries = anthropic_claude_local_provider.index(home)
 
         self.assertEqual(entries[0]["_source_label"], "CLI")
 
@@ -72,7 +72,7 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with patch("pathlib.Path.home", return_value=home):
-                entries = anthropic_claude_provider.index(home)
+                entries = anthropic_claude_local_provider.index(home)
 
         desktop_entry = next(entry for entry in entries if entry["id"] == session_id)
         audit_entry = next(entry for entry in entries if entry["id"] == "audit-session")
@@ -120,8 +120,8 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
             }), encoding="utf-8")
 
             with patch("pathlib.Path.home", return_value=home):
-                entries = anthropic_claude_provider.index(home)
-                session = anthropic_claude_provider.details(entries[0])
+                entries = anthropic_claude_local_provider.index(home)
+                session = anthropic_claude_local_provider.details(entries[0])
 
         self.assertEqual(len(session["subagents"]), 1)
         self.assertEqual(len(session["subagents"][0]["subagents"]), 1)
@@ -155,7 +155,7 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-            session = anthropic_claude_provider.details({"_source": path})
+            session = anthropic_claude_local_provider.details({"_source": path})
 
         self.assertEqual(session["reasoningEffort"], "high")
         self.assertEqual(session["turns"][0]["reasoningEffort"], "high")
@@ -187,7 +187,7 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-            session = anthropic_claude_provider.details({"_source": path})
+            session = anthropic_claude_local_provider.details({"_source": path})
 
         instructions = session["turns"][0]["internalInstructions"]
         self.assertEqual([item["name"] for item in instructions], [
@@ -210,7 +210,7 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-            session = anthropic_claude_provider.details({"_source": path})
+            session = anthropic_claude_local_provider.details({"_source": path})
 
         self.assertEqual(len(session["turns"]), 1)
         turn = session["turns"][0]
@@ -231,7 +231,7 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-            session = anthropic_claude_provider.details({"_source": path})
+            session = anthropic_claude_local_provider.details({"_source": path})
 
         self.assertEqual(len(session["turns"]), 1)
         turn = session["turns"][0]
@@ -277,7 +277,7 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-            session = anthropic_claude_provider.details({"_source": path})
+            session = anthropic_claude_local_provider.details({"_source": path})
 
         self.assertEqual(session["tokens"]["outputTokens"], 273)
         self.assertEqual(session["tokens"]["reasoningTokens"], 249)
@@ -292,7 +292,7 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-            session = pricing.apply_costs(anthropic_claude_provider.details({"_source": path}))
+            session = pricing.apply_costs(anthropic_claude_local_provider.details({"_source": path}))
 
         turn = session["turns"][0]
         self.assertEqual(turn["model"], "claude-sonnet-4-5")

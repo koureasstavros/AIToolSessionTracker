@@ -27,3 +27,16 @@ The viewer is local and read-only. It does not connect to provider cloud APIs,
 download account history, or parse browser/application caches. For a provider
 whose history is cloud-backed, provide a supported JSON/JSONL export before
 expecting it to appear in the viewer.
+
+## Optional OpenTelemetry source
+
+Source Routing can instead select the local OTEL service for any individual
+provider. The app accepts OTLP/HTTP protobuf and JSON trace payloads, plus
+OTLP/HTTP JSON log and metric payloads, at its configured local
+listener and persists accepted spans, logs, and metrics in the local
+`AI-Tool-Session-Tracker-content.db` database. Routing and listener settings are
+stored separately in `AI-Tool-Session-Tracker-config.db`.
+This is an ingest path from a user-configured exporter, not a provider cloud
+API integration. OTEL data is displayed only for providers explicitly routed to
+OTEL; local discovery remains unchanged for every other provider. Source
+archives and deletion are unavailable for OTEL-backed sessions.

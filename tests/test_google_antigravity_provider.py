@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.providers import google_antigravity_provider
+from src.providers import google_antigravity_local_provider
 
 
 class GoogleAntigravityProviderTests(unittest.TestCase):
@@ -13,7 +13,7 @@ class GoogleAntigravityProviderTests(unittest.TestCase):
             "id": "12345678-1234-1234-1234-123456789abc",
             "content": "<USER_REQUEST>\nBuild a weather dashboard\n</USER_REQUEST>\n<ADDITIONAL_METADATA>...</ADDITIONAL_METADATA>",
         }
-        session_id, name = google_antigravity_provider.identity(record, "fallback")
+        session_id, name = google_antigravity_local_provider.identity(record, "fallback")
         self.assertEqual(session_id, "12345678-1234-1234-1234-123456789abc")
         self.assertEqual(name, "Build a weather dashboard")
 
@@ -61,7 +61,7 @@ class GoogleAntigravityProviderTests(unittest.TestCase):
             transcript.write_text("\n".join(json.dumps(step) for step in steps), encoding="utf-8")
 
             summary = {"_source": transcript, "id": conv_id, "name": "Analyze repository structure"}
-            details = google_antigravity_provider.details(summary)
+            details = google_antigravity_local_provider.details(summary)
 
         self.assertEqual(details["id"], conv_id)
         self.assertEqual(details["name"], "Analyze repository structure")
@@ -122,7 +122,7 @@ class GoogleAntigravityProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "transcript.jsonl"
             path.write_text("\n".join(json.dumps(step) for step in steps), encoding="utf-8")
-            details = google_antigravity_provider.details({"_source": path, "id": "test-subagent"})
+            details = google_antigravity_local_provider.details({"_source": path, "id": "test-subagent"})
 
         self.assertEqual(len(details["turns"]), 1)
         invocation = details["turns"][0]["invocations"][0]
@@ -144,8 +144,8 @@ class GoogleAntigravityProviderTests(unittest.TestCase):
                 }) + "\n",
                 encoding="utf-8",
             )
-            with patch("src.providers.google_antigravity_provider._candidate_roots", return_value=[base]):
-                entries = google_antigravity_provider.index(base)
+            with patch("src.providers.google_antigravity_local_provider._candidate_roots", return_value=[base]):
+                entries = google_antigravity_local_provider.index(base)
 
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["id"], conv_id)
@@ -165,8 +165,8 @@ class GoogleAntigravityProviderTests(unittest.TestCase):
                 }) + "\n",
                 encoding="utf-8",
             )
-            with patch("src.providers.google_antigravity_provider._candidate_roots", return_value=[cli_root]):
-                entries = google_antigravity_provider.index(cli_root)
+            with patch("src.providers.google_antigravity_local_provider._candidate_roots", return_value=[cli_root]):
+                entries = google_antigravity_local_provider.index(cli_root)
 
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["name"], "CLI session")
@@ -193,19 +193,19 @@ class GoogleAntigravityProviderTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch("src.providers.google_antigravity_provider._candidate_roots", return_value=[cli_root]):
-                entries = google_antigravity_provider.index(cli_root)
+            with patch("src.providers.google_antigravity_local_provider._candidate_roots", return_value=[cli_root]):
+                entries = google_antigravity_local_provider.index(cli_root)
 
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["id"], "session-id")
 
     def test_source_labels_ide_transcripts_as_ide(self) -> None:
         source = Path.home() / ".gemini" / "antigravity-ide" / "brain" / "session" / ".system_generated" / "logs" / "transcript.jsonl"
-        self.assertEqual(google_antigravity_provider.tool({"_source": source}), "IDE")
+        self.assertEqual(google_antigravity_local_provider.tool({"_source": source}), "IDE")
 
     def test_source_labels_desktop_transcripts_as_desktop(self) -> None:
         source = Path.home() / ".gemini" / "antigravity" / "brain" / "session" / ".system_generated" / "logs" / "transcript.jsonl"
-        self.assertEqual(google_antigravity_provider.tool({"_source": source}), "Desktop")
+        self.assertEqual(google_antigravity_local_provider.tool({"_source": source}), "Desktop")
 
     def test_delete_removes_session_directory_and_db(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -226,7 +226,7 @@ class GoogleAntigravityProviderTests(unittest.TestCase):
             db_file.write_bytes(b"dummy db")
 
             summary = {"_source": transcript, "id": conv_id}
-            google_antigravity_provider.delete(summary)
+            google_antigravity_local_provider.delete(summary)
 
             self.assertFalse(conv_folder.exists())
             self.assertFalse(db_file.exists())

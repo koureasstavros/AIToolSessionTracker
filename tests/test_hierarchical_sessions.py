@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.providers import anthropic_claude_provider
+from src.providers import anthropic_claude_local_provider
 
 
 class ClaudeHierarchyTests(unittest.TestCase):
@@ -19,8 +19,8 @@ class ClaudeHierarchyTests(unittest.TestCase):
             parent.write_text(json.dumps({"sessionId": "parent", "type": "user", "message": {"role": "user", "content": "Parent"}}) + "\n", encoding="utf-8")
             child.write_text(json.dumps({"sessionId": "child", "parentSessionId": "parent", "type": "assistant", "model": "claude-sonnet-4-5", "message": {"role": "assistant", "content": "Delegated", "usage": {"input_tokens": 10, "output_tokens": 5}}}) + "\n", encoding="utf-8")
             with patch("pathlib.Path.home", return_value=home):
-                entries = anthropic_claude_provider.index(home)
-                session = anthropic_claude_provider.details(entries[0])
+                entries = anthropic_claude_local_provider.index(home)
+                session = anthropic_claude_local_provider.details(entries[0])
 
         self.assertEqual(len(entries), 1)
         self.assertEqual(len(entries[0]["_children"]), 1)

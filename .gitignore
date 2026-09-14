@@ -2,4 +2,5 @@ __pycache__/
 *.py[cod]
 build/
 dist/
-model_mappings.json
+AI-Tool-Session-Tracker-config.db*
+AI-Tool-Session-Tracker-content.db*

@@ -24,12 +24,14 @@ from pathlib import Path
 from typing import TypedDict
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
+from src.common import source_otel
 from src.common import source_pricing as pricing
-from src.providers import anthropic_claude_provider
-from src.providers import github_copilot_provider
-from src.providers import google_antigravity_provider
-from src.providers import m365_copilot_provider
-from src.providers import openai_codex_provider
+from src.common import source_routing
+from src.providers import anthropic_claude_local_provider
+from src.providers import github_copilot_local_provider
+from src.providers import google_antigravity_local_provider
+from src.providers import m365_copilot_local_provider
+from src.providers import openai_codex_local_provider
 
 TOKEN_KEYS = (
     "inputTokens",
@@ -98,14 +100,149 @@ def token_accounting_note(provider: str, turn_count: int) -> str:
 APP_NAME = "AI Tool Session Tracker"
 LIVE_SESSION_WINDOW_SECONDS = 60
 PROVIDER_ADAPTERS = {
-    "copilot": github_copilot_provider,
-    "codex": openai_codex_provider,
-    "claude": anthropic_claude_provider,
-    "antigravity": google_antigravity_provider,
-    "m365_copilot": m365_copilot_provider,
+    "copilot": github_copilot_local_provider,
+    "codex": openai_codex_local_provider,
+    "claude": anthropic_claude_local_provider,
+    "antigravity": google_antigravity_local_provider,
+    "m365_copilot": m365_copilot_local_provider,
 }
 LOGGER = logging.getLogger(__name__)
 _INSTANCE_MUTEX: int | None = None
+_OTEL_RECEIVER: "OtelReceiver | None" = None
+
+
+def source_routing_config() -> dict[str, object]:
+    """Read the current source routes without allowing invalid settings to stop scans."""
+    return source_routing.load_source_routing(PROVIDERS)
+
+
+def source_otel_config() -> dict[str, object]:
+    """Read the shared local OTLP listener configuration."""
+    return source_otel.load_source_otel()
+
+
+def source_mode(provider: str, routing: dict[str, object] | None = None) -> str:
+    configured = (routing or source_routing_config()).get("providers", {})
+    return configured.get(provider) if isinstance(configured, dict) and configured.get(provider) == "otel" else "local"
+
+
+class OtelReceiverHandler(BaseHTTPRequestHandler):
+    """Minimal local OTLP/HTTP trace receiver; no telemetry leaves this machine."""
+
+    def _read_request_body(self) -> bytes:
+        """Read Content-Length and HTTP/1.1 chunked OTLP request bodies."""
+        if "chunked" not in self.headers.get("Transfer-Encoding", "").lower():
+            length = int(self.headers.get("Content-Length", "0"))
+            if length < 0 or length > 32 * 1024 * 1024:
+                raise ValueError("OTLP request body exceeds the 32 MiB limit")
+            return self.rfile.read(length)
+        chunks = bytearray()
+        while True:
+            line = self.rfile.readline(128)
+            if not line:
+                raise ValueError("Truncated chunked OTLP request body")
+            try:
+                size = int(line.split(b";", 1)[0].strip(), 16)
+            except ValueError as error:
+                raise ValueError("Invalid chunked OTLP request size") from error
+            if size == 0:
+                # Consume optional trailers and the terminating empty line.
+                while self.rfile.readline(8192).strip():
+                    pass
+                return bytes(chunks)
+            if size < 0 or len(chunks) + size > 32 * 1024 * 1024:
+                raise ValueError("OTLP request body exceeds the 32 MiB limit")
+            chunk = self.rfile.read(size)
+            if len(chunk) != size or self.rfile.read(2) != b"\r\n":
+                raise ValueError("Truncated chunked OTLP request body")
+            chunks.extend(chunk)
+
+    def do_POST(self) -> None:
+        signal = urlparse(self.path).path
+        if signal not in {"/v1/traces", "/v1/logs", "/v1/metrics"}:
+            self.send_error(404)
+            return
+        try:
+            body = self._read_request_body()
+            length = len(body)
+            content_type = self.headers.get("Content-Type", "").lower()
+            if not body:
+                raise ValueError("OTLP request body is empty")
+            if signal == "/v1/traces" and ("protobuf" in content_type or "application/x-protobuf" in content_type):
+                payload = source_otel.otlp_protobuf_to_json(body)
+            elif "protobuf" in content_type or "application/x-protobuf" in content_type:
+                raise ValueError("OTLP protobuf logs and metrics are not supported; configure JSON protocol")
+            else:
+                payload = json.loads(body.decode("utf-8"))
+            if signal == "/v1/traces":
+                source_otel.ingest_otlp_json(payload, PROVIDERS)
+            elif signal == "/v1/logs":
+                source_otel.ingest_otlp_logs_json(payload, PROVIDERS)
+            else:
+                source_otel.ingest_otlp_metrics_json(payload, PROVIDERS)
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError, sqlite3.Error) as error:
+            LOGGER.warning(
+                "Unable to ingest OTLP trace payload (content type %s, %s bytes): %s",
+                self.headers.get("Content-Type", "unknown"), length, error,
+            )
+            self.send_error(400, "Invalid OTLP trace payload")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        try:
+            self.wfile.write(b"{}")
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # OTLP exporters can close a connection after sending a batch;
+            # the spans are already committed before the response is written.
+            return
+
+    def log_message(self, *_: object) -> None:
+        pass
+
+
+class OtelReceiver:
+    """Own the optional OTLP listener independently from the viewer server."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.server = ThreadingHTTPServer((host, port), OtelReceiverHandler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, name="otel-receiver", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def sync_otel_receiver(routing: dict[str, object] | None = None) -> None:
+    """Start the configured receiver only while at least one provider uses OTEL."""
+    global _OTEL_RECEIVER
+    routing = routing or source_routing_config()
+    enabled = any(source_mode(provider, routing) == "otel" for provider in PROVIDERS)
+    otel = source_otel_config()
+    host = otel.get("host", "127.0.0.1")
+    port = otel.get("port", 4318)
+    if not enabled:
+        if _OTEL_RECEIVER is not None:
+            _OTEL_RECEIVER.stop()
+            _OTEL_RECEIVER = None
+        return
+    if _OTEL_RECEIVER is not None and (_OTEL_RECEIVER.host, _OTEL_RECEIVER.port) == (host, port):
+        return
+    if _OTEL_RECEIVER is not None:
+        _OTEL_RECEIVER.stop()
+        _OTEL_RECEIVER = None
+    try:
+        _OTEL_RECEIVER = OtelReceiver(str(host), int(port))
+        _OTEL_RECEIVER.start()
+        LOGGER.info("Listening for OTLP/HTTP traces at http://%s:%s/v1/traces", host, port)
+    except OSError as error:
+        LOGGER.warning("Unable to start OTLP receiver on %s:%s: %s", host, port, error)
 
 
 def configure_logging() -> Path | None:
@@ -220,7 +357,7 @@ def normalize_session_data(value: dict) -> SessionData:
             flags.append("uncategorizedOutput")
     result["tokenFlags"] = flags
     result["tokenFields"] = [key for key in TOKEN_KEYS if key in supplied_fields] if has_supplied_fields else list(TOKEN_KEYS if isinstance(supplied_tokens, dict) else [])
-    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_surface", "_session_id", "_db_metadata", "_db_issue", "_has_data", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation"):
+    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_surface", "_session_id", "_db_metadata", "_db_issue", "_has_data", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation", "outputTokensExcludeReasoning"):
         if key in value:
             result[key] = value[key]
     for turn in result["turns"]:
@@ -1241,7 +1378,7 @@ def load_session_index(root: Path, provider: str, show_empty: bool = False, limi
     adapter = PROVIDER_ADAPTERS[provider]
     normalized = []
     try:
-        indexed_items = adapter.index(root)
+        indexed_items = source_otel.index(provider) if source_mode(provider) == "otel" else adapter.index(root)
     except Exception:
         LOGGER.exception("Unable to scan provider %s; continuing with an empty provider result", provider)
         return []
@@ -1265,7 +1402,7 @@ def load_session_index(root: Path, provider: str, show_empty: bool = False, limi
                 break
             if item.get("_has_data") is not True:
                 try:
-                    if not session_has_content(adapter.details(item)):
+                    if not session_has_content(load_session_details(item, provider)):
                         continue
                 except Exception:
                     LOGGER.exception("Unable to inspect one %s session; skipping it", provider)
@@ -1281,6 +1418,7 @@ class BackgroundScanManager:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self.routing = source_routing_config()
         self._lock = threading.Lock()
         self._sessions: dict[str, list[dict]] = {provider: [] for provider in PROVIDERS}
         self._all_sessions: dict[str, list[dict]] = {provider: [] for provider in PROVIDERS}
@@ -1309,7 +1447,7 @@ class BackgroundScanManager:
                 self._status[provider] = "scanning"
             try:
                 with self._provider_locks[provider]:
-                    indexed = PROVIDER_ADAPTERS[provider].index(self.root)
+                    indexed = source_otel.index(provider) if source_mode(provider, self.routing) == "otel" else PROVIDER_ADAPTERS[provider].index(self.root)
                 normalized = []
                 for item in indexed:
                     try:
@@ -1390,13 +1528,20 @@ class BackgroundScanManager:
 
 def load_session_details(summary: dict, provider: str) -> dict:
     """Load one full transcript through its provider adapter."""
-    details = PROVIDER_ADAPTERS[provider].details(summary)
+    details = source_otel.details(summary, provider) if summary.get("_route") == "otel" or summary.get("_kind") == "otel" else PROVIDER_ADAPTERS[provider].details(summary)
     details["provider"] = provider
     return pricing.apply_costs(normalize_session_data(details))
 
 
 def delete_session(summary: dict) -> None:
     """Delete a session using the owning provider's storage rules."""
+    if summary.get("_route") == "otel" or summary.get("_kind") == "otel":
+        provider = summary.get("provider") or summary.get("_provider")
+        if not isinstance(provider, str) or provider not in PROVIDER_ADAPTERS:
+            raise ValueError("Session summary does not identify its provider")
+        if not source_otel.delete(summary, provider):
+            raise FileNotFoundError("OTEL session was not found in the local database")
+        return
     provider = summary.get("provider") or summary.get("_provider")
     if not isinstance(provider, str) or provider not in PROVIDER_ADAPTERS:
         raise ValueError("Session summary does not identify its provider")
@@ -1405,6 +1550,8 @@ def delete_session(summary: dict) -> None:
 
 def export_session_sources(summary: dict, provider: str, archive: Path) -> Path:
     """Export the owning provider's original source files."""
+    if summary.get("_route") == "otel" or summary.get("_kind") == "otel":
+        raise ValueError("OTEL sessions do not have source archives")
     return PROVIDER_ADAPTERS[provider].export_source_files(summary, archive)
 
 
@@ -1413,7 +1560,12 @@ def import_session_sources(provider: str, archive: Path, root: Path) -> list[Pat
     return PROVIDER_ADAPTERS[provider].import_source_files(archive, root)
 
 
-def provider_path(root: Path, provider: str) -> Path:
+def provider_path(root: Path, provider: str) -> Path | str:
+    if source_mode(provider) == "otel":
+        routing = source_routing_config().get("otel", {})
+        if isinstance(routing, dict):
+            return f"OTLP/HTTP listener: http://{routing.get('host')}:{routing.get('port')}/v1/traces"
+        return "OTEL service"
     return PROVIDER_ADAPTERS[provider].display_root(root)
 
 
@@ -2101,6 +2253,65 @@ def session_tool(summary: dict, provider: str) -> str:
     return PROVIDER_ADAPTERS[provider].tool(summary)
 
 
+def render_model_costs_page() -> str:
+    """Render the editable per-million-token model pricing catalog."""
+    def field_value(row: dict[str, object], key: str) -> str:
+        value = row.get(key)
+        return "" if value is None else f"{float(value):g}"
+
+    def row_markup(row: dict[str, object] | None = None) -> str:
+        row = row or {}
+        return (
+            '<tr class="cost-row">'
+            f'<td><input name="cost_vendor" value="{esc(str(row.get("vendor") or "Custom"), quote=True)}" placeholder="Vendor" required></td>'
+            f'<td><input name="cost_model" value="{esc(str(row.get("model") or ""), quote=True)}" placeholder="Model ID" required></td>'
+            + "".join(
+                f'<td><input name="cost_{key}" type="number" min="0" step="any" value="{esc(field_value(row, key), quote=True)}" placeholder="—"{" required" if key in {"input", "output"} else ""}></td>'
+                for key in ("input", "cache_read", "cache_write", "output", "reasoning")
+            )
+            + '<td><button type="button" class="mapping-remove cost-remove" aria-label="Remove model cost">×</button></td></tr>'
+        )
+
+    rows = "".join(row_markup(row) for row in pricing.load_model_costs()) or row_markup()
+    script = """<script>(function(){
+        var body=document.getElementById('cost-rows'),add=document.getElementById('cost-add');
+        if(!body||!add)return;
+        add.addEventListener('click',function(){
+            var row=body.querySelector('.cost-row'),clone=row.cloneNode(true);
+            clone.querySelectorAll('input').forEach(function(input){
+                input.value=input.name==='cost_vendor'?'Custom':'';
+            });
+            body.appendChild(clone);
+        });
+        body.addEventListener('click',function(event){
+            var remove=event.target.closest('.cost-remove');
+            if(!remove)return;
+            var row=remove.closest('.cost-row'),rows=body.querySelectorAll('.cost-row');
+            if(rows.length>1){row.remove();return;}
+            row.querySelectorAll('input').forEach(function(input){
+                input.value=input.name==='cost_vendor'?'Custom':'';
+            });
+        });
+    })();</script>"""
+    return (
+        '<main class="detail settings-page"><style>'
+        '.cost-table-wrap{max-height:55vh;overflow:auto;border:1px solid var(--line);border-radius:9px}'
+        '.cost-table{width:100%;min-width:960px;border-collapse:collapse;background:#101a2a}'
+        '.cost-table th,.cost-table td{padding:8px;border-bottom:1px solid var(--line);text-align:left;font-size:11px}'
+        '.cost-table th{position:sticky;top:0;background:#162338;color:#9bb1cc;font-size:9px;letter-spacing:.06em;text-transform:uppercase}'
+        '.cost-table input{width:100%;min-width:74px;box-sizing:border-box;border:1px solid #31435f;border-radius:6px;background:#0c1627;color:#dbe9ff;padding:7px}'
+        '.cost-table td:nth-child(1) input,.cost-table td:nth-child(2) input{min-width:130px}.cost-table td:last-child{width:36px}'
+        '</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div>'
+        '<h1>Model costs</h1><p class="settings-intro">Manage rates in USD per one million tokens. The bundled <code>model_costs.json</code> catalog is copied to <code>'
+        + esc(pricing.mapping_config_path()) + '</code> the first time the app opens; later changes are stored only in the database.</p></div>'
+        + '<div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>' + exit_action() + '</div></header>'
+        + '<section class="settings-card"><div class="section-heading"><div><span class="section-kicker">COST CATALOG</span><h2>Model ID to Token Rates</h2></div><span class="muted">Blank cache or reasoning rates are treated as unavailable</span></div>'
+        + '<form method="post" action="/settings"><input type="hidden" name="settings_action" value="model-costs"><div class="cost-table-wrap"><table class="cost-table"><thead><tr><th>Vendor</th><th>Model</th><th>Input tokens</th><th>Input cache read tokens</th><th>Input cache write tokens</th><th>Output tokens</th><th>Output reasoning tokens</th><th></th></tr></thead><tbody id="cost-rows">'
+        + rows + '</tbody></table></div><div class="settings-actions"><button type="button" class="settings-secondary" id="cost-add">Add model</button><button type="submit" class="settings-primary">Save costs</button></div></form>'
+        + script + '</section></main>'
+    )
+
+
 def render_settings_page(action: str | None = None) -> str:
     """Render local application settings, including deployment mappings."""
     mappings = pricing.load_model_mappings()
@@ -2112,11 +2323,43 @@ def render_settings_page(action: str | None = None) -> str:
     )
     if not rows:
         rows = '<div class="mapping-row"><input name="deployment" placeholder="Deployment name" required><span aria-hidden="true">→</span><input name="model" placeholder="Pricing model ID" required><button type="button" class="mapping-remove" aria-label="Remove mapping">×</button></div>'
-    if action == "model-mappings":
+    if action == "model-costs":
+        detail = render_model_costs_page()
+    elif action == "model-mappings":
         detail = f'''<main class="detail settings-page"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div><h1>Model mappings</h1><p class="settings-intro">Map arbitrary deployment names to the model ID used for pricing. The mapping is saved locally in <code>{esc(pricing.mapping_config_path())}</code>.</p></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>{exit_action()}</div></header><section class="settings-card"><div class="section-heading"><div><span class="section-kicker">PRICING</span><h2>Deployment to model ID</h2></div><span class="muted">Exact deployment matches override automatic matching</span></div><form class="mapping-form" method="post" action="/settings"><div id="mapping-rows">{rows}</div><div class="settings-actions"><button type="button" class="settings-secondary" id="mapping-add">Add mapping</button><button type="submit" class="settings-primary">Save mappings</button></div><p class="settings-help">Example: <code>TEST-GS</code> → <code>gpt-5.6-luna</code>. Existing session data is unchanged; pricing is recalculated when sessions are scanned.</p></form></section></main>'''
+        detail = detail.replace("<span class=\"section-kicker\">PRICING</span>", "<span class=\"section-kicker\">MAPPING CATALOG</span>")
+    elif action == "source-otel":
+        otel = source_otel_config()
+        host = esc(str(otel.get("host", "127.0.0.1")), quote=True)
+        port = esc(str(otel.get("port", 4318)), quote=True)
+        detail = f'''<main class="detail settings-page"><style>.listener-form{{display:grid;gap:14px}}.listener-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}.listener-grid label{{display:grid;gap:6px;color:#a9b9ce;font-size:11px}}.listener-grid input{{border:1px solid #31435f;border-radius:7px;background:#0c1627;color:#dbe9ff;padding:8px 10px}}.listener-grid .wide{{grid-column:1/-1}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div><h1>Source OTEL</h1><p class="settings-intro">Configure the single local OTLP receiver shared by every provider routed to OTEL. Received signals remain in <code>{esc(source_otel.content_database_path())}</code>.</p></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>{exit_action()}</div></header><section class="settings-card"><form class="listener-form" method="post" action="/settings"><input type="hidden" name="settings_action" value="source-otel"><div class="section-heading"><div><span class="section-kicker">OTEL SERVICE</span><h2>OTLP receiver</h2></div></div><div class="listener-grid"><label class="wide">Protocol<input name="protocol" value="OTLP/HTTP (protobuf or JSON)" readonly></label><label>Listen host<input name="otel_host" value="{host}" required></label><label>Listen port<input name="otel_port" value="{port}" inputmode="numeric" required></label></div><p class="settings-help">Configure exporters with base endpoint <code>http://HOST:PORT</code>; use <code>/v1/traces</code>, <code>/v1/logs</code>, or <code>/v1/metrics</code> for the matching OTLP signal.</p><div class="settings-actions"><button type="submit" class="settings-primary">Save OTEL settings</button></div></form></section></main>'''
+    elif action == "source-routing":
+        routing = source_routing_config()
+        routes = routing.get("providers", {}) if isinstance(routing.get("providers"), dict) else {}
+        otel = routing.get("otel", {}) if isinstance(routing.get("otel"), dict) else {}
+        route_rows = "".join(
+            f'<label class="routing-row"><span><b>{esc(label)}</b><small>{esc(key)}</small></span><select name="route_{esc(key, quote=True)}"><option value="local"{" selected" if routes.get(key) != "otel" else ""}>Local storage</option><option value="otel"{" selected" if routes.get(key) == "otel" else ""}>OTEL service</option></select></label>'
+            for key, label in PROVIDERS.items()
+        )
+        host = esc(str(otel.get("host", "127.0.0.1")), quote=True)
+        port = esc(str(otel.get("port", 4318)), quote=True)
+        detail = f'''<main class="detail settings-page"><style>.routing-form{{display:grid;gap:14px}}.routing-row{{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 0;border-bottom:1px solid var(--line)}}.routing-row span{{display:grid;gap:3px}}.routing-row small{{color:var(--muted);font:10px ui-monospace,monospace}}.routing-row select,.listener-grid input{{border:1px solid #31435f;border-radius:7px;background:#0c1627;color:#dbe9ff;padding:8px 10px}}.listener-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}.listener-grid label{{display:grid;gap:6px;color:#a9b9ce;font-size:11px}}.listener-grid .wide{{grid-column:1/-1}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div><h1>Source Routing</h1><p class="settings-intro">Choose where each provider is read from. OTEL routes receive OTLP/HTTP JSON traces on this computer, store them in <code>{esc(source_otel.content_database_path())}</code>, and show only that provider&apos;s received data.</p></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>{exit_action()}</div></header><section class="settings-card"><form class="routing-form" method="post" action="/settings"><input type="hidden" name="settings_action" value="source-routing"><div class="section-heading"><div><span class="section-kicker">PROVIDER ROUTES</span><h2>Session source by provider</h2></div></div>{route_rows}<div class="section-heading"><div><span class="section-kicker">OTEL SERVICE</span><h2>OTLP receiver</h2></div></div><div class="listener-grid"><label class="wide">Protocol<input name="protocol" value="OTLP/HTTP JSON" readonly></label><label>Listen host<input name="otel_host" value="{host}" required></label><label>Listen port<input name="otel_port" value="{port}" inputmode="numeric" required></label></div><p class="settings-help">Configure exporters to send JSON OTLP traces to <code>http://HOST:PORT/v1/traces</code>. Include <code>ai.session.provider</code> (copilot, codex, claude, antigravity, or m365_copilot) and optionally <code>ai.session.id</code>. This listener is enabled only when at least one provider uses OTEL.</p><div class="settings-actions"><button type="submit" class="settings-primary">Save source routing</button></div></form></section></main>'''
+        detail = detail.replace("OTLP/HTTP JSON", "OTLP/HTTP (protobuf or JSON)").replace(
+            "OTEL routes receive OTLP/HTTP (protobuf or JSON) traces",
+            "OTEL routes receive OTLP/HTTP traces, logs, and metrics",
+        ).replace(
+            "Configure exporters to send JSON OTLP traces to <code>http://HOST:PORT/v1/traces</code>.",
+            "Configure exporters with base endpoint <code>http://HOST:PORT</code>; use <code>/v1/traces</code>, <code>/v1/logs</code>, or <code>/v1/metrics</code> for the matching OTLP signal.",
+        )
+        detail = re.sub(
+            r'<div class="section-heading"><div><span class="section-kicker">OTEL SERVICE</span>.*?</form>',
+            '<div class="settings-actions"><button type="submit" class="settings-primary">Save routes</button></div></form>',
+            detail,
+            flags=re.DOTALL,
+        )
     else:
         detail = f'<main class="detail settings-page settings-empty"><header class="detail-heading"><div></div><div class="detail-actions"><a class="icon-button" href="/?provider=copilot" title="Back to sessions" aria-label="Back to sessions">←</a>{exit_action()}</div></header><div class="empty-hero"><span class="hero-icon">⚙</span><span class="section-kicker">APPLICATION SETTINGS</span><h1>Select an action</h1><p>Choose a settings action from the sidebar to manage the application.</p></div></main>'
-    settings_actions = f'<div class="settings-sidebar"><div class="settings-sidebar-title">Settings</div><a class="settings-sidebar-link{" selected" if action == "model-mappings" else ""}" href="/?view=settings&action=model-mappings"><span aria-hidden="true">↔</span><span>Model mappings</span></a></div>'
+    settings_actions = f'<div class="settings-sidebar"><div class="settings-sidebar-title">Settings</div><a class="settings-sidebar-link{" selected" if action == "model-costs" else ""}" href="/?view=settings&action=model-costs"><span aria-hidden="true">$</span><span>Model costs</span></a><a class="settings-sidebar-link{" selected" if action == "model-mappings" else ""}" href="/?view=settings&action=model-mappings"><span aria-hidden="true">↔</span><span>Model mappings</span></a><a class="settings-sidebar-link{" selected" if action == "source-routing" else ""}" href="/?view=settings&action=source-routing"><span aria-hidden="true">⇄</span><span>Source Routing</span></a><a class="settings-sidebar-link{" selected" if action == "source-otel" else ""}" href="/?view=settings&action=source-otel"><span aria-hidden="true">◉</span><span>Source OTEL</span></a></div>'
     return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__SIDEBAR_CLASS__", "").replace("__PROVIDER_MENU__", "").replace("__VIEW_TABS__", "").replace("__STATS_SIDEBAR__", "").replace("__SIDEBAR_CONTENT__", settings_actions).replace("__SESSION_ROWS__", "").replace("__SESSION_COUNT__", "0").replace("__DETAIL__", detail).replace("__REFRESH_URL__", "/?refresh=1").replace("__EMPTY_TOGGLE__", "").replace("__ROOT__", "").replace("__IMPORT_FORM__", "").replace("__SCAN_BOOTSTRAP__", "")
 
 
@@ -2127,6 +2370,9 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 if sessions_override is None else sessions_override)
     chosen_summary = next((item for item in sessions if item["id"] == selected), None) if selected else None
     chosen = load_session_details(chosen_summary, provider) if chosen_summary else None
+    supports_local_actions = source_mode(provider) == "local" and not (
+        chosen_summary and (chosen_summary.get("_route") == "otel" or chosen_summary.get("_kind") == "otel")
+    )
     provider_menu = "".join(
         f'<a class="provider {"selected" if provider == key else ""}" data-provider="{esc(key)}" href="/?{esc(urlencode({"view": "statistics" if view == "statistics" else "operational", "provider": key, "show_empty": int(show_empty)}), quote=True)}"><span class="provider-mark" aria-hidden="true"></span><span>{esc(label)}</span></a>'
         for key, label in PROVIDERS.items()
@@ -2259,9 +2505,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         )
         detail = f'''<main class="detail"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>{esc(PROVIDERS.get(provider, provider))}</div><h1>{esc(chosen["name"])}</h1>
             <div class="header-chips"><span>Surface: {esc(session_tool(chosen_summary, provider))}</span><span>Timestamp: {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span><span>Model: {esc(display_model_name(chosen.get("pricingModel") or chosen.get("model")))}</span>{session_effort_markup}</div>
-            </div><div class="detail-actions">{model_analysis_markup(chosen)}<a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a><a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');">
-            <input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}">
-            <button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form><a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>{exit_action()}</div></header>
+            </div><div class="detail-actions">{model_analysis_markup(chosen)}<a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a>{f'''<a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');"><input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}"><button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form>''' if supports_local_actions else ''}<a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>{exit_action()}</div></header>
             <section class="session-facts"><div><span>Session ID</span><code>{esc(chosen["id"])}</code><button type="button" class="copy-value" data-copy="{esc(chosen["id"], quote=True)}">Copy</button></div><div><span>Project</span><code>{esc(chosen.get("project") or "Unavailable")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("project") or "Unavailable", quote=True)}">Copy</button></div><div><span>Source</span><code>{esc(chosen.get("source") or "Unknown")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("source") or "Unknown", quote=True)}">Copy</button></div></section>
             {token_accounting_note(provider, len(chosen["turns"]))}
             {f'<div class="provider-note"><b>Provider note</b>{esc(chosen["_db_issue"])}</div>' if chosen.get("_db_issue") else ""}
@@ -2275,6 +2519,21 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         else:
             detail = f'<main class="detail no-sessions"><header class="detail-heading"><div></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>{exit_action()}</div></header><div class="empty-hero"><span class="hero-icon">○</span><span class="section-kicker">__APP_NAME__</span><h1>No sessions found</h1><p>No local conversations were found for this provider. Try showing empty sessions or refresh the source.</p></div></main>'
 
+    if chosen and chosen_summary and chosen_summary.get("_kind") == "otel":
+        delete_control = (
+            '<form class="detail-delete" method="post" action="/delete" '
+            'onsubmit="return confirm(\'Delete all locally stored OTEL spans for this session?\');">'
+            f'<input type="hidden" name="provider" value="{esc(provider)}">'
+            f'<input type="hidden" name="show_empty" value="{int(show_empty)}">'
+            f'<input type="hidden" name="session" value="{esc(chosen["id"])}">'
+            '<button type="submit" class="icon-button danger" title="Delete OTEL session" aria-label="Delete OTEL session">×</button></form>'
+        )
+        detail = detail.replace(
+            '<a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>',
+            delete_control + '<a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>',
+            1,
+        )
+
     refresh_url = esc("/?" + urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "refresh": 1}), quote=True)
     toggle_url = esc("/?" + urlencode({"provider": provider, "show_empty": int(not show_empty)}), quote=True)
     toggle_label = "Hide empty sessions" if show_empty else "Show empty sessions"
@@ -2284,7 +2543,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18"></path><path d="M10.6 5.2A10.8 10.8 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-3.2 4.2"></path><path d="M6.2 6.2C3.5 8.1 2 12 2 12s3.5 7 10 7a10.8 10.8 0 0 0 3.4-.6"></path></svg>'
     )
     toggle = f'<a class="empty-toggle" href="{toggle_url}" title="{toggle_label}" aria-label="{toggle_label}">{toggle_icon}</a>'
-    import_form = f'<form class="import-inline" method="post" action="/import" enctype="multipart/form-data"><input id="source-archive" name="archive" type="file" accept=".zip" required onchange="this.form.submit()"><input type="hidden" name="provider" value="{esc(provider)}"><label class="import-button" for="source-archive" title="Import one session archive" aria-label="Import one session archive">⇧</label></form>'
+    import_form = f'<form class="import-inline" method="post" action="/import" enctype="multipart/form-data"><input id="source-archive" name="archive" type="file" accept=".zip" required onchange="this.form.submit()"><input type="hidden" name="provider" value="{esc(provider)}"><label class="import-button" for="source-archive" title="Import one session archive" aria-label="Import one session archive">⇧</label></form>' if source_mode(provider) == "local" else ""
     view_tabs = f'<style>.detail .message p{{font-size:12px}}.detail .muted{{font-size:11px}}.detail .section-kicker{{font-size:10px}}.detail .section-heading h2{{font-size:17px}}.detail .metric span{{font-size:10px}}.detail .metric strong{{font-size:20px}}.assistant .role>span{{width:22px;height:22px;border-radius:7px}}.view-tabs{{display:flex;gap:5px;margin:10px 0 16px;padding:3px;background:#0c1627;border:1px solid #223451;border-radius:8px}}.view-tab{{flex:1;padding:7px 8px;border-radius:6px;color:#8fa8c5;text-align:center;text-decoration:none;font-size:11px}}.view-tab:hover,.view-tab.selected{{background:#24558a;color:#fff}}.stats-group-menu,.stats-time-menu{{margin:0 -14px;padding:10px 14px;border:0;border-top:1px solid #202b3d;border-bottom:1px solid #202b3d;border-radius:0;background:transparent}}.stats-time-menu{{margin-top:12px}}.stats-sidebar-title{{margin:0;padding:0 8px 4px;color:#697a91;font-size:9px;font-weight:800;letter-spacing:.14em;text-transform:uppercase}}.stats-sidebar-links{{display:grid;gap:3px}}.stats-sidebar-link{{display:flex;align-items:center;gap:10px;min-height:34px;padding:8px 10px;border:1px solid transparent;border-radius:11px;color:#b9c4d3;text-decoration:none;font-size:12px;font-weight:650}}.stats-sidebar-link .provider-mark{{width:8px;height:8px;flex:none;border-radius:50%;background:#68768a;box-shadow:none}}.stats-sidebar-link:hover,.stats-sidebar-link.selected{{border-color:#293750;background:linear-gradient(100deg,#182235,#131a27);box-shadow:none;color:#fff}}.stats-sidebar-link.selected .provider-mark{{transform:scale(1.18);box-shadow:0 0 0 3px rgba(124,140,255,.12)}}.stats-sidebar .provider-menu:empty,.stats-sidebar .sessions-area{{display:none}}.timeline-point{{cursor:pointer;stroke:#101a2a;stroke-width:2}}.tokens-point{{fill:#54c99f}}.cost-point{{fill:#f07878}}.timeline-hint{{margin-left:auto;color:#687990;font-size:10px}}.import-error{{position:fixed;z-index:30;top:20px;left:calc(var(--sidebar) + 24px);right:24px;width:auto;max-width:none;margin:0;padding:12px 16px;border:1px solid #8f3e4b;border-radius:9px;background:#351923;color:#ffb4c0;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.3)}}@media(max-width:700px){{.import-error{{left:20px;right:20px}}}}</style><nav class="view-tabs"><a class="view-tab {"selected" if view != "statistics" else ""}" href="/?{urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty)})}">Operational</a><a class="view-tab {"selected" if view == "statistics" else ""}" href="/?{urlencode({"view": "statistics", "provider": provider, "group": group, "range": time_range})}">Statistics</a></nav>'
     view_tabs += '<style>.session-expand-controls{display:flex;gap:4px;margin-top:8px}.session-toggle{margin-left:0;padding:6px 9px;border:1px solid #40516c;border-radius:8px;background:#182538;color:#a9c9e9;font-size:10px;text-transform:none;cursor:pointer}.session-toggle:hover{border-color:#6c7fe2;background:#26365a;color:#fff}.turn-message{display:block!important;margin:12px 14px;width:auto;box-sizing:border-box;padding:0;border:1px solid var(--line);border-bottom:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-message>summary{display:flex;align-items:center;gap:7px;padding:10px 12px;border:0;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-message>summary::-webkit-details-marker{display:none}.turn-message>summary:after{margin-left:auto;color:#6f82a0;content:"▾"}.turn-message:not([open])>summary:after{content:"▸"}.turn-message>p{margin:0;padding:14px 16px;border-top:1px solid var(--line);background:rgba(15,23,34,.6)}.turn-invocations{width:auto;box-sizing:border-box;margin-left:14px;margin-right:14px}.turn-invocations>summary{justify-content:flex-start;gap:7px}.turn-invocations>summary>span:first-child{display:flex;align-items:center;gap:7px}.turn-invocations>summary .summary-count{margin-left:auto}.turn-invocations>summary:after{margin-left:4px;color:#6f82a0;content:"▾"}.turn-invocations:not([open])>summary:after{content:"▸"}.invocation-icon{display:grid;place-items:center;width:22px;height:22px;flex:0 0 22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800;letter-spacing:-.03em}</style><script>(function(){document.addEventListener("click",function(event){var summary=event.target.closest(".turn-message > summary");if(summary){event.preventDefault();summary.parentElement.open=!summary.parentElement.open;return;}var button=event.target.closest(".session-toggle");if(!button)return;var detail=button.closest(".detail");if(!detail)return;var target=button.getAttribute("data-target");var selectors=target==="all"?".turn-message,.turn-invocations":target==="user"?"details.user-content":target==="assistant"?"details.assistant-content":"details.turn-invocations";var details=detail.querySelectorAll(selectors);var shouldOpen=Array.prototype.some.call(details,function(item){return !item.open});details.forEach(function(item){item.open=shouldOpen});});})();</script>'
     view_tabs += '<style>.turn-message>summary,.turn-invocations>summary{min-height:44px;box-sizing:border-box}</style>'
@@ -2338,6 +2597,58 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         if route == "/settings":
             form = parse_qs(body.decode("utf-8", errors="replace"))
+            if form.get("settings_action", [""])[0] == "model-costs":
+                fields = ("vendor", "model", "input", "cache_read", "cache_write", "output", "reasoning")
+                values = {field: form.get(f"cost_{field}", []) for field in fields}
+                row_count = max((len(items) for items in values.values()), default=0)
+                costs = [
+                    {field: values[field][index] if index < len(values[field]) else "" for field in fields}
+                    for index in range(row_count)
+                ]
+                try:
+                    pricing.save_model_costs(costs)
+                except (OSError, ValueError) as error:
+                    LOGGER.warning("Unable to save model costs: %s", error)
+                    self.send_error(400, str(error))
+                    return
+                type(self).scan_manager = None
+                self.send_response(303)
+                self.send_header("Location", "/?view=settings&action=model-costs")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            if form.get("settings_action", [""])[0] == "source-routing":
+                routes = {provider: form.get(f"route_{provider}", [""])[0] for provider in PROVIDERS}
+                try:
+                    source_routing.save_source_routing(PROVIDERS, routes)
+                except (OSError, ValueError) as error:
+                    LOGGER.warning("Unable to save source routing: %s", error)
+                    self.send_error(400, str(error))
+                    return
+                type(self).scan_manager = None
+                sync_otel_receiver()
+                self.send_response(303)
+                self.send_header("Location", "/?view=settings&action=source-routing")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            if form.get("settings_action", [""])[0] == "source-otel":
+                try:
+                    source_otel.save_source_otel(
+                        source_otel.OTEL_HTTP,
+                        form.get("otel_host", [""])[0],
+                        form.get("otel_port", [""])[0],
+                    )
+                except (OSError, ValueError) as error:
+                    LOGGER.warning("Unable to save Source OTEL settings: %s", error)
+                    self.send_error(400, str(error))
+                    return
+                sync_otel_receiver()
+                self.send_response(303)
+                self.send_header("Location", "/?view=settings&action=source-otel")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
             deployments = form.get("deployment", [])
             models = form.get("model", [])
             mappings = {
@@ -2352,7 +2663,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(500, "Unable to save model mappings")
                 return
             self.send_response(303)
-            self.send_header("Location", "/?provider=copilot&refresh=1")
+            self.send_header("Location", "/?view=settings&action=model-mappings")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
@@ -2377,6 +2688,9 @@ class Handler(BaseHTTPRequestHandler):
                     upload = part.get_payload(decode=True) or b""
             if provider not in PROVIDERS or not upload or not filename.lower().endswith(".zip"):
                 self.send_error(400, "Invalid import request")
+                return
+            if source_mode(provider) == "otel":
+                self.send_error(400, "Archive import is unavailable while this provider uses OTEL")
                 return
             descriptor, temporary_name = tempfile.mkstemp(prefix="session-import-", suffix=".zip")
             os.close(descriptor)
@@ -2566,7 +2880,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     log_path = configure_logging()
     parser = argparse.ArgumentParser(description="View Copilot session token usage")
-    parser.add_argument("--root", type=Path, default=github_copilot_provider.default_root(), help="Copilot/agent session root folder")
+    parser.add_argument("--root", type=Path, default=github_copilot_local_provider.default_root(), help="Copilot/agent session root folder")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     LOGGER.info("Starting AI Tool Session Tracker")
@@ -2585,6 +2899,8 @@ def main() -> None:
     Handler.root = args.root.expanduser().resolve()
     if not Handler.root.is_dir():
         LOGGER.warning("Configured Copilot root does not exist: %s; continuing with other providers", Handler.root)
+    pricing.load_model_costs()
+    sync_otel_receiver()
     url = f"http://127.0.0.1:{args.port}"
     try:
         server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)

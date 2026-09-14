@@ -6,21 +6,21 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.providers import (
-    anthropic_claude_provider,
-    github_copilot_provider,
-    google_antigravity_provider,
-    m365_copilot_provider,
-    openai_codex_provider,
+    anthropic_claude_local_provider,
+    github_copilot_local_provider,
+    google_antigravity_local_provider,
+    m365_copilot_local_provider,
+    openai_codex_local_provider,
 )
 
 
 class SourceArchiveTests(unittest.TestCase):
     def test_each_provider_round_trips_source_files(self) -> None:
         providers = (
-            ("codex", openai_codex_provider),
-            ("claude", anthropic_claude_provider),
-            ("m365_copilot", m365_copilot_provider),
-            ("antigravity", google_antigravity_provider),
+            ("codex", openai_codex_local_provider),
+            ("claude", anthropic_claude_local_provider),
+            ("m365_copilot", m365_copilot_local_provider),
+            ("antigravity", google_antigravity_local_provider),
         )
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -43,9 +43,9 @@ class SourceArchiveTests(unittest.TestCase):
             source = base / "transcript.jsonl"
             source.write_text('{"role":"user","content":"hello"}\n', encoding="utf-8")
             archive = base / "codex.zip"
-            openai_codex_provider.export_source_files({"_source": source}, archive)
+            openai_codex_local_provider.export_source_files({"_source": source}, archive)
             with self.assertRaisesRegex(ValueError, "different provider"):
-                anthropic_claude_provider.import_source_files(archive, base / "claude-root")
+                anthropic_claude_local_provider.import_source_files(archive, base / "claude-root")
 
     def test_copilot_exports_session_state_and_injects_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -55,9 +55,9 @@ class SourceArchiveTests(unittest.TestCase):
             (source / "events.jsonl").write_text('{"type":"user.message"}\n', encoding="utf-8")
             archive = base / "copilot.zip"
             summary = {"_source": source, "_kind": "copilot-session-state"}
-            github_copilot_provider.export_source_files(summary, archive)
+            github_copilot_local_provider.export_source_files(summary, archive)
             destination = base / "workspace-storage"
-            written = github_copilot_provider.import_source_files(archive, destination)
+            written = github_copilot_local_provider.import_source_files(archive, destination)
             self.assertEqual(len(written), 1)
             self.assertTrue((destination / "imported" / "session-1" / "events.jsonl").exists())
 
@@ -67,7 +67,7 @@ class SourceArchiveTests(unittest.TestCase):
             database = base / "session-store.db"
             database.write_bytes(b"SQLite format 3")
             archive = base / "copilot-db.zip"
-            github_copilot_provider.export_source_files(
+            github_copilot_local_provider.export_source_files(
                 {"_source": database, "_kind": "copilot-db"}, archive
             )
             with zipfile.ZipFile(archive) as exported:
@@ -88,7 +88,7 @@ class SourceArchiveTests(unittest.TestCase):
                 encoding="utf-8",
             )
             archive = base / "merged.zip"
-            github_copilot_provider.export_source_files(
+            github_copilot_local_provider.export_source_files(
                 {"_sources": [
                     {"_source": state, "_kind": "copilot-session-state"},
                     {"_source": chat, "_kind": "copilot-chat"},

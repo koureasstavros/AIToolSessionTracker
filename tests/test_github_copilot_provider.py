@@ -5,7 +5,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from src.providers import github_copilot_provider
+from src.providers import github_copilot_local_provider
 
 
 class CopilotInvocationGroupingTests(unittest.TestCase):
@@ -18,21 +18,21 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(
-                github_copilot_provider._surface_from_session_state(folder),
+                github_copilot_local_provider._surface_from_session_state(folder),
                 "Desktop",
             )
 
     def test_shared_cli_desktop_sources_are_mixed(self) -> None:
         self.assertEqual(
-            github_copilot_provider.tool({"_kind": "copilot-session-state"}),
+            github_copilot_local_provider.tool({"_kind": "copilot-session-state"}),
             "Mixed",
         )
         self.assertEqual(
-            github_copilot_provider.tool({"_kind": "copilot-db"}),
+            github_copilot_local_provider.tool({"_kind": "copilot-db"}),
             "Mixed",
         )
         self.assertEqual(
-            github_copilot_provider.tool({"_kind": "copilot-chat"}),
+            github_copilot_local_provider.tool({"_kind": "copilot-chat"}),
             "Extension",
         )
 
@@ -59,7 +59,7 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
                 ],
             }
 
-            github_copilot_provider.delete(summary)
+            github_copilot_local_provider.delete(summary)
 
             self.assertFalse(state.exists())
             with closing(sqlite3.connect(database)) as db:
@@ -84,7 +84,7 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
                 "\n".join(json.dumps(record) for record in records),
                 encoding="utf-8",
             )
-            session = github_copilot_provider._read_session_state(folder)
+            session = github_copilot_local_provider._read_session_state(folder)
 
         self.assertEqual(len(session["turns"]), 1)
         turn = session["turns"][0]
@@ -107,7 +107,7 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
                 "\n".join(json.dumps(record) for record in records),
                 encoding="utf-8",
             )
-            session = github_copilot_provider._read_session_state(folder)
+            session = github_copilot_local_provider._read_session_state(folder)
 
         self.assertEqual(session["reasoningEffort"], "high")
         self.assertEqual(session["turns"][0]["reasoningEffort"], "medium")
@@ -127,7 +127,7 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
                 "\n".join(json.dumps(record) for record in records),
                 encoding="utf-8",
             )
-            session = github_copilot_provider._read_session_state(folder)
+            session = github_copilot_local_provider._read_session_state(folder)
 
         self.assertEqual(session["reasoningEffort"], "medium")
 
@@ -145,7 +145,7 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
-            session = github_copilot_provider._read_chat(path)
+            session = github_copilot_local_provider._read_chat(path)
 
         self.assertEqual(session["reasoningEffort"], "medium")
 
@@ -172,7 +172,7 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text(json.dumps(document), encoding="utf-8")
-            session = github_copilot_provider._read_chat(path)
+            session = github_copilot_local_provider._read_chat(path)
 
         self.assertEqual(len(session["turns"]), 1)
         turn = session["turns"][0]
@@ -222,7 +222,7 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "session-1.jsonl"
             path.write_text(json.dumps(document), encoding="utf-8")
-            session = github_copilot_provider.details({
+            session = github_copilot_local_provider.details({
                 "_source": path,
                 "_kind": "copilot-chat",
             })
@@ -288,7 +288,7 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
                     {"id": "session-1", "_source": database, "_kind": "copilot-db", "_session_id": "session-1"},
                 ],
             }
-            session = github_copilot_provider.details(summary)
+            session = github_copilot_local_provider.details(summary)
 
         self.assertEqual(len(session["turns"]), 1)
         self.assertEqual(len(session["subagents"]), 1)
