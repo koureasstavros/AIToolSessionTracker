@@ -4,6 +4,10 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Tracker, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.36 — 2026-09-15
+
+- Added session analysis and best practices pop up view
+
 ### Version v0.0.35 — 2026-09-15
 
 - Added sorting into table columns on statistics view

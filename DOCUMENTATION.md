@@ -28,17 +28,29 @@ The Session Selection panel lists the conversations discovered for the chosen pr
 
 ![Select Session](material/documentation/20d60c79-1b31-487b-a1da-9b94c4875671.png)
 
-## Item Expand / Colapse
-
-The Expand and Collapse functionality helps users manage the amount of information displayed on screen. Users can expand conversation turns, tool events, raw records, and content sections to inspect detailed data, or collapse them to keep the interface organized and focused. Dedicated buttons provide quick controls for opening or closing individual sections, making it easier to navigate long and complex AI sessions.
-
-![Item Expand / Colapse](material/documentation/c9f1a65c-20b2-4876-bdcd-3fc7ccc293ed.png)
-
 ## Session Sections
 
 Each session is organized into clear, structured sections for User, Assistant, Invocation with Tokens, and Cost. The User section displays the original prompt, while the Assistant section presents the generated response. Invocation details show the models used and the associated tool calls and results. Token information summarizes input, cached input, cache writes, output, and reasoning usage, and the Cost section provides an estimated USD value based on the selected model’s local pricing data.
 
 ![Session Sections](material/documentation/19f0b2a1-bf87-425f-98bf-c0ec632d4768.png)
+
+## Section Expand / Colapse
+
+The Expand and Collapse functionality helps users manage the amount of information displayed on screen. Users can expand conversation turns, tool events, raw records, and content sections to inspect detailed data, or collapse them to keep the interface organized and focused. Dedicated buttons provide quick controls for opening or closing individual sections, making it easier to navigate long and complex AI sessions.
+
+![Item Expand / Colapse](material/documentation/c9f1a65c-20b2-4876-bdcd-3fc7ccc293ed.png)
+
+## Session Analysis
+
+The session analysis reviews your session and provides additional insights, including the different models used, the associated effort, and best‑practice recommendations that help reduce overall consumption.
+
+The Best Practices section is driven by a set of rules that identify behaviors or configurations which impact consumption.
+
+![Best Practices](material/documentation/b37741cf-f983-4ce9-b4af-3f120ce53151.png)
+
+The model analysis shows all models used during the session along with their corresponding statistics.
+
+![Model Analysis](material/documentation/0ddb0b8d-f1f4-47b2-91c6-22d174cc7cd4.png)
 
 ## Session Import / Export
 

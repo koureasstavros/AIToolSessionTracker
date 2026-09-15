@@ -1866,6 +1866,180 @@ def model_analysis_markup(session: dict) -> str:
     )
 
 
+def _turn_model(turn: dict, session: dict) -> str | None:
+    model = turn.get("model") or session.get("model")
+    return str(model) if model else None
+
+
+def _turn_effort(turn: dict, session: dict) -> str | None:
+    return normalize_reasoning_effort(turn.get("reasoningEffort") or session.get("reasoningEffort"))
+
+
+def _context_signature(turn: dict) -> tuple[tuple[str, str], ...] | None:
+    """Return only provider-injected context that precedes the user prompt."""
+    instructions = turn.get("internalInstructions") if isinstance(turn.get("internalInstructions"), list) else []
+    instruction_values = tuple(
+        (str(item.get("name") or "Internal instructions"), str(item.get("content") or ""))
+        for item in instructions if isinstance(item, dict)
+    )
+    if not instruction_values:
+        return None
+    return instruction_values
+
+
+def _cache_miss_cost(turn: dict, model: str | None) -> float | None:
+    """Price the current turn's uncached input, excluding output generation."""
+    tokens = turn.get("tokens") if isinstance(turn.get("tokens"), dict) else {}
+    costs = pricing.cost_breakdown(
+        {key: tokens.get(key) for key in ("inputTokens", "cacheWriteTokens")}, model
+    )
+    if not costs:
+        return None
+    return (costs.get("inputTokens") or 0.0) + (costs.get("cacheWriteTokens") or 0.0)
+
+
+def _best_practice_units(session: dict) -> list[dict]:
+    """Use invocation usage when available because turns may aggregate models."""
+    units: list[dict] = []
+    turns = session.get("turns") if isinstance(session.get("turns"), list) else []
+    for turn_number, turn in enumerate(turns, 1):
+        if not isinstance(turn, dict):
+            continue
+        invocations = turn.get("invocations") if isinstance(turn.get("invocations"), list) else []
+        valid_invocations = [item for item in invocations if isinstance(item, dict)]
+        if not valid_invocations:
+            unit = dict(turn)
+            unit["_analysis_turn"] = (
+                turn_number if session.get("provider") == "copilot"
+                else turn.get("turn_index") if turn.get("turn_index") is not None else turn_number
+            )
+            units.append(unit)
+            continue
+        for invocation in valid_invocations:
+            unit = dict(turn)
+            unit["_analysis_turn"] = (
+                turn_number if session.get("provider") == "copilot"
+                else turn.get("turn_index") if turn.get("turn_index") is not None else turn_number
+            )
+            unit["model"] = invocation.get("model") or turn.get("model")
+            unit["reasoningEffort"] = invocation.get("reasoningEffort") or turn.get("reasoningEffort")
+            invocation_tokens = invocation.get("tokens") if isinstance(invocation.get("tokens"), dict) else {}
+            if any(
+                isinstance(invocation_tokens.get(key), int) and not isinstance(invocation_tokens.get(key), bool)
+                for key in TOKEN_KEYS
+            ):
+                unit["tokens"] = invocation_tokens
+            units.append(unit)
+    return units
+
+
+def best_practices_findings(session: dict) -> list[dict[str, object]]:
+    """Find likely prompt-cache invalidations and attach their input cost."""
+    turns = _best_practice_units(session)
+    findings: list[dict[str, object]] = []
+    previous_turn: dict | None = None
+    previous_time = 0.0
+    previous_context = None
+    for index, turn in enumerate(turns, 1):
+        if not isinstance(turn, dict):
+            continue
+        model = _turn_model(turn, session)
+        effort = _turn_effort(turn, session)
+        turn_tokens = turn.get("tokens") if isinstance(turn.get("tokens"), dict) else {}
+        cache_read = turn_tokens.get("cacheReadTokens")
+        cache_miss = (
+            (cache_read is None or (
+                isinstance(cache_read, int)
+                and not isinstance(cache_read, bool)
+                and cache_read == 0
+            ))
+            and any(
+                isinstance(turn_tokens.get(key), int)
+                and not isinstance(turn_tokens.get(key), bool)
+                and turn_tokens.get(key) > 0
+                for key in ("inputTokens", "cacheWriteTokens")
+            )
+        )
+        current_time = turn_timestamp(turn, session.get("updated", 0))
+        current_context = _context_signature(turn)
+        if previous_turn is not None and cache_miss:
+            previous_model = _turn_model(previous_turn, session)
+            previous_effort = _turn_effort(previous_turn, session)
+            cost = _cache_miss_cost(turn, model)
+
+            def add_finding(kind: str, title: str, detail: str) -> None:
+                findings.append({"kind": kind, "turn": turn.get("_analysis_turn", index), "title": title, "detail": detail, "cost": cost})
+
+            if previous_model and model and previous_model != model:
+                add_finding(
+                    "model",
+                    "Model changed",
+                    f"{display_model_name(previous_model)} → {display_model_name(model)}; the prompt cache cannot be reused.",
+                )
+            if previous_effort and effort and previous_effort != effort:
+                add_finding(
+                    "effort",
+                    "Reasoning effort changed",
+                    f"{previous_effort} → {effort}; keep effort stable when continuing a cacheable session.",
+                )
+            if previous_context is not None and current_context is not None and current_context != previous_context:
+                add_finding(
+                    "context",
+                    "Session context changed",
+                    "Provider-injected instructions before the user prompt changed, so the existing prompt cache was not reused.",
+                )
+            if previous_time and current_time - previous_time > 300:
+                minutes = (current_time - previous_time) / 60
+                add_finding(
+                    "idle",
+                    "Session gap exceeded 5 minutes",
+                    f"The next turn started after {minutes:.0f} minutes; continue sooner to improve cache reuse.",
+                )
+        previous_turn = turn
+        previous_time = current_time
+        if current_context is not None:
+            previous_context = current_context
+    return findings
+
+
+def best_practices_markup(session: dict) -> str:
+    """Render cache-oriented recommendations in a session-level popover."""
+    findings = best_practices_findings(session)
+    grouped: dict[str, list[str]] = {}
+    group_labels = {
+        "model": "Model stability",
+        "effort": "Reasoning effort stability",
+        "context": "Internal context stability",
+        "idle": "Session timing",
+    }
+    for finding in findings:
+        cost = finding.get("cost")
+        cost_label = fmt_cost_label(cost if isinstance(cost, (int, float)) else None)
+        card = (
+            f'<article class="best-practice-finding {esc(finding["kind"])}">'
+            f'<header><span class="best-practice-kind">Turn {finding["turn"]}</span><b>{esc(finding["title"])}</b><strong>{esc(cost_label)} uncached input</strong></header>'
+            f'<p>{esc(finding["detail"])}</p></article>'
+        )
+        grouped.setdefault(str(finding["kind"]), []).append(card)
+    sections = [
+        f'<section class="best-practice-group"><header><b>{esc(group_labels[kind])}</b><span>{len(grouped[kind])} finding{"s" if len(grouped[kind]) != 1 else ""}</span></header>{"".join(grouped[kind])}</section>'
+        for kind in group_labels if grouped.get(kind)
+    ]
+    if not sections:
+        sections.append(
+            '<div class="best-practices-clear"><b>No cache-efficiency issues detected.</b>'
+            '<span>There is not enough evidence of a model, effort, context, or idle-gap cache miss in this session.</span></div>'
+        )
+    return (
+        '<details class="best-practices">'
+        f'<summary><span>Best practices</span><b>{len(findings)}</b></summary>'
+        '<div class="best-practices-popover"><header><div><span class="section-kicker">CACHE EFFICIENCY</span>'
+        '<h2>Best practices</h2></div><small>Potential prompt-cache invalidations detected in this session. Costs cover uncached input only.</small></header>'
+        '<div class="best-practices-tip"><b>Recommendation</b><span>Keep the model, effort, and provider-injected instructions stable, and return within 5 minutes when possible.</span></div>'
+        f'{"".join(sections)}</div></details>'
+    )
+
+
 def turn_token_cards(tokens: dict[str, int | None], model: str | None, session_id: str, provider: str, turn_index: int, selected_turn: int | None, selected_metric: str | None, show_empty: bool = False, token_flags: list[str] | None = None, costs: dict[str, float] | None = None) -> str:
     costs = costs if costs is not None else pricing.cost_breakdown(tokens, model)
     cards = []
@@ -2411,7 +2585,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 '<span class="turn-kind">Usage summary</span>' if turn.get("kind") == "usage_summary" else
                 ""
             )
-            turn_label = turn.get("turn_index", index)
+            turn_label = index if provider == "copilot" else turn.get("turn_index", index)
             raw_url = esc("/?" + urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "session": chosen["id"], "turn": index, "raw": 1}), quote=True)
             invocation_markup = ""
             show_invocation_breakdown = len(invocations) > 1 or tools_are_nested
@@ -2505,7 +2679,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         )
         detail = f'''<main class="detail"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>{esc(PROVIDERS.get(provider, provider))}</div><h1>{esc(chosen["name"])}</h1>
             <div class="header-chips"><span>Surface: {esc(session_tool(chosen_summary, provider))}</span><span>Timestamp: {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span><span>Model: {esc(display_model_name(chosen.get("pricingModel") or chosen.get("model")))}</span>{session_effort_markup}</div>
-            </div><div class="detail-actions">{model_analysis_markup(chosen)}<a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a>{f'''<a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');"><input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}"><button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form>''' if supports_local_actions else ''}<a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>{exit_action()}</div></header>
+                </div><div class="detail-actions">{best_practices_markup(chosen)}{model_analysis_markup(chosen)}<a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a>{f'''<a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');"><input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}"><button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form>''' if supports_local_actions else ''}<a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>{exit_action()}</div></header>
             <section class="session-facts"><div><span>Session ID</span><code>{esc(chosen["id"])}</code><button type="button" class="copy-value" data-copy="{esc(chosen["id"], quote=True)}">Copy</button></div><div><span>Project</span><code>{esc(chosen.get("project") or "Unavailable")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("project") or "Unavailable", quote=True)}">Copy</button></div><div><span>Source</span><code>{esc(chosen.get("source") or "Unknown")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("source") or "Unknown", quote=True)}">Copy</button></div></section>
             {token_accounting_note(provider, len(chosen["turns"]))}
             {f'<div class="provider-note"><b>Provider note</b>{esc(chosen["_db_issue"])}</div>' if chosen.get("_db_issue") else ""}
@@ -3090,10 +3264,10 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
     if(menuButton)menuButton.addEventListener('click',function(){body.classList.toggle('nav-open')});
     if(scrim)scrim.addEventListener('click',closeNav);
     document.addEventListener('keydown',function(event){
-        if(event.key==='Escape'){closeNav();document.querySelectorAll('.model-analysis[open]').forEach(function(panel){panel.removeAttribute('open')});}
+        if(event.key==='Escape'){closeNav();document.querySelectorAll('.model-analysis[open],.best-practices[open]').forEach(function(panel){panel.removeAttribute('open')});}
         if(event.key==='/' && search && document.activeElement!==search){event.preventDefault();search.focus();}
     });
-    document.addEventListener('click',function(event){document.querySelectorAll('.model-analysis[open]').forEach(function(panel){if(!panel.contains(event.target))panel.removeAttribute('open')});});
+    document.addEventListener('click',function(event){document.querySelectorAll('.model-analysis[open],.best-practices[open]').forEach(function(panel){if(!panel.contains(event.target))panel.removeAttribute('open')});});
     if(search)search.addEventListener('input',function(){
         var query=search.value.trim().toLowerCase(), visible=0;
         document.querySelectorAll('.session-row').forEach(function(row){var show=!query||row.textContent.toLowerCase().includes(query);row.hidden=!show;if(show)visible++;});
@@ -3191,6 +3365,22 @@ PAGE = PAGE.replace('</style>\n</head>', '''<style>
 .model-analysis-metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px}
 .model-analysis-metrics .metric{min-height:49px;padding:7px 8px;border-radius:8px}
 .model-analysis-metrics .metric strong{margin-top:5px;font-size:11px}
+.best-practices{position:relative}
+.best-practices>summary{display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border:1px solid #725b38;border-radius:9px;background:#241e17;color:#e0c695;font-size:10px;font-weight:700;cursor:pointer;list-style:none;white-space:nowrap}
+.best-practices>summary::-webkit-details-marker{display:none}
+.best-practices>summary:hover,.best-practices[open]>summary{border-color:#c99850;background:#3a2c1b;color:#fff2d5}
+.best-practices>summary>b{display:grid;place-items:center;min-width:24px;height:22px;padding:0 7px;border-radius:999px;background:#8a5e27;color:#ffe2a7;font-size:10px;font-weight:800}
+.best-practices-popover{position:fixed;z-index:40;top:84px;right:12px;display:grid;gap:9px;width:min(760px,calc(100vw - 24px));max-height:min(72vh,680px);padding:13px;border:1px solid #6b5231;border-radius:12px;background:#15120e;box-shadow:0 22px 65px rgba(0,0,0,.55);overflow:auto}
+.best-practices-popover>header{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;padding:2px 2px 8px;border-bottom:1px solid #403323}
+.best-practices-popover h2{margin:0;color:#fff0d0;font-size:15px}
+.best-practices-popover>header small{max-width:360px;color:#a08b6a;font-size:9px;line-height:1.45;text-align:right}
+.best-practices-tip{display:flex;gap:8px;padding:9px;border:1px solid #5c472b;border-radius:8px;background:#251d13;color:#d8bd8b;font-size:10px;line-height:1.45}
+.best-practices-tip b{color:#ffe1a8;white-space:nowrap}
+.best-practice-group{display:grid;gap:6px;padding:8px;border:1px solid #3f3324;border-radius:9px;background:#18140f}.best-practice-group>header{display:flex;justify-content:space-between;align-items:center;padding:1px 2px 3px}.best-practice-group>header b{color:#e7cf9f;font-size:10px}.best-practice-group>header span{color:#947e5e;font-size:9px}
+.best-practices-clear{display:grid;gap:4px;padding:12px;border:1px solid #3f4935;border-radius:8px;background:#172016;color:#b9cf9b;font-size:10px;line-height:1.45}.best-practices-clear span{color:#91a47c}
+.best-practice-finding{display:grid;gap:5px;padding:9px;border:1px solid #403323;border-left:3px solid #c99850;border-radius:8px;background:#1b1711}
+.best-practice-finding.model{border-left-color:#9d8bea}.best-practice-finding.effort{border-left-color:#6bb5c4}.best-practice-finding.context{border-left-color:#d58b72}.best-practice-finding.idle{border-left-color:#d7b15e}
+.best-practice-finding header{display:flex;align-items:center;gap:8px}.best-practice-finding header b{color:#f2dfbb;font-size:10px}.best-practice-finding header strong{margin-left:auto;color:#e4bd78;font-size:9px}.best-practice-kind{color:#9b896c;font-size:9px}.best-practice-finding p{margin:0;color:#b6a488;font-size:10px;line-height:1.4}
 .session-facts code{overflow-x:auto;text-overflow:clip;scrollbar-width:none}
 .session-facts code::-webkit-scrollbar{display:none}
 .sidebar-top .provider-menu{max-height:130px;overflow-y:auto;margin:0 -14px;padding-right:14px;scrollbar-width:thin;scrollbar-color:#344056 transparent}
@@ -3232,7 +3422,7 @@ PAGE = PAGE.replace('</style>\n</head>', '''<style>
 .raw-event-context{border-color:#3d355f}
 .raw-event-context>summary{background:#171327}
 .raw-event-metadata,.raw-event-instructions,.raw-event-raw{border-color:#263247}
-@media(max-width:620px){.turn-invocation{display:block}.invocation-name{margin-bottom:7px}.invocation-usage{grid-template-columns:1fr}.model-analysis-popover{position:fixed;top:64px;right:12px;left:12px;width:auto;max-height:calc(100vh - 78px)}.model-analysis-popover>header{align-items:flex-start;flex-direction:column}.model-analysis-popover>header small{text-align:left}.model-analysis-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.model-analysis-metrics .metric:last-child{grid-column:1/-1}}
+@media(max-width:620px){.turn-invocation{display:block}.invocation-name{margin-bottom:7px}.invocation-usage{grid-template-columns:1fr}.model-analysis-popover,.best-practices-popover{position:fixed;top:64px;right:12px;left:12px;width:auto;max-height:calc(100vh - 78px)}.model-analysis-popover>header,.best-practices-popover>header{align-items:flex-start;flex-direction:column}.model-analysis-popover>header small,.best-practices-popover>header small{text-align:left}.model-analysis-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.model-analysis-metrics .metric:last-child{grid-column:1/-1}.best-practice-finding header{align-items:flex-start;flex-wrap:wrap}.best-practice-finding header strong{margin-left:0;width:100%}}
 </style></head>''')
 
 PAGE = PAGE.replace('</head>', '<style>.progressive-scan{position:fixed;inset:0 0 0 var(--sidebar);display:grid;place-items:center;width:auto;min-height:0;margin:0;padding:24px}.progressive-scan .detail-heading,.no-sessions>.detail-heading,.settings-empty>.detail-heading{position:absolute;top:42px;left:clamp(24px,4vw,64px);right:clamp(24px,4vw,64px);width:auto}.progressive-scan .empty-hero{width:min(500px,100%);margin:0 auto;text-align:center}.no-sessions,.settings-empty{position:relative;padding-bottom:42px}.settings-empty{display:grid;place-items:center}.settings-empty .empty-hero{width:min(500px,100%);margin:0 auto;text-align:center}@media(max-width:900px){.progressive-scan{left:0}}@media(max-width:620px){.progressive-scan .detail-heading,.no-sessions>.detail-heading,.settings-empty>.detail-heading{top:24px;left:13px;right:13px}.no-sessions,.settings-empty{padding-bottom:24px}}</style></head>', 1)
