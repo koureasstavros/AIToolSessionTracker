@@ -11,6 +11,9 @@ analysis = Analysis(
     binaries=[],
     datas=[
         (str(project_root / "src" / "common" / "model_costs.json"), "src/common"),
+        (str(project_root / "src" / "common" / "model_mapping.json"), "src/common"),
+        (str(project_root / "src" / "common" / "source_otel.json"), "src/common"),
+        (str(project_root / "src" / "common" / "source_routing.json"), "src/common"),
     ],
     hiddenimports=collect_submodules("src"),
     hookspath=[],
