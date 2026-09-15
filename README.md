@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "tracker", "llm", "slm", "model", "session", "turn", "invocation", "agents", "tools", "context"]
 license: "apache-2.0"
-version: v0.0.34
+version: v0.0.35
 ---
 
 # AI Tool Session Tracker

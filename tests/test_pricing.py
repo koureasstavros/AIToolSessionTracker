@@ -11,7 +11,7 @@ from src.common import source_pricing as pricing
 class PricingTests(unittest.TestCase):
     def test_model_costs_seed_from_bundled_catalog_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database_path = Path(directory) / "AI-Tool-Session-Tracker.db"
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
             costs = pricing.load_model_costs(database_path)
             with closing(sqlite3.connect(database_path)) as database:
                 count = database.execute("SELECT COUNT(*) FROM model_costs").fetchone()[0]
@@ -19,15 +19,38 @@ class PricingTests(unittest.TestCase):
         self.assertGreater(count, 1)
         self.assertTrue(any(row["model"] == "gpt-4o" for row in costs))
 
+    def test_model_costs_add_missing_bundled_entries_on_later_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            pricing.load_model_costs(database_path)
+            with closing(sqlite3.connect(database_path)) as database:
+                database.execute("DELETE FROM model_costs WHERE model = 'gpt-6-astra'")
+                database.commit()
+
+            costs = pricing.load_model_costs(database_path)
+
+            self.assertTrue(any(row["model"] == "gpt-6-astra" for row in costs))
+
+    def test_deleted_bundled_model_stays_deleted_after_save_and_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            costs = pricing.load_model_costs(database_path)
+            costs = [row for row in costs if row["model"] != "gpt-6-astra"]
+            pricing.save_model_costs(costs, database_path)
+
+            reloaded = pricing.load_model_costs(database_path)
+
+            self.assertFalse(any(row["model"] == "gpt-6-astra" for row in reloaded))
+
     def test_custom_model_costs_are_saved_and_used_for_pricing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database_path = Path(directory) / "AI-Tool-Session-Tracker.db"
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
             pricing.save_model_costs([{
                 "vendor": "Test", "model": "test-model", "input": 2, "cache_read": 0.5,
                 "cache_write": 1, "output": 4, "reasoning": 6,
             }], database_path)
             with patch.object(pricing, "mapping_config_path", return_value=database_path):
-                self.assertEqual(pricing.load_model_costs()[0]["model"], "test-model")
+                self.assertTrue(any(row["model"] == "test-model" for row in pricing.load_model_costs()))
                 self.assertEqual(pricing.cost_for_tokens({"inputTokens": 1_000_000, "outputTokens": 1_000_000}, "test-model"), 6.0)
 
     def test_reasoning_tokens_use_reasoning_rate_instead_of_being_added_twice(self) -> None:
@@ -40,6 +63,21 @@ class PricingTests(unittest.TestCase):
         }
         # gpt-5.6-luna: 1 + .1 + 1.25 + 3.6 regular output + 2.4 reasoning.
         self.assertAlmostEqual(pricing.cost_for_tokens(tokens, "OpenAI/gpt-5.6-luna"), 8.35)
+
+    def test_missing_cache_rates_fall_back_to_input_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            pricing.save_model_costs([{
+                "vendor": "Test", "model": "cache-fallback", "input": 2,
+                "cache_read": None, "cache_write": None, "output": 4, "reasoning": None,
+            }], database_path)
+            with patch.object(pricing, "mapping_config_path", return_value=database_path):
+                tokens = {
+                    "inputTokens": 1_000_000,
+                    "cacheReadTokens": 1_000_000,
+                    "cacheWriteTokens": 1_000_000,
+                }
+                self.assertAlmostEqual(pricing.cost_for_tokens(tokens, "cache-fallback"), 6.0)
 
     def test_separate_reasoning_output_is_priced_without_double_subtraction(self) -> None:
         tokens = {"outputTokens": 600_000, "reasoningTokens": 400_000}
@@ -54,7 +92,7 @@ class PricingTests(unittest.TestCase):
 
     def test_explicit_deployment_mapping_resolves_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "AI-Tool-Session-Tracker.db"
+            config_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
             pricing.save_model_mappings({"TEST-GS": "gpt-5.6-luna"}, config_path)
             with closing(sqlite3.connect(config_path)) as database:
                 self.assertEqual(
@@ -67,7 +105,7 @@ class PricingTests(unittest.TestCase):
 
     def test_model_mappings_seed_from_bundled_catalog_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database_path = Path(directory) / "AI-Tool-Session-Tracker.db"
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
 
             mappings = pricing.load_model_mappings(database_path)
 
@@ -79,6 +117,29 @@ class PricingTests(unittest.TestCase):
                     ).fetchone()[0],
                     "1",
                 )
+
+    def test_model_mappings_add_missing_bundled_entries_on_later_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            pricing.load_model_mappings(database_path)
+            with closing(sqlite3.connect(database_path)) as database:
+                database.execute("DELETE FROM model_mappings WHERE deployment = 'GPT56LUNA-GS'")
+                database.commit()
+
+            mappings = pricing.load_model_mappings(database_path)
+
+            self.assertEqual(mappings["GPT56LUNA-GS"], "gpt-5.6-luna")
+
+    def test_deleted_bundled_mapping_stays_deleted_after_save_and_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            mappings = pricing.load_model_mappings(database_path)
+            mappings.pop("GPT56LUNA-GS")
+            pricing.save_model_mappings(mappings, database_path)
+
+            reloaded = pricing.load_model_mappings(database_path)
+
+            self.assertNotIn("GPT56LUNA-GS", reloaded)
 
     def test_deployment_path_resolves_to_public_model_name(self) -> None:
         price = pricing.find_model("azure/Azure-APIM/GPT56SOL-GS")

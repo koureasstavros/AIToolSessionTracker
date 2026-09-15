@@ -46,16 +46,11 @@ def _routing_rows(payload: object, defaults: dict[str, object]) -> list[tuple[st
 
 
 def _seed_initial_routing(connection: sqlite3.Connection, defaults: dict[str, object]) -> list[tuple[str, str]]:
-    """Seed the bundled source routes into a new local database once."""
-    seeded = connection.execute(
-        "SELECT 1 FROM tracker_metadata WHERE key = 'source_routing_json_seeded'"
-    ).fetchone()
-    if seeded:
-        return []
+    """Add bundled source routes that are missing without replacing edits."""
     rows = _routing_rows(_BUNDLED_ROUTING, defaults)
-    connection.executemany("INSERT OR REPLACE INTO source_routing (provider, source) VALUES (?, ?)", rows)
+    connection.executemany("INSERT OR IGNORE INTO source_routing (provider, source) VALUES (?, ?)", rows)
     connection.execute(
-        "INSERT INTO tracker_metadata (key, value) VALUES ('source_routing_json_seeded', '1')"
+        "INSERT OR REPLACE INTO tracker_metadata (key, value) VALUES ('source_routing_json_seeded', '1')"
     )
     return rows
 
@@ -67,12 +62,8 @@ def load_source_routing(providers: object, path: Path | None = None) -> dict[str
     try:
         with connect_database(config_path) as connection, connection:
             _initialize_tables(connection)
+            _seed_initial_routing(connection, result)
             rows = connection.execute("SELECT provider, source FROM source_routing").fetchall()
-            if not rows:
-                rows = _seed_initial_routing(connection, result)
-            if not rows:
-                rows = _routing_rows({}, result)
-                connection.executemany("INSERT OR REPLACE INTO source_routing (provider, source) VALUES (?, ?)", rows)
     except (OSError, sqlite3.Error, ValueError):
         # Preserve safe local-only startup if an existing database is unavailable.
         return result

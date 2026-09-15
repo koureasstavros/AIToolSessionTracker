@@ -4,6 +4,12 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Tracker, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.35 — 2026-09-15
+
+- Added sorting into table columns on statistics view
+- Added migration lifecycle from json to database for costs, mappings, routings
+- Fixed issues with table row valuess modifications and row deletions on save
+
 ### Version v0.0.34 — 2026-09-14
 
 - Added support for model / cost configuration

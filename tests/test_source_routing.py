@@ -68,6 +68,18 @@ class SourceRoutingTests(unittest.TestCase):
         self.assertEqual(content_path.name, "AI-Tool-Session-Tracker-content.db")
         self.assertNotEqual(config_path, content_path)
 
+    def test_source_routing_adds_missing_bundled_entries_on_later_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            source_routing.load_source_routing(PROVIDERS, database_path)
+            with closing(sqlite3.connect(database_path)) as database:
+                database.execute("DELETE FROM source_routing WHERE provider = 'claude'")
+                database.commit()
+
+            routing = source_routing.load_source_routing(PROVIDERS, database_path)
+
+            self.assertEqual(routing["providers"]["claude"], "local")
+
     def test_nested_context_is_not_part_of_user_request(self) -> None:
         text = (
             "<context>Current environment</context><userRequest>"

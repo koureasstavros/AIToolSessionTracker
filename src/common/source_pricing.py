@@ -13,6 +13,8 @@ _SEED_COSTS = json.loads((Path(__file__).with_name("model_costs.json")).read_tex
 _SEED_MAPPINGS = json.loads((Path(__file__).with_name("model_mapping.json")).read_text(encoding="utf-8"))
 LEGACY_MODEL_MAPPING_FILENAME = "model_mappings.json"
 _PRICING_COST_CACHE: dict[Path, list[dict[str, object]]] = {}
+_DELETED_MODEL_COSTS: dict[Path, set[str]] = {}
+_DELETED_MODEL_MAPPINGS: dict[Path, set[str]] = {}
 
 
 def _canonical(value: object) -> str:
@@ -52,21 +54,18 @@ def _initialize_cost_tables(connection: sqlite3.Connection) -> None:
     )
 
 
-def _seed_model_costs(connection: sqlite3.Connection) -> None:
-    """Import bundled model costs once, leaving later database edits untouched."""
-    seeded = connection.execute(
-        "SELECT 1 FROM tracker_metadata WHERE key = 'model_costs_json_seeded'"
-    ).fetchone()
-    if seeded:
-        return
+def _seed_model_costs(connection: sqlite3.Connection, config_path: Path) -> None:
+    """Add bundled model costs that are missing without overwriting edits."""
+    deleted = _DELETED_MODEL_COSTS.get(config_path, set())
+    bundled_costs = [row for row in _SEED_COSTS if _canonical(row["model"]) not in deleted]
     connection.executemany(
         """INSERT OR IGNORE INTO model_costs
         (model, vendor, input, cache_read, cache_write, output, reasoning)
         VALUES (:model, :vendor, :input, :cache_read, :cache_write, :output, :reasoning)""",
-        _SEED_COSTS,
+        bundled_costs,
     )
     connection.execute(
-        "INSERT INTO tracker_metadata (key, value) VALUES ('model_costs_json_seeded', '1')"
+        "INSERT OR REPLACE INTO tracker_metadata (key, value) VALUES ('model_costs_json_seeded', '1')"
     )
 
 
@@ -75,7 +74,7 @@ def load_model_costs(path: Path | None = None) -> list[dict[str, object]]:
     try:
         with connect_database(path or mapping_config_path()) as connection, connection:
             _initialize_cost_tables(connection)
-            _seed_model_costs(connection)
+            _seed_model_costs(connection, path or mapping_config_path())
             rows = connection.execute(
                 "SELECT vendor, model, input, cache_read, cache_write, output, reasoning FROM model_costs ORDER BY vendor COLLATE NOCASE, model COLLATE NOCASE"
             ).fetchall()
@@ -114,6 +113,17 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
     config_path = path or mapping_config_path()
     with connect_database(config_path) as connection, connection:
         _initialize_cost_tables(connection)
+        existing_models = {
+            _canonical(row[0])
+            for row in connection.execute("SELECT model FROM model_costs").fetchall()
+        }
+        bundled_models = {_canonical(row["model"]): str(row["model"]) for row in _SEED_COSTS}
+        submitted_models = {_canonical(row["model"]) for row in cleaned}
+        deleted_models = existing_models.intersection(bundled_models) - submitted_models
+        deleted = set(_DELETED_MODEL_COSTS.get(config_path, set()))
+        deleted.difference_update(submitted_models)
+        deleted.update(deleted_models)
+        _DELETED_MODEL_COSTS[config_path] = deleted
         connection.execute("DELETE FROM model_costs")
         connection.executemany(
             """INSERT INTO model_costs
@@ -162,25 +172,23 @@ def _migrate_legacy_mappings(connection: sqlite3.Connection) -> None:
     )
 
 
-def _seed_model_mappings(connection: sqlite3.Connection) -> None:
-    """Import bundled deployment mappings once without replacing local edits."""
-    seeded = connection.execute(
-        "SELECT 1 FROM tracker_metadata WHERE key = 'model_mapping_json_seeded'"
-    ).fetchone()
-    if seeded:
-        return
+def _seed_model_mappings(connection: sqlite3.Connection, config_path: Path) -> None:
+    """Add bundled deployment mappings that are missing without replacing edits."""
     mappings = _SEED_MAPPINGS.get("mappings") if isinstance(_SEED_MAPPINGS, dict) else {}
+    deleted = _DELETED_MODEL_MAPPINGS.get(config_path, set())
     if isinstance(mappings, dict):
         connection.executemany(
             "INSERT OR IGNORE INTO model_mappings (deployment, model) VALUES (?, ?)",
             [
                 (str(deployment).strip(), str(model).strip())
                 for deployment, model in mappings.items()
-                if str(deployment).strip() and str(model).strip()
+                if str(deployment).strip()
+                and _canonical(deployment) not in deleted
+                and str(model).strip()
             ],
         )
     connection.execute(
-        "INSERT INTO tracker_metadata (key, value) VALUES ('model_mapping_json_seeded', '1')"
+        "INSERT OR REPLACE INTO tracker_metadata (key, value) VALUES ('model_mapping_json_seeded', '1')"
     )
 
 
@@ -190,7 +198,7 @@ def load_model_mappings(path: Path | None = None) -> dict[str, str]:
         with connect_database(path or mapping_config_path()) as connection, connection:
             _initialize_mapping_tables(connection)
             _migrate_legacy_mappings(connection)
-            _seed_model_mappings(connection)
+            _seed_model_mappings(connection, path or mapping_config_path())
             rows = connection.execute(
                 "SELECT deployment, model FROM model_mappings ORDER BY deployment COLLATE NOCASE"
             ).fetchall()
@@ -209,6 +217,19 @@ def save_model_mappings(mappings: dict[str, str], path: Path | None = None) -> P
     }
     with connect_database(config_path) as connection, connection:
         _initialize_mapping_tables(connection)
+        existing_deployments = {
+            _canonical(row[0])
+            for row in connection.execute("SELECT deployment FROM model_mappings").fetchall()
+        }
+        bundled_deployments = {
+            _canonical(deployment)
+            for deployment in (_SEED_MAPPINGS.get("mappings", {}) if isinstance(_SEED_MAPPINGS, dict) else {})
+        }
+        submitted_deployments = {_canonical(deployment) for deployment in cleaned}
+        deleted = set(_DELETED_MODEL_MAPPINGS.get(config_path, set()))
+        deleted.difference_update(submitted_deployments)
+        deleted.update(existing_deployments.intersection(bundled_deployments) - submitted_deployments)
+        _DELETED_MODEL_MAPPINGS[config_path] = deleted
         connection.execute("DELETE FROM model_mappings")
         connection.executemany(
             "INSERT INTO model_mappings (deployment, model) VALUES (?, ?)",
@@ -281,10 +302,12 @@ def cost_breakdown(tokens: dict[str, object], model: object, output_includes_rea
     output = value("outputTokens")
     reasoning = value("reasoningTokens")
     regular_output = max(0, output - reasoning) if output_includes_reasoning else output
+    cache_read_price = price["cache_read"] if price["cache_read"] is not None else price["input"]
+    cache_write_price = price["cache_write"] if price["cache_write"] is not None else price["input"]
     return {
         "inputTokens": value("inputTokens") * price["input"] / 1_000_000,
-        "cacheReadTokens": value("cacheReadTokens") * (price["cache_read"] or 0) / 1_000_000,
-        "cacheWriteTokens": value("cacheWriteTokens") * (price["cache_write"] or 0) / 1_000_000,
+        "cacheReadTokens": value("cacheReadTokens") * cache_read_price / 1_000_000,
+        "cacheWriteTokens": value("cacheWriteTokens") * cache_write_price / 1_000_000,
         "outputTokens": regular_output * price["output"] / 1_000_000,
         "reasoningTokens": reasoning * (price["reasoning"] or price["output"]) / 1_000_000,
     }
