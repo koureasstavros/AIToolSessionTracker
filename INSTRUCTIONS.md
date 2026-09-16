@@ -12,7 +12,11 @@ Run the script into packer/<platform>/*
 For generating release based on source code:
 gh release create v0.0.XX --notes-file README.md
 gh release delete v0.0.XX
+git tag -d v0.0.XX
+git push origin --delete v0.0.XX
 
 For generating release based on source code and a compiled binary:
 gh release create v0.0.XX dist/windows/AI-Tool-Session-Tracker.exe --title "v0.0.XX" --notes-file README.md
 gh release delete v0.0.XX
+git tag -d v0.0.XX
+git push origin --delete v0.0.XX

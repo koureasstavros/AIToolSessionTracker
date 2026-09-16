@@ -1191,9 +1191,7 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
             if updated_title:
                 summary["name"] = str(updated_title)
             requests = metadata.get("requests", [])
-            if not requests:
-                summary["_has_data"] = False
-            elif isinstance(requests, list):
+            if isinstance(requests, list):
                 summary["_has_data"] = any(
                     isinstance(request, dict)
                     and (isinstance(request.get("message"), dict) and request["message"].get("text")
@@ -1202,25 +1200,32 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
                          or any(isinstance(item, dict) and item.get("value") for item in (request.get("response") or [])))
                     for request in requests
                 )
-                # Newer VS Code versions persist request results as patch
-                # records after the metadata record. The metadata request
-                # entries can therefore look empty even when the transcript
-                # contains a completed response.
-                if not summary["_has_data"]:
-                    for record in safe_json_lines(path):
-                        key = record.get("k")
-                        value = record.get("v")
-                        has_completion = key[2] == "completionTokens" and number(value) is not None if isinstance(key, list) and len(key) >= 3 else False
-                        has_message = (key[2] == "message" and isinstance(value, dict) and value.get("text")
-                                       if isinstance(key, list) and len(key) >= 3 else False)
-                        has_response = (key[2] == "response" and isinstance(value, list)
-                                        and any(isinstance(item, dict) and item.get("value") for item in value)
-                                        if isinstance(key, list) and len(key) >= 3 else False)
-                        if (isinstance(key, list) and len(key) >= 3
-                                and key[0] == "requests"
-                                and (has_completion or has_message or has_response)):
-                            summary["_has_data"] = True
-                            break
+            else:
+                summary["_has_data"] = False
+            # Newer VS Code versions persist request results as patch records
+            # after the metadata record. The metadata request entries can
+            # therefore look empty even when the transcript contains a
+            # completed response.
+            if not summary["_has_data"]:
+                for record in safe_json_lines(path):
+                    key = record.get("k")
+                    value = record.get("v")
+                    has_usage = (
+                        key[2] in {"promptTokens", "completionTokens", "inputTokens", "outputTokens", "reasoningTokens"}
+                        and isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        if isinstance(key, list) and len(key) >= 3 else False
+                    )
+                    has_message = (key[2] == "message" and isinstance(value, dict) and value.get("text")
+                                   if isinstance(key, list) and len(key) >= 3 else False)
+                    has_response = (key[2] == "response" and isinstance(value, list)
+                                    and any(isinstance(item, dict) and item.get("value") for item in value)
+                                    if isinstance(key, list) and len(key) >= 3 else False)
+                    if (isinstance(key, list) and len(key) >= 3
+                            and key[0] == "requests"
+                            and (has_usage or has_message or has_response)):
+                        summary["_has_data"] = True
+                        break
     elif kind == "copilot-session-state":
         workspace = path / "workspace.yaml"
         try:
@@ -1427,20 +1432,60 @@ class BackgroundScanManager:
         self._deleted_sessions: set[tuple[str, str]] = set()
         self._provider_locks: dict[str, threading.Lock] = {provider: threading.Lock() for provider in PROVIDERS}
         self._thread: threading.Thread | None = None
+        self._detail_thread: threading.Thread | None = None
 
     def start(self) -> None:
         with self._lock:
             if all(status == "complete" for status in self._status.values()):
                 return
             if self._thread is not None and self._thread.is_alive():
-                return
-            self._thread = threading.Thread(target=self._scan, name="session-scan", daemon=True)
-            self._thread.start()
+                pass
+            else:
+                self._thread = threading.Thread(target=self._scan, name="session-scan", daemon=True)
+                self._thread.start()
+            if self._detail_thread is None or not self._detail_thread.is_alive():
+                self._detail_thread = threading.Thread(target=self._background_details, name="session-detail-cache", daemon=True)
+                self._detail_thread.start()
 
     def is_complete(self) -> bool:
         with self._lock:
             return all(status == "complete" for status in self._status.values())
 
+    def load_next_statistics_detail(self, show_empty: bool = False) -> bool:
+        """Load one uncached session for progressive statistics rendering."""
+        with self._lock:
+            candidates = [
+                (provider, summary)
+                for provider in PROVIDERS
+                for provider_key, summary in self._statistics_sessions[provider]
+                if provider_key == provider
+                and (show_empty or summary.get("_has_data") is True)
+                and not isinstance(summary.get("_loaded_details"), dict)
+            ]
+        if not candidates:
+            return False
+        provider, summary = candidates[0]
+        try:
+            with self._provider_locks[provider]:
+                details = load_session_details(summary, provider)
+            with self._lock:
+                summary["_loaded_details"] = details
+            return True
+        except Exception:
+            LOGGER.exception("Unable to load statistics details for %s", summary.get("id"))
+            with self._lock:
+                summary["_loaded_details"] = {}
+            return True
+
+    def statistics_complete(self, show_empty: bool = False) -> bool:
+        with self._lock:
+            return not any(
+                (show_empty or summary.get("_has_data") is True)
+                and (summary.get("_source") is not None or summary.get("_kind") or summary.get("_route"))
+                and not isinstance(summary.get("_loaded_details"), dict)
+                for provider in PROVIDERS
+                for _, summary in self._statistics_sessions[provider]
+            )
     def _scan(self) -> None:
         for provider in PROVIDERS:
             with self._lock:
@@ -1453,16 +1498,21 @@ class BackgroundScanManager:
                     try:
                         item["provider"] = provider
                         summary = normalize_session_data(item)
-                        with self._provider_locks[provider]:
-                            details = load_session_details(summary, provider)
                         with self._lock:
                             if (provider, str(summary.get("id"))) in self._deleted_sessions:
                                 continue
                             self._all_sessions[provider].append(summary)
-                            self._statistics_sessions[provider].append((provider, {**summary, "_loaded_details": details}))
+                            # Keep the initial scan limited to inexpensive
+                            # sidebar metadata. Full transcripts are loaded
+                            # when a session is selected (or when statistics
+                            # explicitly need their usage data).
+                            self._statistics_sessions[provider].append((provider, summary))
+                        # Do not parse a transcript just to classify an
+                        # unknown session. Unknown and explicitly empty
+                        # summaries stay available through Show empty, while
+                        # the default sidebar remains free of empty rows.
                         if summary.get("_has_data") is not True:
-                            if not session_has_content(details):
-                                continue
+                            continue
                         normalized.append(summary)
                         normalized.sort(key=lambda value: value.get("updated", 0), reverse=True)
                         with self._lock:
@@ -1476,6 +1526,32 @@ class BackgroundScanManager:
                 LOGGER.exception("Unable to scan provider %s", provider)
             with self._lock:
                 self._status[provider] = "complete"
+
+    def _background_details(self) -> None:
+        """Warm complete session details without delaying sidebar indexing."""
+        while True:
+            with self._lock:
+                candidates = [
+                    (provider, summary)
+                    for provider in PROVIDERS
+                    for _, summary in self._statistics_sessions[provider]
+                    if (summary.get("_source") is not None or summary.get("_kind") or summary.get("_route"))
+                    if not isinstance(summary.get("_loaded_details"), dict)
+                ]
+                indexing_complete = all(status == "complete" for status in self._status.values())
+            if candidates:
+                provider, summary = candidates[0]
+                try:
+                    with self._provider_locks[provider]:
+                        load_session_details(summary, provider)
+                except Exception:
+                    LOGGER.exception("Unable to warm details for %s", summary.get("id"))
+                    with self._lock:
+                        summary["_loaded_details"] = {}
+                continue
+            if indexing_complete:
+                return
+            time.sleep(0.05)
 
     def snapshot(self, provider: str, show_empty: bool = False) -> tuple[list[dict], dict[str, str]]:
         with self._lock:
@@ -1518,19 +1594,27 @@ class BackgroundScanManager:
         self.remove_session(provider, session_id)
         return True
 
-    def all_sessions(self, show_empty: bool = False) -> list[tuple[str, dict]]:
+    def all_sessions(self, show_empty: bool = False, loaded_only: bool = False) -> list[tuple[str, dict]]:
         with self._lock:
             items = [item for provider in PROVIDERS for item in self._statistics_sessions[provider]]
             if show_empty:
-                return items
-            return [(provider, summary) for provider, summary in items if any(summary.get("id") == item.get("id") for item in self._sessions.get(provider, []))]
+                visible = items
+            else:
+                visible = [(provider, summary) for provider, summary in items if any(summary.get("id") == item.get("id") for item in self._sessions.get(provider, []))]
+            if loaded_only:
+                visible = [(provider, summary) for provider, summary in visible if isinstance(summary.get("_loaded_details"), dict)]
+            return visible
 
 
-def load_session_details(summary: dict, provider: str) -> dict:
+def load_session_details(summary: dict, provider: str, force_refresh: bool = False) -> dict:
     """Load one full transcript through its provider adapter."""
+    if not force_refresh and isinstance(summary.get("_loaded_details"), dict):
+        return summary["_loaded_details"]
     details = source_otel.details(summary, provider) if summary.get("_route") == "otel" or summary.get("_kind") == "otel" else PROVIDER_ADAPTERS[provider].details(summary)
     details["provider"] = provider
-    return pricing.apply_costs(normalize_session_data(details))
+    loaded = pricing.apply_costs(normalize_session_data(details))
+    summary["_loaded_details"] = loaded
+    return loaded
 
 
 def delete_session(summary: dict) -> None:
@@ -1768,13 +1852,17 @@ def invocation_total_cards(invocation: dict, model: str | None, token_flags: lis
     return f'<section class="invocation-total"><div class="invocation-total-title"><span>Invocation total</span><b>{esc(label)}</b></div>{cards}</section>'
 
 
-def model_usage_breakdown(session: dict) -> list[dict]:
-    """Group session usage by the model that generated it without double counting."""
+def model_usage_breakdown(session: dict, dimension: str = "model") -> list[dict]:
+    """Group session usage by model or effort without double counting."""
+    cache_key = f"_{dimension}_usage_breakdown"
+    cached = session.get(cache_key)
+    if isinstance(cached, list):
+        return cached
     rows: dict[str, dict] = {}
     accounted = {key: 0 for key in TOKEN_KEYS}
     seen_agents: set[int] = set()
 
-    def add_usage(tokens: object, model: object, local: dict[str, int] | None = None) -> None:
+    def add_usage(tokens: object, model: object, local: dict[str, int] | None = None, effort: object = None) -> None:
         if not isinstance(tokens, dict):
             return
         values = {
@@ -1785,7 +1873,11 @@ def model_usage_breakdown(session: dict) -> list[dict]:
         if not values:
             return
         price = pricing.find_model(model)
-        label = str(price["model"] if price else model or "Unavailable")
+        label = (
+            normalize_reasoning_effort(effort) or "Unknown"
+            if dimension == "effort"
+            else str(price["model"] if price else model or "Unavailable")
+        )
         row = rows.setdefault(label, {
             "model": label,
             "tokens": blank_tokens(),
@@ -1805,7 +1897,12 @@ def model_usage_breakdown(session: dict) -> list[dict]:
             return
         seen_agents.add(id(agent))
         own_tokens = agent.get("ownTokens") if isinstance(agent.get("ownTokens"), dict) else agent.get("tokens", {})
-        add_usage(own_tokens, agent.get("agentModel") or agent.get("pricingModel") or agent.get("model"), local)
+        add_usage(
+            own_tokens,
+            agent.get("agentModel") or agent.get("pricingModel") or agent.get("model"),
+            local,
+            agent.get("reasoningEffort"),
+        )
         for child in agent.get("subagents", []) if isinstance(agent.get("subagents"), list) else []:
             add_agent(child, local)
 
@@ -1817,7 +1914,12 @@ def model_usage_breakdown(session: dict) -> list[dict]:
         for invocation in invocations:
             if not isinstance(invocation, dict):
                 continue
-            add_usage(invocation.get("tokens", {}), invocation.get("model") or turn.get("model") or session.get("model"), turn_accounted)
+            add_usage(
+                invocation.get("tokens", {}),
+                invocation.get("model") or turn.get("model") or session.get("model"),
+                turn_accounted,
+                invocation.get("reasoningEffort") or turn.get("reasoningEffort") or session.get("reasoningEffort"),
+            )
             for tool in invocation.get("tools", []) if isinstance(invocation.get("tools"), list) else []:
                 if isinstance(tool, dict):
                     add_agent(tool.get("subagent"), turn_accounted)
@@ -1826,7 +1928,7 @@ def model_usage_breakdown(session: dict) -> list[dict]:
             for key in TOKEN_KEYS
         }
         if any(residual.values()):
-            add_usage(residual, turn.get("model") or session.get("model"))
+            add_usage(residual, turn.get("model") or session.get("model"), effort=turn.get("reasoningEffort") or session.get("reasoningEffort"))
 
     for agent in session.get("subagents", []) if isinstance(session.get("subagents"), list) else []:
         add_agent(agent)
@@ -1836,8 +1938,10 @@ def model_usage_breakdown(session: dict) -> list[dict]:
         for key in TOKEN_KEYS
     }
     if any(residual.values()):
-        add_usage(residual, session.get("pricingModel") or session.get("model"))
-    return sorted(rows.values(), key=lambda row: sum(row["costs"].values()), reverse=True)
+        add_usage(residual, session.get("pricingModel") or session.get("model"), effort=session.get("reasoningEffort"))
+    result = sorted(rows.values(), key=lambda row: sum(row["costs"].values()), reverse=True)
+    session[cache_key] = result
+    return result
 
 
 def model_analysis_markup(session: dict) -> str:
@@ -2266,6 +2370,8 @@ def statistics_group_key(session: dict, group: str, provider: str, summary: dict
         return PROVIDERS.get(provider, provider)
     if group == "model":
         return str(session.get("pricingModel") or session.get("model") or "Unknown model")
+    if group == "effort":
+        return normalize_reasoning_effort(session.get("reasoningEffort")) or "Unknown"
     if group == "project":
         project = session.get("project")
         if not project:
@@ -2296,11 +2402,16 @@ def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "
     ordered = sorted(points.items())
     if not ordered:
         return '<div class="timeline-empty">No dated session data is available.</div>'
-    width, height, left, right, top, bottom = 1000, 330, 58, 28, 24, 54
-    cost_axis = width - right - 34
-    chart_width, chart_height = cost_axis - left, height - top - bottom
     max_tokens = max((item["tokens"] for _, item in ordered), default=1) or 1
     max_cost = max((item["cost"] for _, item in ordered), default=1) or 1
+    cost_labels = [fmt_unit(max_cost * fraction, True) for fraction in (0, 0.5, 1)]
+    # Size the right margin from the actual currency labels instead of using
+    # a fixed wide gutter. This keeps short labels close to the chart while
+    # still protecting larger values from viewBox clipping.
+    right = max(48, max(len(label) for label in cost_labels) * 7 + 18)
+    width, height, left, top, bottom = 1000, 330, 58, 24, 54
+    cost_axis = width - right - 34
+    chart_width, chart_height = cost_axis - left, height - top - bottom
 
     def coordinates(key: str, maximum: float) -> str:
         values = []
@@ -2327,15 +2438,15 @@ def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "
         for fraction in (0, 0.5, 1)
     )
     cost_ticks = "".join(
-        f'<text class="cost-axis-label" x="{width - right + 9}" y="{top + chart_height * (1 - fraction) + 4:.1f}" text-anchor="start">{fmt_unit(max_cost * fraction, True)}</text>'
-        for fraction in (0, 0.5, 1)
+        f'<text class="cost-axis-label" x="{width - right + 9}" y="{top + chart_height * (1 - fraction) + 4:.1f}" text-anchor="start">{label}</text>'
+        for fraction, label in zip((0, 0.5, 1), cost_labels)
     )
     return f'''<div class="timeline-chart"><div class="timeline-legend"><span class="timeline-key tokens-key">Tokens</span><span class="timeline-key cost-key">Cost</span><span class="timeline-hint">Hover points for details</span></div><svg viewBox="0 0 {width} {height}" role="img" aria-label="Token and cost timeline"><line class="timeline-axis" x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}"/><line class="timeline-axis" x1="{cost_axis}" y1="{top}" x2="{cost_axis}" y2="{height - bottom}"/><line class="timeline-axis" x1="{left}" y1="{height - bottom}" x2="{cost_axis}" y2="{height - bottom}"/>{token_ticks}{cost_ticks}<text class="tokens-axis-title" x="12" y="{top + chart_height / 2}" text-anchor="middle" transform="rotate(-90 12 {top + chart_height / 2})">Tokens</text><text class="cost-axis-title" x="{cost_axis + 22}" y="{top + chart_height / 2}" text-anchor="middle" transform="rotate(90 {cost_axis + 22} {top + chart_height / 2})">Cost</text><polyline class="timeline-tokens" points="{coordinates("tokens", max_tokens)}"/><polyline class="timeline-cost" points="{coordinates("cost", max_cost)}"/>{markers("tokens", max_tokens, "tokens-point")}{markers("cost", max_cost, "cost-point")}{labels}</svg></div>'''
 
 
 def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_group: str | None = None, time_range: str = "all", provider: str = "copilot") -> str:
     """Render aggregate token and cost information across all providers."""
-    if group not in {"project", "today", "day", "week", "month", "year", "tool", "model", "timeline"}:
+    if group not in {"project", "today", "day", "week", "month", "year", "tool", "model", "effort", "timeline"}:
         group = "day"
     range_days = {"7d": 7, "30d": 30, "90d": 90, "365d": 365}.get(time_range)
     start_of_today = datetime.combine(datetime.now().date(), datetime.min.time()).timestamp()
@@ -2357,7 +2468,7 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
         session = summary.get("_loaded_details")
         if not isinstance(session, dict):
             session = load_session_details(summary, provider)
-        model_rows = model_usage_breakdown(session) if group == "model" else [None]
+        model_rows = model_usage_breakdown(session, group) if group in {"model", "effort"} else [None]
         for model_row in model_rows:
             bucket_label = model_row["model"] if model_row is not None else statistics_group_key(session, group, provider, summary, time_range)
             bucket = groups.setdefault(bucket_label, {
@@ -2392,7 +2503,7 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
             timeline_bucket["tokens"] += sum(value or 0 for value in session.get("tokens", {}).values())
             timeline_bucket["cost"] += session.get("costUsd") if isinstance(session.get("costUsd"), (int, float)) else 0
     ordered_groups = sorted(groups.items(), key=lambda item: item[0], reverse=True)
-    heading = {"project": "Project", "today": "Hour", "day": "Day", "week": "Week", "month": "Month", "year": "Year", "tool": "Provider", "model": "Model", "timeline": "Timeline"}[group]
+    heading = {"project": "Project", "today": "Hour", "day": "Day", "week": "Week", "month": "Month", "year": "Year", "tool": "Provider", "model": "Model", "effort": "Effort", "timeline": "Timeline"}[group]
     session_count = len(summaries)
     average_tokens = sum(totals.values()) / session_count if session_count else 0
     average_cost = total_cost / session_count if session_count else 0
@@ -2537,7 +2648,7 @@ def render_settings_page(action: str | None = None) -> str:
     return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__SIDEBAR_CLASS__", "").replace("__PROVIDER_MENU__", "").replace("__VIEW_TABS__", "").replace("__STATS_SIDEBAR__", "").replace("__SIDEBAR_CONTENT__", settings_actions).replace("__SESSION_ROWS__", "").replace("__SESSION_COUNT__", "0").replace("__DETAIL__", detail).replace("__REFRESH_URL__", "/?refresh=1").replace("__EMPTY_TOGGLE__", "").replace("__ROOT__", "").replace("__IMPORT_FORM__", "").replace("__SCAN_BOOTSTRAP__", "")
 
 
-def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False, selected_raw: bool = False, view: str = "sessions", group: str = "today", selected_group: str | None = None, time_range: str = "all", import_error: str | None = None, session_offset: int = 0, sessions_override: list[dict] | None = None, statistics_override: list[tuple[str, dict]] | None = None, scan_bootstrap: str = "", settings_action: str | None = None) -> str:
+def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False, selected_raw: bool = False, view: str = "sessions", group: str = "today", selected_group: str | None = None, time_range: str = "all", import_error: str | None = None, session_offset: int = 0, sessions_override: list[dict] | None = None, statistics_override: list[tuple[str, dict]] | None = None, scan_bootstrap: str = "", settings_action: str | None = None, scan_phase: str = "high-level") -> str:
     if view == "settings":
         return render_settings_page(settings_action)
     sessions = (load_session_index(root, provider, show_empty)
@@ -2622,13 +2733,20 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         for provider_key in PROVIDERS
         for summary in load_session_index(root, provider_key, show_empty)
     ] if view == "statistics" else []
-    if scan_bootstrap and (view != "statistics" or not all_statistics_sessions):
+    # Statistics can render immediately with whatever detail rows are already
+    # cached. The sidebar scan indicator and poller then fill the aggregates
+    # progressively; do not block the whole statistics view behind the scan
+    # placeholder while the first detail is loading.
+    if scan_bootstrap and view != "statistics":
         detail = f'<main class="detail progressive-scan {"statistics" if view == "statistics" else ""}"><header class="detail-heading"><div></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>{exit_action()}</div></header><div class="empty-hero"><span class="hero-icon">↻</span><span class="section-kicker">APPLICATION OPERATIONS</span><h1>Scanning local sessions</h1><p>Sessions and statistics will appear progressively as local files are processed.</p></div></main>'
     else:
-        detail = render_statistics(all_statistics_sessions, group, selected_group, time_range, provider) if view == "statistics" else ""
+        if view == "statistics" and scan_bootstrap and not all_statistics_sessions:
+            detail = '<main class="detail statistics-loading"><header class="detail-heading"><div><span class="section-kicker">STATISTICS</span><h1>Statistics</h1><p class="muted">Loading session details progressively…</p></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>{}</div></header></main>'.format(exit_action())
+        else:
+            detail = render_statistics(all_statistics_sessions, group, selected_group, time_range, provider) if view == "statistics" else ""
     if view != "statistics" and chosen:
         turn_note = ""
-        refresh_conversation_url = esc("/?" + urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "session": chosen["id"]}), quote=True)
+        refresh_conversation_url = esc("/?" + urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "session": chosen["id"], "session_refresh": 1}), quote=True)
         selected_content_turn = chosen["turns"][selected_turn - 1] if selected_turn and 0 < selected_turn <= len(chosen["turns"]) else {}
         if selected_raw:
             explorer_title, explorer_text, explorer_raw = "Classified event data", "", raw_events_markup(selected_content_turn.get("raw", []))
@@ -2718,6 +2836,8 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
     )
     toggle = f'<a class="empty-toggle" href="{toggle_url}" title="{toggle_label}" aria-label="{toggle_label}">{toggle_icon}</a>'
     import_form = f'<form class="import-inline" method="post" action="/import" enctype="multipart/form-data"><input id="source-archive" name="archive" type="file" accept=".zip" required onchange="this.form.submit()"><input type="hidden" name="provider" value="{esc(provider)}"><label class="import-button" for="source-archive" title="Import one session archive" aria-label="Import one session archive">⇧</label></form>' if source_mode(provider) == "local" else ""
+    indicator_class = "scan-full-transcripts" if scan_phase == "full" else "scan-high-level"
+    scan_indicator = f'<div class="scan-indicator {indicator_class}" role="status" aria-live="polite"><span>{"Loading full transcripts" if scan_phase == "full" else "Scanning session list"}</span><i aria-hidden="true"></i></div>' if scan_bootstrap else ""
     view_tabs = f'<style>.detail .message p{{font-size:12px}}.detail .muted{{font-size:11px}}.detail .section-kicker{{font-size:10px}}.detail .section-heading h2{{font-size:17px}}.detail .metric span{{font-size:10px}}.detail .metric strong{{font-size:20px}}.assistant .role>span{{width:22px;height:22px;border-radius:7px}}.view-tabs{{display:flex;gap:5px;margin:10px 0 16px;padding:3px;background:#0c1627;border:1px solid #223451;border-radius:8px}}.view-tab{{flex:1;padding:7px 8px;border-radius:6px;color:#8fa8c5;text-align:center;text-decoration:none;font-size:11px}}.view-tab:hover,.view-tab.selected{{background:#24558a;color:#fff}}.stats-group-menu,.stats-time-menu{{margin:0 -14px;padding:10px 14px;border:0;border-top:1px solid #202b3d;border-bottom:1px solid #202b3d;border-radius:0;background:transparent}}.stats-time-menu{{margin-top:12px}}.stats-sidebar-title{{margin:0;padding:0 8px 4px;color:#697a91;font-size:9px;font-weight:800;letter-spacing:.14em;text-transform:uppercase}}.stats-sidebar-links{{display:grid;gap:3px}}.stats-sidebar-link{{display:flex;align-items:center;gap:10px;min-height:34px;padding:8px 10px;border:1px solid transparent;border-radius:11px;color:#b9c4d3;text-decoration:none;font-size:12px;font-weight:650}}.stats-sidebar-link .provider-mark{{width:8px;height:8px;flex:none;border-radius:50%;background:#68768a;box-shadow:none}}.stats-sidebar-link:hover,.stats-sidebar-link.selected{{border-color:#293750;background:linear-gradient(100deg,#182235,#131a27);box-shadow:none;color:#fff}}.stats-sidebar-link.selected .provider-mark{{transform:scale(1.18);box-shadow:0 0 0 3px rgba(124,140,255,.12)}}.stats-sidebar .provider-menu:empty,.stats-sidebar .sessions-area{{display:none}}.timeline-point{{cursor:pointer;stroke:#101a2a;stroke-width:2}}.tokens-point{{fill:#54c99f}}.cost-point{{fill:#f07878}}.timeline-hint{{margin-left:auto;color:#687990;font-size:10px}}.import-error{{position:fixed;z-index:30;top:20px;left:calc(var(--sidebar) + 24px);right:24px;width:auto;max-width:none;margin:0;padding:12px 16px;border:1px solid #8f3e4b;border-radius:9px;background:#351923;color:#ffb4c0;font-size:12px;box-shadow:0 8px 24px rgba(0,0,0,.3)}}@media(max-width:700px){{.import-error{{left:20px;right:20px}}}}</style><nav class="view-tabs"><a class="view-tab {"selected" if view != "statistics" else ""}" href="/?{urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty)})}">Operational</a><a class="view-tab {"selected" if view == "statistics" else ""}" href="/?{urlencode({"view": "statistics", "provider": provider, "group": group, "range": time_range})}">Statistics</a></nav>'
     view_tabs += '<style>.session-expand-controls{display:flex;gap:4px;margin-top:8px}.session-toggle{margin-left:0;padding:6px 9px;border:1px solid #40516c;border-radius:8px;background:#182538;color:#a9c9e9;font-size:10px;text-transform:none;cursor:pointer}.session-toggle:hover{border-color:#6c7fe2;background:#26365a;color:#fff}.turn-message{display:block!important;margin:12px 14px;width:auto;box-sizing:border-box;padding:0;border:1px solid var(--line);border-bottom:1px solid var(--line);border-radius:10px;background:#0b1018;overflow:hidden}.turn-message>summary{display:flex;align-items:center;gap:7px;padding:10px 12px;border:0;color:#7d8da4;font-size:9px;font-weight:750;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;list-style:none}.turn-message>summary::-webkit-details-marker{display:none}.turn-message>summary:after{margin-left:auto;color:#6f82a0;content:"▾"}.turn-message:not([open])>summary:after{content:"▸"}.turn-message>p{margin:0;padding:14px 16px;border-top:1px solid var(--line);background:rgba(15,23,34,.6)}.turn-invocations{width:auto;box-sizing:border-box;margin-left:14px;margin-right:14px}.turn-invocations>summary{justify-content:flex-start;gap:7px}.turn-invocations>summary>span:first-child{display:flex;align-items:center;gap:7px}.turn-invocations>summary .summary-count{margin-left:auto}.turn-invocations>summary:after{margin-left:4px;color:#6f82a0;content:"▾"}.turn-invocations:not([open])>summary:after{content:"▸"}.invocation-icon{display:grid;place-items:center;width:22px;height:22px;flex:0 0 22px;border-radius:7px;background:#272d50;color:#bec6ff;font-size:8px;font-weight:800;letter-spacing:-.03em}</style><script>(function(){document.addEventListener("click",function(event){var summary=event.target.closest(".turn-message > summary");if(summary){event.preventDefault();summary.parentElement.open=!summary.parentElement.open;return;}var button=event.target.closest(".session-toggle");if(!button)return;var detail=button.closest(".detail");if(!detail)return;var target=button.getAttribute("data-target");var selectors=target==="all"?".turn-message,.turn-invocations":target==="user"?"details.user-content":target==="assistant"?"details.assistant-content":"details.turn-invocations";var details=detail.querySelectorAll(selectors);var shouldOpen=Array.prototype.some.call(details,function(item){return !item.open});details.forEach(function(item){item.open=shouldOpen});});})();</script>'
     view_tabs += '<style>.turn-message>summary,.turn-invocations>summary{min-height:44px;box-sizing:border-box}</style>'
@@ -2729,7 +2849,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
         '<div class="stats-group-menu"><div class="stats-sidebar-title">Group by</div><nav class="stats-sidebar-links">'
         + "".join(
                 f'<a class="stats-sidebar-link stats-navigation {"selected" if group == option else ""}" href="/?{urlencode({"view": "statistics", "provider": provider, "group": option, "range": time_range})}"><span class="provider-mark" aria-hidden="true"></span><span>{label}</span></a>'
-            for option, label in (("today", "Today"), ("day", "Day"), ("week", "Week"), ("month", "Month"), ("year", "Year"), ("project", "Project"), ("tool", "Provider"), ("model", "Model"), ("timeline", "Timeline"))
+            for option, label in (("today", "Today"), ("day", "Day"), ("week", "Week"), ("month", "Month"), ("year", "Year"), ("project", "Project"), ("tool", "Provider"), ("model", "Model"), ("effort", "Effort"), ("timeline", "Timeline"))
         )
         + '</nav></div>'
         + (
@@ -2742,8 +2862,10 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             if group == "timeline" else ""
         )
     ) if view == "statistics" else ""
+    if view == "statistics" and scan_indicator:
+        stats_sidebar = scan_indicator + stats_sidebar
     message = f'<div class="import-error" role="alert">{esc(import_error)}</div>' if import_error else ""
-    sidebar_content = f'''<div class="sessions-area"><div class="sessions-heading"><div class="heading-line"><div class="count">Sessions <b>{len(sessions)}</b></div><div class="sessions-heading-actions">{toggle}<a class="refresh-sessions" href="{refresh_url}" aria-label="Refresh sessions" title="Refresh sessions">↻</a>{import_form}</div></div><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg><input class="session-search" type="search" placeholder="Filter sessions…" aria-label="Filter sessions"><span class="search-key">/</span></div></div><div class="session-list">{session_rows}<div class="empty-search" hidden>No matching sessions</div></div></div>'''
+    sidebar_content = f'''<div class="sessions-area"><div class="sessions-heading"><div class="heading-line"><div class="count">Sessions <b>{len(sessions)}</b></div><div class="sessions-heading-actions">{toggle}<a class="refresh-sessions" href="{refresh_url}" aria-label="Refresh sessions" title="Refresh sessions">↻</a>{import_form}</div></div>{scan_indicator}<div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg><input class="session-search" type="search" placeholder="Filter sessions…" aria-label="Filter sessions"><span class="search-key">/</span></div></div><div class="session-list">{session_rows}<div class="empty-search" hidden>No matching sessions</div></div></div>'''
     return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__SIDEBAR_CLASS__", "stats-sidebar" if view == "statistics" else "").replace("__PROVIDER_MENU__", "" if view == "statistics" else provider_menu).replace("__VIEW_TABS__", view_tabs).replace("__STATS_SIDEBAR__", stats_sidebar).replace("__SIDEBAR_CONTENT__", sidebar_content).replace("__SESSION_ROWS__", "").replace("__SESSION_COUNT__", str(len(sessions))).replace("__DETAIL__", message + detail).replace("__REFRESH_URL__", refresh_url).replace("__EMPTY_TOGGLE__", "").replace("__ROOT__", esc(provider_path(root, provider))).replace("__IMPORT_FORM__", "").replace("__SCAN_BOOTSTRAP__", scan_bootstrap)
 
 
@@ -2947,8 +3069,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             show_empty = query.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
             sessions, statuses = manager.snapshot(provider, show_empty)
-            scan_complete = all(status == "complete" for status in statuses.values())
             view = query.get("view", ["sessions"])[0]
+            index_complete = all(status == "complete" for status in statuses.values())
+            details_complete = manager.statistics_complete(True)
+            scan_complete = index_complete and details_complete
+            scan_phase = "full" if index_complete and not details_complete else "high-level"
             page = render(
                 self.root,
                 query.get("session", [None])[0],
@@ -2958,19 +3083,26 @@ class Handler(BaseHTTPRequestHandler):
                 group=query.get("group", ["today"])[0],
                 time_range=query.get("range", ["all"])[0],
                 sessions_override=sessions,
-                statistics_override=manager.all_sessions(show_empty),
+                statistics_override=manager.all_sessions(show_empty, loaded_only=True),
                 scan_bootstrap="" if scan_complete else "<!-- scanning -->",
+                scan_phase=scan_phase,
             )
             payload = json.dumps({
                 "html": page,
                 "done": scan_complete,
             }).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # The browser can cancel a polling request when navigation or
+                # a newer poll supersedes it. This is normal for the local
+                # progressive scanner and should not produce a server trace.
+                return
             return
         if parsed_url.path == "/export":
             query = parse_qs(parsed_url.query)
@@ -3020,6 +3152,7 @@ class Handler(BaseHTTPRequestHandler):
         session_offset = int(offset_value) if offset_value.isdigit() else 0
         import_error = query.get("import_error", [None])[0]
         refresh_requested = query.get("refresh", ["0"])[0] in {"1", "true", "yes"}
+        session_refresh_requested = query.get("session_refresh", ["0"])[0] in {"1", "true", "yes"}
         selected_raw = query.get("raw", ["0"])[0] in {"1", "true", "yes"}
         show_empty = query.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
         try:
@@ -3030,9 +3163,17 @@ class Handler(BaseHTTPRequestHandler):
             manager = type(self).scan_manager
             manager.start()
             current_sessions, _ = manager.snapshot(provider, show_empty)
-            scan_complete = manager.is_complete()
-            bootstrap = "" if scan_complete else "<script>(function(){var timer=setInterval(function(){fetch('/api/scan'+location.search).then(function(r){return r.json()}).then(function(data){var doc=new DOMParser().parseFromString(data.html,'text/html');document.querySelector('.app').replaceWith(doc.querySelector('.app'));if(data.done)clearInterval(timer);}).catch(function(){});},250);})();</script>"
-            body = render(self.root, selected, selected_turn, selected_metric, provider, show_empty, selected_raw, view, group, selected_group, time_range, import_error, session_offset, sessions_override=current_sessions, statistics_override=manager.all_sessions(show_empty), scan_bootstrap=bootstrap, settings_action=settings_action).encode("utf-8")
+            if session_refresh_requested and selected:
+                for summary in current_sessions:
+                    if summary.get("id") == selected:
+                        summary.pop("_loaded_details", None)
+                        break
+            index_complete = manager.is_complete()
+            details_complete = manager.statistics_complete(True)
+            scan_complete = index_complete and details_complete
+            scan_phase = "full" if index_complete and not details_complete else "high-level"
+            bootstrap = "" if scan_complete else "<script>(function(){var timer=setInterval(function(){fetch('/api/scan'+location.search).then(function(r){return r.json()}).then(function(data){var doc=new DOMParser().parseFromString(data.html,'text/html'), currentSidebar=document.querySelector('.sidebar'), incomingSidebar=doc.querySelector('.sidebar'), currentDetail=document.querySelector('.detail'), incomingDetail=doc.querySelector('.detail');if(currentSidebar&&incomingSidebar){var currentIndicator=currentSidebar.querySelector('.scan-indicator'), incomingIndicator=incomingSidebar.querySelector('.scan-indicator'), fullLoading=incomingIndicator&&incomingIndicator.classList.contains('scan-full-transcripts');if(currentIndicator&&incomingIndicator&&currentIndicator.className!==incomingIndicator.className)currentIndicator.replaceWith(incomingIndicator);else if(currentIndicator&&!incomingIndicator)currentIndicator.remove();else if(!currentIndicator&&incomingIndicator){var heading=currentSidebar.querySelector('.sessions-heading .heading-line');if(heading)heading.after(incomingIndicator);}if(!fullLoading){var currentList=currentSidebar.querySelector('.session-list'), incomingList=incomingSidebar.querySelector('.session-list'), currentCount=currentSidebar.querySelector('.sessions-heading .count b'), incomingCount=incomingSidebar.querySelector('.sessions-heading .count b');if(currentList&&incomingList)currentList.replaceWith(incomingList);if(currentCount&&incomingCount)currentCount.textContent=incomingCount.textContent;var search=currentSidebar.querySelector('.session-search');if(search&&search.value){var query=search.value.trim().toLowerCase();currentSidebar.querySelectorAll('.session-row').forEach(function(row){row.hidden=!row.textContent.toLowerCase().includes(query);});}}}if(currentDetail&&incomingDetail){var detailScroll=currentDetail.scrollTop;currentDetail.replaceWith(incomingDetail);var refreshedDetail=document.querySelector('.detail');if(refreshedDetail)refreshedDetail.scrollTop=detailScroll;}if(data.done)clearInterval(timer);}).catch(function(){});},250);})();</script>"
+            body = render(self.root, selected, selected_turn, selected_metric, provider, show_empty, selected_raw, view, group, selected_group, time_range, import_error, session_offset, sessions_override=current_sessions, statistics_override=manager.all_sessions(show_empty, loaded_only=True), scan_bootstrap=bootstrap, settings_action=settings_action, scan_phase=scan_phase).encode("utf-8")
         except Exception:
             LOGGER.exception("Unable to render request for provider %s", provider)
             self.send_error(500, "Unable to read session files")
@@ -3426,6 +3567,7 @@ PAGE = PAGE.replace('</style>\n</head>', '''<style>
 </style></head>''')
 
 PAGE = PAGE.replace('</head>', '<style>.progressive-scan{position:fixed;inset:0 0 0 var(--sidebar);display:grid;place-items:center;width:auto;min-height:0;margin:0;padding:24px}.progressive-scan .detail-heading,.no-sessions>.detail-heading,.settings-empty>.detail-heading{position:absolute;top:42px;left:clamp(24px,4vw,64px);right:clamp(24px,4vw,64px);width:auto}.progressive-scan .empty-hero{width:min(500px,100%);margin:0 auto;text-align:center}.no-sessions,.settings-empty{position:relative;padding-bottom:42px}.settings-empty{display:grid;place-items:center}.settings-empty .empty-hero{width:min(500px,100%);margin:0 auto;text-align:center}@media(max-width:900px){.progressive-scan{left:0}}@media(max-width:620px){.progressive-scan .detail-heading,.no-sessions>.detail-heading,.settings-empty>.detail-heading{top:24px;left:13px;right:13px}.no-sessions,.settings-empty{padding-bottom:24px}}</style></head>', 1)
+PAGE = PAGE.replace('</head>', '<style>.scan-indicator{display:flex;align-items:center;gap:8px;margin:8px 0 2px;font-size:9px}.stats-sidebar .scan-indicator{margin-bottom:16px}.scan-indicator i{position:relative;display:block;flex:1;height:3px;overflow:hidden;border-radius:99px}.scan-high-level{color:#79d6a2}.scan-high-level i{background:#1d432d}.scan-high-level i:after{background:linear-gradient(90deg,transparent,#65e39a,transparent)}.scan-full-transcripts{color:#ff9a9a}.scan-full-transcripts i{background:#4d2024}.scan-full-transcripts i:after{background:linear-gradient(90deg,transparent,#ff6868,transparent)}.scan-indicator i:after{position:absolute;inset:0;width:38%;border-radius:99px;content:"";animation:scan-slide 1.15s ease-in-out infinite}@keyframes scan-slide{from{transform:translateX(-110%)}to{transform:translateX(285%)}}@media(prefers-reduced-motion:reduce){.scan-indicator i:after{animation:none;left:31%;transform:none}}</style></head>', 1)
 
 
 PAGE = PAGE.replace("</body>", "__SCAN_BOOTSTRAP__</body>")

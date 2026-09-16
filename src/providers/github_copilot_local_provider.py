@@ -223,6 +223,35 @@ def _read_session_state(folder: Path) -> dict:
     return session
 
 
+def _session_state_has_data(folder: Path) -> bool:
+    """Classify a session without building its full normalized transcript."""
+    events = folder / "events.jsonl"
+    try:
+        with events.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type")
+                data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                if event_type == "user.message" and str(data.get("content") or "").strip():
+                    return True
+                if event_type == "assistant.message" and (
+                    str(data.get("content") or "").strip()
+                    or any(isinstance(data.get(key), (int, float)) and not isinstance(data.get(key), bool)
+                           for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens", "reasoningTokens"))
+                ):
+                    return True
+                if event_type == "session.shutdown" and data.get("modelMetrics"):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def _read_chat(path: Path) -> dict:
     """Parse the current VS Code chatSessions JSONL format."""
     viewer = _viewer()
@@ -641,6 +670,7 @@ def index(root: Path) -> list[dict]:
             for path in candidates:
                 if path.is_dir() and path.name != "__pycache__" and (path / "events.jsonl").exists():
                     entry = viewer.session_summary(path, "copilot", "copilot-session-state")
+                    entry["_has_data"] = _session_state_has_data(path)
                     surface = _surface_from_session_state(path)
                     if surface:
                         entry["_surface"] = surface
@@ -682,6 +712,7 @@ def index(root: Path) -> list[dict]:
                 surfaces.add("Extension")
         entry["_surface"] = next(iter(surfaces)) if len(surfaces) == 1 else "Mixed"
         entry["_source_label"] = tool(entry)
+        entry["_has_data"] = any(source.get("_has_data") is True for source in entry.get("_sources", []))
     return sorted(unique.values(), key=lambda item: item["updated"], reverse=True)
 
 
@@ -696,6 +727,23 @@ def _db_index() -> list[dict]:
                 "SELECT id, COALESCE(summary, id), updated_at FROM sessions "
                 "ORDER BY updated_at DESC"
             ).fetchall()
+            data_ids = {
+                session_id
+                for session_id, in db.execute(
+                    "SELECT DISTINCT session_id FROM turns "
+                    "WHERE trim(COALESCE(user_message, '')) <> '' "
+                    "OR trim(COALESCE(assistant_response, '')) <> ''"
+                )
+            }
+            data_ids.update(
+                session_id
+                for session_id, in db.execute(
+                    "SELECT DISTINCT session_id FROM assistant_usage_events "
+                    "WHERE input_tokens IS NOT NULL OR cache_read_tokens IS NOT NULL "
+                    "OR cache_write_tokens IS NOT NULL OR output_tokens IS NOT NULL "
+                    "OR reasoning_tokens IS NOT NULL"
+                )
+            )
     except (OSError, sqlite3.Error):
         return []
     fallback = path.stat().st_mtime
@@ -707,7 +755,8 @@ def _db_index() -> list[dict]:
             return fallback
     return [{"id": sid, "name": name, "updated": timestamp(updated),
              "turns": [], "tokens": viewer.blank_tokens(), "model": "GitHub Copilot",
-             "_source": path, "_session_id": sid, "_source_label": "Mixed", "_kind": "copilot-db"}
+             "_source": path, "_session_id": sid, "_source_label": "Mixed", "_kind": "copilot-db",
+             "_has_data": sid in data_ids}
             for sid, name, updated in rows]
 
 

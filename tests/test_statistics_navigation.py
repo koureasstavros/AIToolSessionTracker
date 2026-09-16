@@ -40,6 +40,15 @@ class StatisticsNavigationTests(unittest.TestCase):
         self.assertIn("provider=claude", markup)
         self.assertIn("view=statistics", markup)
 
+    def test_timeline_keeps_cost_axis_inside_svg_viewbox(self) -> None:
+        markup = render_timeline_svg(
+            {"2026-09-09": {"tokens": 120.0, "cost": 0.5}},
+            provider="claude",
+        )
+
+        self.assertIn('x="956"', markup)
+        self.assertIn('x="935"', markup)
+
     def test_statistics_currency_labels_show_two_decimals(self) -> None:
         self.assertEqual(fmt_unit(1.2, currency=True), "$1.20")
         self.assertEqual(fmt_unit(1_234.5, currency=True), "$1.23K")
@@ -82,6 +91,47 @@ class StatisticsNavigationTests(unittest.TestCase):
         self.assertIn("AI Tool Session Tracker", markup)
         self.assertNotIn("synchronous scan", markup)
 
+    def test_statistics_renders_while_details_are_still_loading(self) -> None:
+        markup = render(
+            Path("."),
+            None,
+            provider="copilot",
+            view="statistics",
+            sessions_override=[],
+            statistics_override=[],
+            scan_bootstrap="poll",
+        )
+
+        self.assertIn("Statistics", markup)
+        self.assertNotIn("Scanning local sessions", markup)
+
+    def test_statistics_sidebar_shows_scan_indicator(self) -> None:
+        markup = render(
+            Path("."),
+            None,
+            provider="copilot",
+            view="statistics",
+            sessions_override=[],
+            statistics_override=[],
+            scan_bootstrap="poll",
+        )
+
+        self.assertIn("scan-indicator scan-high-level", markup)
+
+    def test_scan_indicator_turns_red_for_full_transcript_warming(self) -> None:
+        markup = render(
+            Path("."),
+            None,
+            provider="copilot",
+            sessions_override=[],
+            statistics_override=[],
+            scan_bootstrap="poll",
+            scan_phase="full",
+        )
+
+        self.assertIn("scan-indicator scan-full-transcripts", markup)
+        self.assertIn("Loading full transcripts", markup)
+
     def test_operational_shell_uses_centered_scanning_view(self) -> None:
         markup = render(
             Path("."),
@@ -110,12 +160,39 @@ class StatisticsNavigationTests(unittest.TestCase):
         self.assertIn("Scanning local sessions", markup)
         self.assertNotIn("Select a session", markup)
 
+    def test_scan_poll_updates_sidebar_and_detail_without_replacing_app(self) -> None:
+        handler_source = inspect.getsource(Handler.do_GET)
+
+        self.assertIn("currentList.replaceWith(incomingList)", handler_source)
+        self.assertIn("currentDetail.replaceWith(incomingDetail)", handler_source)
+        self.assertNotIn("document.querySelector('.app').replaceWith", handler_source)
+
+    def test_full_transcript_poll_does_not_replace_sidebar_list(self) -> None:
+        handler_source = inspect.getsource(Handler.do_GET)
+
+        self.assertIn("fullLoading", handler_source)
+        self.assertIn("if(!fullLoading)", handler_source)
+
+    def test_sidebar_shows_scan_indicator_during_progressive_scan(self) -> None:
+        markup = render(
+            Path("."),
+            None,
+            provider="copilot",
+            sessions_override=[],
+            statistics_override=[],
+            scan_bootstrap="poll",
+        )
+
+        self.assertIn("scan-indicator scan-high-level", markup)
+        self.assertIn("Scanning session list", markup)
+
     def test_background_scan_publishes_all_sessions_sequentially(self) -> None:
         entries = [
             {"id": "first", "name": "first", "updated": 1, "_has_data": True},
             {"id": "second", "name": "second", "updated": 2, "_has_data": True},
         ]
         seen = []
+        detail_calls = []
 
         class Adapter:
             def index(self, _root):
@@ -123,6 +200,7 @@ class StatisticsNavigationTests(unittest.TestCase):
                 return [dict(entry) for entry in entries]
 
             def details(self, summary):
+                detail_calls.append(summary["id"])
                 return summary
 
         adapters = {provider: Adapter() for provider in ("copilot", "codex", "claude", "antigravity", "m365_copilot")}
@@ -136,7 +214,98 @@ class StatisticsNavigationTests(unittest.TestCase):
         sessions, statuses = manager.snapshot("copilot")
         self.assertEqual({item["id"] for item in sessions}, {"first", "second"})
         self.assertEqual(len(seen), 5)
+        self.assertEqual(detail_calls, [])
         self.assertTrue(all(value == "complete" for value in statuses.values()))
+
+    def test_background_scan_hides_unknown_sessions_unless_show_empty(self) -> None:
+        entries = [
+            {"id": "known", "name": "known", "updated": 2, "_has_data": True},
+            {"id": "unknown", "name": "unknown", "updated": 1},
+        ]
+
+        class Adapter:
+            def index(self, _root):
+                return [dict(entry) for entry in entries]
+
+            def details(self, summary):
+                raise AssertionError(f"details loaded during scan: {summary['id']}")
+
+        adapters = {provider: Adapter() for provider in ("copilot", "codex", "claude", "antigravity", "m365_copilot")}
+        manager = BackgroundScanManager(Path("."))
+        with patch("session_token_viewer.PROVIDER_ADAPTERS", adapters), patch(
+            "session_token_viewer.source_mode", return_value="local"
+        ):
+            manager.start()
+            manager._thread.join(timeout=2)
+
+        self.assertEqual([item["id"] for item in manager.snapshot("copilot")[0]], ["known"])
+        self.assertEqual(
+            {item["id"] for item in manager.snapshot("copilot", show_empty=True)[0]},
+            {"known", "unknown"},
+        )
+
+    def test_statistics_details_load_one_session_at_a_time(self) -> None:
+        manager = BackgroundScanManager(Path("."))
+        first = {"id": "first", "provider": "copilot", "_has_data": True, "_source": Path("first")}
+        second = {"id": "second", "provider": "copilot", "_has_data": True, "_source": Path("second")}
+        manager._sessions["copilot"] = [first, second]
+        manager._statistics_sessions["copilot"] = [("copilot", first), ("copilot", second)]
+
+        with patch("session_token_viewer.load_session_details", side_effect=[{"id": "first"}, {"id": "second"}]) as load:
+            self.assertTrue(manager.load_next_statistics_detail())
+            self.assertEqual(load.call_count, 1)
+            self.assertEqual(manager.all_sessions(loaded_only=True)[0][1]["id"], "first")
+            self.assertFalse(manager.statistics_complete())
+            self.assertTrue(manager.load_next_statistics_detail())
+            self.assertTrue(manager.statistics_complete())
+
+    def test_model_statistics_breakdown_is_cached_on_loaded_session(self) -> None:
+        from session_token_viewer import model_usage_breakdown
+
+        session = {"model": "gpt-test", "tokens": {key: 0 for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens", "reasoningTokens")}, "turns": []}
+        with patch("session_token_viewer.pricing.find_model", side_effect=AssertionError("recomputed model lookup")):
+            first = model_usage_breakdown(session)
+            session["_model_usage_breakdown"] = first
+            self.assertIs(model_usage_breakdown(session), first)
+
+    def test_statistics_can_group_by_reasoning_effort(self) -> None:
+        from session_token_viewer import statistics_group_key
+
+        self.assertEqual(
+            statistics_group_key({"reasoningEffort": "high"}, "effort", "copilot", {}),
+            "high",
+        )
+        markup = render(Path("."), None, view="statistics", group="effort", statistics_override=[])
+        self.assertIn('group=effort', markup)
+        self.assertIn(">Effort<", markup)
+        self.assertNotIn("Unknown effort", markup)
+
+    def test_statistics_scan_indicator_precedes_group_menu(self) -> None:
+        markup = render(Path("."), None, view="statistics", statistics_override=[], scan_bootstrap="poll")
+
+        self.assertLess(markup.index("scan-indicator"), markup.index("Group by"))
+
+    def test_effort_breakdown_is_granular(self) -> None:
+        from session_token_viewer import model_usage_breakdown
+
+        session = {
+            "model": "gpt-test",
+            "tokens": {key: 0 for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens", "reasoningTokens")},
+            "turns": [{
+                "reasoningEffort": "high",
+                "tokens": {key: 0 for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens", "reasoningTokens")},
+                "invocations": [{"reasoningEffort": "low", "model": "gpt-test", "tokens": {"outputTokens": 5}}],
+            }],
+        }
+
+        labels = {row["model"] for row in model_usage_breakdown(session, "effort")}
+        self.assertEqual(labels, {"low"})
+
+    def test_scan_handler_handles_cancelled_poll_connections(self) -> None:
+        handler_source = inspect.getsource(Handler.do_GET)
+
+        self.assertIn("ConnectionAbortedError", handler_source)
+        self.assertIn("browser can cancel a polling request", handler_source)
 
     def test_background_scan_removes_deleted_session_from_cached_results(self) -> None:
         manager = BackgroundScanManager(Path("."))

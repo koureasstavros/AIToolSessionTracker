@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "tracker", "llm", "slm", "model", "session", "turn", "invocation", "agents", "tools", "context"]
 license: "apache-2.0"
-version: v0.0.36
+version: v0.0.37
 ---
 
 # AI Tool Session Tracker
@@ -35,6 +35,8 @@ This project is freely available to everyone, but your support as a sponsor can 
 [🏷️ Sponshor this Project through PayPal](https://www.paypal.com/donate/?hosted_button_id=HNWFJR47DAJQE) --If you're looking for a donation platform other than GitHub.
 
 ## Run
+
+Navigate to releases and find the compiled binaries for your operating system, just one click, otherwise download the source code and follow the instructions.
 
 From this folder:
 
@@ -203,6 +205,11 @@ Import destinations are documented in the corresponding provider guides under
 
 Archives are validated for provider ownership and path traversal before any
 file is written.
+
+### Session Refresh
+Use the refresh button above the provider session list to rescan local storage
+for newly created, modified, or removed sessions. The selected provider is
+refreshed without changing the current view or session filter.
 
 ### Session Delete
 Each conversation has a delete button for removing its locally stored transcript
