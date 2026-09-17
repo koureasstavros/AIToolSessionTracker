@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "tracker", "llm", "slm", "model", "session", "turn", "invocation", "agents", "tools", "context"]
 license: "apache-2.0"
-version: v0.0.37
+version: v0.0.38
 ---
 
 # AI Tool Session Tracker
@@ -155,6 +155,8 @@ documented separately:
 - [GitHub Copilot](docs/providers/github-copilot.md)
 - [OpenAI Codex](docs/providers/openai-codex.md)
 - [Anthropic Claude Code](docs/providers/claude-code.md)
+- [xAI Cursor](docs/providers/xai-cursor.md)
+- [Cognition Devin](docs/providers/cognition-devin.md)
 - [Google Antigravity](docs/providers/google-antigravity.md)
 - [Microsoft 365 Copilot](docs/providers/microsoft-365-copilot.md)
 
@@ -266,8 +268,8 @@ Received OTEL data is stored locally in `AI-Tool-Session-Tracker-content.db`, wh
 listener and routing settings remain in `AI-Tool-Session-Tracker-config.db`; no provider
 cloud API is contacted.
 
-Exporters should set `ai.session.provider` to `copilot`, `codex`, `claude`,
-`antigravity`, or `m365_copilot`, and can use `ai.session.id` to group spans
+Exporters should set `ai.session.provider` to `copilot`, `codex`, or `claude`,
+and can use `ai.session.id` to group spans
 into a session. The receiver recognizes common `gen_ai.usage.*_tokens` and
 `gen_ai.*.model` attributes. OTEL-backed sessions intentionally cannot be
 imported, exported, or deleted through the local-storage controls.
@@ -310,6 +312,8 @@ Provider-specific behavior is implemented in:
 - `src/providers/github_copilot_local_provider.py`
 - `src/providers/openai_codex_local_provider.py`
 - `src/providers/anthropic_claude_local_provider.py`
+- `src/providers/xai_cursor_local_provider.py`
+- `src/providers/cognition_devin_local_provider.py`
 - `src/providers/google_antigravity_local_provider.py`
 - `src/providers/m365_copilot_local_provider.py`
 
@@ -318,8 +322,6 @@ Provider-specific OTEL routing and metadata mapping is implemented in:
 - `src/providers/github_copilot_otel_provider.py`
 - `src/providers/openai_codex_otel_provider.py`
 - `src/providers/anthropic_claude_otel_provider.py`
-- `src/providers/google_antigravity_otel_provider.py`
-- `src/providers/m365_copilot_otel_provider.py`
 
 Each provider adapter under `src/providers/` exposes the same operations:
 

@@ -19,8 +19,6 @@ from typing import Any
 from src.common.tracker_database import config_database_path, connect_database, content_database_path
 from src.providers import anthropic_claude_otel_provider
 from src.providers import github_copilot_otel_provider
-from src.providers import google_antigravity_otel_provider
-from src.providers import m365_copilot_otel_provider
 from src.providers import openai_codex_otel_provider
 
 OTEL_CONFIG_FILENAME = "source_otel.json"
@@ -39,8 +37,6 @@ OTEL_PROVIDER_ADAPTERS = (
     github_copilot_otel_provider,
     openai_codex_otel_provider,
     anthropic_claude_otel_provider,
-    google_antigravity_otel_provider,
-    m365_copilot_otel_provider,
 )
 
 

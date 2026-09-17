@@ -1,9 +1,15 @@
 {
+  "available_sources": {
+    "local": "Local storage",
+    "otel": "OTEL service"
+  },
   "providers": {
-    "copilot": "local",
-    "codex": "local",
-    "claude": "local",
-    "antigravity": "local",
-    "m365_copilot": "local"
+    "copilot": {"available": ["local", "otel"], "default": "local"},
+    "codex": {"available": ["local", "otel"], "default": "local"},
+    "claude": {"available": ["local", "otel"], "default": "local"},
+    "xai_cursor": {"available": ["local"], "default": "local"},
+    "cognition_devin": {"available": ["local"], "default": "local"},
+    "antigravity": {"available": ["local"], "default": "local"},
+    "m365_copilot": {"available": ["local"], "default": "local"}
   }
 }

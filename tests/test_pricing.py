@@ -193,6 +193,29 @@ class PricingTests(unittest.TestCase):
             "gemini-3.7-flash": 4.575,
         })
 
+    def test_cognition_devin_models_are_cataloged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            pricing.load_model_costs(database_path)
+            with patch.object(pricing, "mapping_config_path", return_value=database_path):
+                pricing._PRICING_COST_CACHE.pop(database_path, None)
+                self._assert_model_costs({
+                    "swe-1-5": 0.0,
+                    "swe-1-6": 3.2,
+                    "swe-1-6-fast": 3.2,
+                    "swe-1-6-slow": 3.2,
+                    "swe-1-mini": 0.0,
+                    "swe-grep": 0.0,
+                    "swe-check": 0.0,
+                    "swe-1-7": 3.2,
+                    "swe-1-7-medium": 3.2,
+                    "swe-1-7-lightning": 16.0,
+                    "swe-1-7-lightning-medium": 16.0,
+                    "swe-2-high": 4.575,
+                    "swe-2-medium": 4.575,
+                    "swe-2-max": 4.575,
+                })
+
     def test_microsoft_365_copilot_models_have_costs(self) -> None:
         self._assert_model_costs({
             "gpt-4.1": 10.5,

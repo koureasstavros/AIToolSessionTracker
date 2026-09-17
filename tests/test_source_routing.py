@@ -122,6 +122,20 @@ class SourceRoutingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 source_otel.save_source_otel("otlp_http", "127.0.0.1", "0", path)
 
+    def test_local_only_providers_expose_only_local_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "routing.db"
+            configuration = source_routing.load_source_routing(PROVIDERS, path)
+
+            self.assertEqual(configuration["provider_options"]["antigravity"], ["local"])
+            self.assertEqual(configuration["provider_options"]["xai_cursor"], ["local"])
+            self.assertEqual(configuration["provider_options"]["cognition_devin"], ["local"])
+            self.assertEqual(configuration["provider_options"]["m365_copilot"], ["local"])
+            routes = {provider: "local" for provider in PROVIDERS}
+            routes["cognition_devin"] = "otel"
+            with self.assertRaises(ValueError):
+                source_routing.save_source_routing(PROVIDERS, routes, path)
+
     def test_source_otel_seeds_from_bundled_catalog_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tracker.db"

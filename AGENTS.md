@@ -135,3 +135,44 @@ Keep token cards visually smaller as their scope becomes more specific:
 4. Delegated-agent totals — smallest cards.
 
 When changing token-card styles, preserve this order using the existing scope selectors: `.overview > .metrics`, `.turn-metrics`, `.invocation-total`/`.invocation-parent-body`, and `.delegated-agent`. The hierarchy applies to card dimensions, padding, and value typography while retaining readable labels and accessible contrast.
+
+## New Provider Checklist
+
+When adding a provider, first inspect its supported local storage and determine
+whether it also has a usable local OpenTelemetry source. Do not assume every
+provider supports both sources. Record the available sources and the default
+route in `src/common/source_routing.json`; providers without an OTEL adapter
+must expose local storage only in the Source Routing UI.
+
+Implement the provider-specific adapter files under `src/providers/` for every
+supported source:
+
+- `<provider>_local_provider.py` for local JSON, JSONL, SQLite, or other native
+	storage.
+- `<provider>_otel_provider.py` only when the provider has provider-specific
+	OTEL metadata or parsing behavior. Register it in `src/common/source_otel.py`.
+
+Register the provider in `PROVIDERS` and `PROVIDER_ADAPTERS` in
+`session_token_viewer.py`, preserving the requested provider order. Add the
+provider to the bundled routing catalog, model pricing catalog, README provider
+list, provider storage matrix, and a provider guide under `docs/providers/`.
+
+Provider details must follow the normalized fields described in `README.md` and
+the bundled JSON catalogs. At minimum, inspect and parse the native records for:
+
+- Surface: Extension, CLI, Desktop, or Mixed when it can be identified.
+- Session identity, display name, project, timestamps, and model/deployment.
+- Turns and context, including user input and assistant output.
+- Invocations, reasoning/thinking content, tools, tool arguments, and results.
+- Persisted token usage for input, cache read, cache write, output, and
+	reasoning tokens. If a value is absent, preserve it as unavailable or mark a
+	documented estimate; never silently present fabricated usage as exact.
+- Raw source records, attachments, delegated agents, effort metadata, and
+	provider-specific fields when available.
+
+Keep `index(root)` lightweight: discover summaries and `_has_data` without
+parsing complete transcripts. Put full parsing in `details(summary)` and reuse
+the normalized cache for operational and Statistics views. Add focused tests for
+source discovery, surface/model detection, user and assistant content, turns,
+invocations, tools, token accounting, empty sessions, deletion, and archive
+behavior. Run the full unittest suite before completing the provider change.

@@ -27,11 +27,13 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from src.common import source_otel
 from src.common import source_pricing as pricing
 from src.common import source_routing
-from src.providers import anthropic_claude_local_provider
 from src.providers import github_copilot_local_provider
+from src.providers import openai_codex_local_provider
+from src.providers import anthropic_claude_local_provider
+from src.providers import xai_cursor_local_provider
+from src.providers import cognition_devin_local_provider
 from src.providers import google_antigravity_local_provider
 from src.providers import m365_copilot_local_provider
-from src.providers import openai_codex_local_provider
 
 TOKEN_KEYS = (
     "inputTokens",
@@ -51,6 +53,8 @@ PROVIDERS = {
     "copilot": "GitHub Copilot",
     "codex": "OpenAI Codex",
     "claude": "Anthropic Claude Code",
+    "xai_cursor": "xAI Cursor",
+    "cognition_devin": "Cognition Devin",
     "antigravity": "Google Antigravity",
     "m365_copilot": "Microsoft 365 Copilot",
 }
@@ -70,6 +74,14 @@ TOKEN_ACCOUNTING_NOTES = {
     "antigravity": (
         "Google Antigravity",
         "Native token usage is not consistently present in the local transcript. When usage is absent, the viewer estimates token counts from transcript content and prices them with the matching Gemini model rate. These values are estimates.",
+    ),
+    "xai_cursor": (
+        "xAI Cursor",
+        "Cursor's local agent transcript does not currently include token usage. The viewer estimates input and output tokens from visible message text and serialized tool arguments/results. These values are estimates and should not be treated as provider billing data.",
+    ),
+    "cognition_devin": (
+        "Cognition Devin",
+        "Devin stores usage metrics in assistant message metadata when available, including input, output, and cache-read tokens. Missing fields are estimated from visible content and marked as estimates.",
     ),
     "m365_copilot": (
         "Microsoft 365 Copilot",
@@ -103,6 +115,8 @@ PROVIDER_ADAPTERS = {
     "copilot": github_copilot_local_provider,
     "codex": openai_codex_local_provider,
     "claude": anthropic_claude_local_provider,
+    "xai_cursor": xai_cursor_local_provider,
+    "cognition_devin": cognition_devin_local_provider,
     "antigravity": google_antigravity_local_provider,
     "m365_copilot": m365_copilot_local_provider,
 }
@@ -357,7 +371,7 @@ def normalize_session_data(value: dict) -> SessionData:
             flags.append("uncategorizedOutput")
     result["tokenFlags"] = flags
     result["tokenFields"] = [key for key in TOKEN_KEYS if key in supplied_fields] if has_supplied_fields else list(TOKEN_KEYS if isinstance(supplied_tokens, dict) else [])
-    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_surface", "_session_id", "_db_metadata", "_db_issue", "_has_data", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation", "outputTokensExcludeReasoning"):
+    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_surface", "_session_id", "_db_metadata", "_db_issue", "_has_data", "_devin_session", "_devin_session_id", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation", "outputTokensExcludeReasoning"):
         if key in value:
             result[key] = value[key]
     for turn in result["turns"]:
@@ -1492,7 +1506,12 @@ class BackgroundScanManager:
                 self._status[provider] = "scanning"
             try:
                 with self._provider_locks[provider]:
-                    indexed = source_otel.index(provider) if source_mode(provider, self.routing) == "otel" else PROVIDER_ADAPTERS[provider].index(self.root)
+                    adapter = PROVIDER_ADAPTERS.get(provider)
+                    if source_mode(provider, self.routing) == "local" and adapter is None:
+                        with self._lock:
+                            self._status[provider] = "complete"
+                        continue
+                    indexed = source_otel.index(provider) if source_mode(provider, self.routing) == "otel" else adapter.index(self.root)
                 normalized = []
                 for item in indexed:
                     try:
@@ -2621,14 +2640,16 @@ def render_settings_page(action: str | None = None) -> str:
     elif action == "source-routing":
         routing = source_routing_config()
         routes = routing.get("providers", {}) if isinstance(routing.get("providers"), dict) else {}
+        provider_options = routing.get("provider_options", {}) if isinstance(routing.get("provider_options"), dict) else {}
+        source_labels = routing.get("available_sources", {}) if isinstance(routing.get("available_sources"), dict) else {}
         otel = routing.get("otel", {}) if isinstance(routing.get("otel"), dict) else {}
         route_rows = "".join(
-            f'<label class="routing-row"><span><b>{esc(label)}</b><small>{esc(key)}</small></span><select name="route_{esc(key, quote=True)}"><option value="local"{" selected" if routes.get(key) != "otel" else ""}>Local storage</option><option value="otel"{" selected" if routes.get(key) == "otel" else ""}>OTEL service</option></select></label>'
+            f'<label class="routing-row"><span><b>{esc(label)}</b><small>{esc(key)}</small></span><select name="route_{esc(key, quote=True)}">{"".join(f'<option value="{esc(source, quote=True)}"{" selected" if routes.get(key) == source else ""}>{esc(source_labels.get(source, source))}</option>' for source in provider_options.get(key, ["local"]))}</select></label>'
             for key, label in PROVIDERS.items()
         )
         host = esc(str(otel.get("host", "127.0.0.1")), quote=True)
         port = esc(str(otel.get("port", 4318)), quote=True)
-        detail = f'''<main class="detail settings-page"><style>.routing-form{{display:grid;gap:14px}}.routing-row{{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 0;border-bottom:1px solid var(--line)}}.routing-row span{{display:grid;gap:3px}}.routing-row small{{color:var(--muted);font:10px ui-monospace,monospace}}.routing-row select,.listener-grid input{{border:1px solid #31435f;border-radius:7px;background:#0c1627;color:#dbe9ff;padding:8px 10px}}.listener-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}.listener-grid label{{display:grid;gap:6px;color:#a9b9ce;font-size:11px}}.listener-grid .wide{{grid-column:1/-1}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div><h1>Source Routing</h1><p class="settings-intro">Choose where each provider is read from. OTEL routes receive OTLP/HTTP JSON traces on this computer, store them in <code>{esc(source_otel.content_database_path())}</code>, and show only that provider&apos;s received data.</p></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>{exit_action()}</div></header><section class="settings-card"><form class="routing-form" method="post" action="/settings"><input type="hidden" name="settings_action" value="source-routing"><div class="section-heading"><div><span class="section-kicker">PROVIDER ROUTES</span><h2>Session source by provider</h2></div></div>{route_rows}<div class="section-heading"><div><span class="section-kicker">OTEL SERVICE</span><h2>OTLP receiver</h2></div></div><div class="listener-grid"><label class="wide">Protocol<input name="protocol" value="OTLP/HTTP JSON" readonly></label><label>Listen host<input name="otel_host" value="{host}" required></label><label>Listen port<input name="otel_port" value="{port}" inputmode="numeric" required></label></div><p class="settings-help">Configure exporters to send JSON OTLP traces to <code>http://HOST:PORT/v1/traces</code>. Include <code>ai.session.provider</code> (copilot, codex, claude, antigravity, or m365_copilot) and optionally <code>ai.session.id</code>. This listener is enabled only when at least one provider uses OTEL.</p><div class="settings-actions"><button type="submit" class="settings-primary">Save source routing</button></div></form></section></main>'''
+        detail = f'''<main class="detail settings-page"><style>.routing-form{{display:grid;gap:14px}}.routing-row{{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 0;border-bottom:1px solid var(--line)}}.routing-row span{{display:grid;gap:3px}}.routing-row small{{color:var(--muted);font:10px ui-monospace,monospace}}.routing-row select,.listener-grid input{{border:1px solid #31435f;border-radius:7px;background:#0c1627;color:#dbe9ff;padding:8px 10px}}.listener-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}.listener-grid label{{display:grid;gap:6px;color:#a9b9ce;font-size:11px}}.listener-grid .wide{{grid-column:1/-1}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div><h1>Source Routing</h1><p class="settings-intro">Choose where each provider is read from. OTEL routes receive OTLP/HTTP JSON traces on this computer, store them in <code>{esc(source_otel.content_database_path())}</code>, and show only that provider&apos;s received data.</p></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>{exit_action()}</div></header><section class="settings-card"><form class="routing-form" method="post" action="/settings"><input type="hidden" name="settings_action" value="source-routing"><div class="section-heading"><div><span class="section-kicker">PROVIDER ROUTES</span><h2>Session source by provider</h2></div></div>{route_rows}<div class="section-heading"><div><span class="section-kicker">OTEL SERVICE</span><h2>OTLP receiver</h2></div></div><div class="listener-grid"><label class="wide">Protocol<input name="protocol" value="OTLP/HTTP JSON" readonly></label><label>Listen host<input name="otel_host" value="{host}" required></label><label>Listen port<input name="otel_port" value="{port}" inputmode="numeric" required></label></div><p class="settings-help">Configure exporters to send JSON OTLP traces to <code>http://HOST:PORT/v1/traces</code>. Include <code>ai.session.provider</code> (copilot, codex, or claude) and optionally <code>ai.session.id</code>. This listener is enabled only when at least one provider uses OTEL.</p><div class="settings-actions"><button type="submit" class="settings-primary">Save source routing</button></div></form></section></main>'''
         detail = detail.replace("OTLP/HTTP JSON", "OTLP/HTTP (protobuf or JSON)").replace(
             "OTEL routes receive OTLP/HTTP (protobuf or JSON) traces",
             "OTEL routes receive OTLP/HTTP traces, logs, and metrics",

@@ -21,7 +21,24 @@ def routing_config_path() -> Path:
 def default_routing(providers: object) -> dict[str, object]:
     """Create safe local-only defaults for all known providers."""
     keys = providers.keys() if isinstance(providers, dict) else providers
-    return {"providers": {str(provider): LOCAL_SOURCE for provider in keys}}
+    bundled_providers = _BUNDLED_ROUTING.get("providers", {}) if isinstance(_BUNDLED_ROUTING, dict) else {}
+    provider_options = {}
+    provider_defaults = {}
+    for provider in keys:
+        configured = bundled_providers.get(str(provider)) if isinstance(bundled_providers, dict) else None
+        available = configured.get("available") if isinstance(configured, dict) else None
+        provider_options[str(provider)] = [
+            source for source in (available if isinstance(available, list) else [LOCAL_SOURCE, OTEL_SOURCE])
+            if source in {LOCAL_SOURCE, OTEL_SOURCE}
+        ] or [LOCAL_SOURCE]
+        configured_default = configured.get("default") if isinstance(configured, dict) else LOCAL_SOURCE
+        provider_defaults[str(provider)] = configured_default if configured_default in provider_options[str(provider)] else LOCAL_SOURCE
+    available_sources = _BUNDLED_ROUTING.get("available_sources") if isinstance(_BUNDLED_ROUTING, dict) else None
+    return {
+        "providers": provider_defaults,
+        "available_sources": available_sources if isinstance(available_sources, dict) else {LOCAL_SOURCE: "Local storage", OTEL_SOURCE: "OTEL service"},
+        "provider_options": provider_options,
+    }
 
 
 def _initialize_tables(connection: sqlite3.Connection) -> None:
@@ -36,13 +53,20 @@ def _initialize_tables(connection: sqlite3.Connection) -> None:
 def _routing_rows(payload: object, defaults: dict[str, object]) -> list[tuple[str, str]]:
     """Normalize the bundled routing payload into safe local rows."""
     configured = payload.get("providers") if isinstance(payload, dict) and isinstance(payload.get("providers"), dict) else {}
-    return [
-        (
-            provider,
-            configured.get(provider) if configured.get(provider) in {LOCAL_SOURCE, OTEL_SOURCE} else LOCAL_SOURCE,
-        )
-        for provider in defaults["providers"]
-    ]
+    rows = []
+    options = defaults["provider_options"]
+    for provider in defaults["providers"]:
+        configured_value = configured.get(provider)
+        if isinstance(configured_value, dict):
+            allowed = configured_value.get("available")
+            if isinstance(allowed, list):
+                options[provider] = [source for source in allowed if source in {LOCAL_SOURCE, OTEL_SOURCE}] or [LOCAL_SOURCE]
+            configured_value = configured_value.get("default")
+        elif isinstance(configured_value, str) and configured_value in {LOCAL_SOURCE, OTEL_SOURCE}:
+            options[provider] = [LOCAL_SOURCE, OTEL_SOURCE]
+        allowed = options.get(provider, [LOCAL_SOURCE])
+        rows.append((provider, configured_value if configured_value in allowed else LOCAL_SOURCE))
+    return rows
 
 
 def _seed_initial_routing(connection: sqlite3.Connection, defaults: dict[str, object]) -> list[tuple[str, str]]:
@@ -68,8 +92,19 @@ def load_source_routing(providers: object, path: Path | None = None) -> dict[str
         # Preserve safe local-only startup if an existing database is unavailable.
         return result
     known = result["providers"]
+    result["provider_options"] = {
+        provider: list(options)
+        for provider, options in result["provider_options"].items()
+    }
+    bundled_sources = _BUNDLED_ROUTING.get("available_sources") if isinstance(_BUNDLED_ROUTING, dict) else None
+    if isinstance(bundled_sources, dict):
+        result["available_sources"] = {
+            source: str(label)
+            for source, label in bundled_sources.items()
+            if source in {LOCAL_SOURCE, OTEL_SOURCE}
+        }
     for provider, source in rows:
-        if provider in known and source in {LOCAL_SOURCE, OTEL_SOURCE}:
+        if provider in known and source in result["provider_options"].get(provider, [LOCAL_SOURCE]):
             known[provider] = source
     return result
 
@@ -83,7 +118,7 @@ def save_source_routing(
     result = default_routing(providers)
     for provider in result["providers"]:
         route = routes.get(provider)
-        if route not in {LOCAL_SOURCE, OTEL_SOURCE}:
+        if route not in result["provider_options"].get(provider, [LOCAL_SOURCE]):
             raise ValueError(f"Invalid source route for {provider}")
         result["providers"][provider] = route
     config_path = path or routing_config_path()

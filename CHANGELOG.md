@@ -4,6 +4,12 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Tracker, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.38 — 2026-09-17
+
+- Added xAI Cursor provider
+- Added Cognition Devin provider
+- Fixed OTEL provider support handling
+
 ### Version v0.0.37 — 2026-09-16
 
 - Stabilized progressive lazy loading of sessions
