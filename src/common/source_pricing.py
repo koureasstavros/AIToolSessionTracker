@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from src.common.tracker_database import config_database_path, connect_database
+from src.migrations import model_costs_migration
 
 _SEED_COSTS = json.loads((Path(__file__).with_name("model_costs.json")).read_text(encoding="utf-8"))
 _SEED_MAPPINGS = json.loads((Path(__file__).with_name("model_mapping.json")).read_text(encoding="utf-8"))
-LEGACY_MODEL_MAPPING_FILENAME = "model_mappings.json"
 _PRICING_COST_CACHE: dict[Path, list[dict[str, object]]] = {}
 _DELETED_MODEL_COSTS: dict[Path, set[str]] = {}
 _DELETED_MODEL_MAPPINGS: dict[Path, set[str]] = {}
+CANONICAL_CACHE_WRITE_TOKEN_KEYS = ("cacheWrite5mTokens", "cacheWrite1hTokens")
 
 
 def _canonical(value: object) -> str:
@@ -24,10 +25,6 @@ def _canonical(value: object) -> str:
 def mapping_config_path() -> Path:
     """Return the tracker database that persists model deployment mappings."""
     return config_database_path()
-
-
-def _legacy_mapping_path() -> Path:
-    return Path.cwd() / LEGACY_MODEL_MAPPING_FILENAME
 
 
 def _initialize_mapping_tables(connection: sqlite3.Connection) -> None:
@@ -43,45 +40,118 @@ def _initialize_cost_tables(connection: sqlite3.Connection) -> None:
     _initialize_mapping_tables(connection)
     connection.execute(
         """CREATE TABLE IF NOT EXISTS model_costs (
-            model TEXT PRIMARY KEY COLLATE NOCASE,
             vendor TEXT NOT NULL,
+            model TEXT PRIMARY KEY COLLATE NOCASE,
+            context_threshold INTEGER DEFAULT NULL,
             input REAL NOT NULL,
             cache_read REAL,
             cache_write REAL,
+            cache_write_5m REAL,
+            cache_write_1h REAL,
             output REAL NOT NULL,
-            reasoning REAL
+            reasoning REAL,
+            short_input REAL,
+            short_cache_read REAL,
+            short_cache_write REAL,
+            short_cache_write_5m REAL,
+            short_cache_write_1h REAL,
+            short_output REAL,
+            short_reasoning REAL,
+            long_input REAL,
+            long_cache_read REAL,
+            long_cache_write REAL,
+            long_cache_write_5m REAL,
+            long_cache_write_1h REAL,
+            long_output REAL,
+            long_reasoning REAL
         )"""
     )
-
-
 def _seed_model_costs(connection: sqlite3.Connection, config_path: Path) -> None:
     """Add bundled model costs that are missing without overwriting edits."""
     deleted = _DELETED_MODEL_COSTS.get(config_path, set())
-    bundled_costs = [row for row in _SEED_COSTS if _canonical(row["model"]) not in deleted]
+    bundled_costs = [
+        {
+            **row,
+            "input": row.get("input", row.get("short_input")),
+            "cache_read": row.get("cache_read", row.get("short_cache_read")),
+            "cache_write": row.get("cache_write", row.get("short_cache_write")),
+            "cache_write_5m": row.get("cache_write_5m", row.get("short_cache_write_5m", row.get("cache_write"))),
+            "cache_write_1h": row.get("cache_write_1h", row.get("short_cache_write_1h", row.get("cache_write"))),
+            "output": row.get("output", row.get("short_output")),
+            "reasoning": row.get("reasoning", row.get("short_reasoning")),
+            "context_threshold": row.get("context_threshold"),
+            "short_input": row.get("short_input", row.get("input")),
+            "short_cache_read": row.get("short_cache_read", row.get("cache_read")),
+            "short_cache_write": row.get("short_cache_write", row.get("cache_write")),
+            "short_cache_write_5m": row.get("short_cache_write_5m", row.get("cache_write_5m", row.get("cache_write"))),
+            "short_cache_write_1h": row.get("short_cache_write_1h", row.get("cache_write_1h", row.get("cache_write"))),
+            "short_output": row.get("short_output", row.get("output")),
+            "short_reasoning": row.get("short_reasoning", row.get("reasoning")),
+            "long_input": row.get("long_input", row.get("input")),
+            "long_cache_read": row.get("long_cache_read", row.get("cache_read")),
+            "long_cache_write": row.get("long_cache_write", row.get("cache_write")),
+            "long_cache_write_5m": row.get("long_cache_write_5m", row.get("cache_write_5m", row.get("cache_write"))),
+            "long_cache_write_1h": row.get("long_cache_write_1h", row.get("cache_write_1h", row.get("cache_write"))),
+            "long_output": row.get("long_output", row.get("output")),
+            "long_reasoning": row.get("long_reasoning", row.get("reasoning")),
+        }
+        for row in _SEED_COSTS
+        if _canonical(row["model"]) not in deleted
+    ]
     connection.executemany(
         """INSERT OR IGNORE INTO model_costs
-        (model, vendor, input, cache_read, cache_write, output, reasoning)
-        VALUES (:model, :vendor, :input, :cache_read, :cache_write, :output, :reasoning)""",
+        (model, vendor, input, cache_read, cache_write, cache_write_5m, cache_write_1h, output, reasoning,
+         context_threshold,
+         short_input, short_cache_read, short_cache_write, short_cache_write_5m, short_cache_write_1h, short_output, short_reasoning,
+         long_input, long_cache_read, long_cache_write, long_cache_write_5m, long_cache_write_1h, long_output, long_reasoning)
+        VALUES (:model, :vendor, :input, :cache_read, :cache_write, :cache_write_5m, :cache_write_1h, :output, :reasoning,
+            :context_threshold,
+            :short_input, :short_cache_read, :short_cache_write, :short_cache_write_5m, :short_cache_write_1h, :short_output, :short_reasoning,
+            :long_input, :long_cache_read, :long_cache_write, :long_cache_write_5m, :long_cache_write_1h, :long_output, :long_reasoning)""",
+        bundled_costs,
+    )
+    connection.executemany(
+        """UPDATE model_costs SET input = :input, cache_read = :cache_read,
+            cache_write = :cache_write, cache_write_5m = :cache_write_5m,
+            cache_write_1h = :cache_write_1h, output = :output, reasoning = :reasoning,
+            short_input = :short_input, short_cache_read = :short_cache_read,
+            short_cache_write = :short_cache_write, short_cache_write_5m = :short_cache_write_5m,
+            short_cache_write_1h = :short_cache_write_1h, short_output = :short_output,
+            short_reasoning = :short_reasoning, long_input = :long_input,
+            long_cache_read = :long_cache_read, long_cache_write = :long_cache_write,
+            long_cache_write_5m = :long_cache_write_5m, long_cache_write_1h = :long_cache_write_1h,
+            long_output = :long_output, long_reasoning = :long_reasoning
+            WHERE model = :model AND short_input = input AND long_input = input
+            AND short_output = output AND long_output = output""",
         bundled_costs,
     )
     connection.execute(
-        "INSERT OR REPLACE INTO tracker_metadata (key, value) VALUES ('model_costs_json_seeded', '1')"
+        "INSERT OR REPLACE INTO tracker_metadata (key, value) "
+        "VALUES ('model_costs_seeded', '1')"
     )
-
 
 def load_model_costs(path: Path | None = None) -> list[dict[str, object]]:
     """Load database-backed model prices in USD per million tokens."""
     try:
         with connect_database(path or mapping_config_path()) as connection, connection:
             _initialize_cost_tables(connection)
+            model_costs_migration.migration_001_model_costs(connection, _SEED_COSTS)
             _seed_model_costs(connection, path or mapping_config_path())
             rows = connection.execute(
-                "SELECT vendor, model, input, cache_read, cache_write, output, reasoning FROM model_costs ORDER BY vendor COLLATE NOCASE, model COLLATE NOCASE"
+                "SELECT vendor, model, input, cache_read, cache_write, cache_write_5m, cache_write_1h, output, reasoning, context_threshold, short_input, short_cache_read, short_cache_write, short_cache_write_5m, short_cache_write_1h, short_output, short_reasoning, long_input, long_cache_read, long_cache_write, long_cache_write_5m, long_cache_write_1h, long_output, long_reasoning FROM model_costs ORDER BY vendor COLLATE NOCASE, model COLLATE NOCASE"
             ).fetchall()
     except (OSError, sqlite3.Error):
         return []
-    keys = ("vendor", "model", "input", "cache_read", "cache_write", "output", "reasoning")
-    return [dict(zip(keys, row)) for row in rows]
+    keys = ("vendor", "model", "input", "cache_read", "cache_write", "cache_write_5m", "cache_write_1h", "output", "reasoning", "context_threshold", "short_input", "short_cache_read", "short_cache_write", "short_cache_write_5m", "short_cache_write_1h", "short_output", "short_reasoning", "long_input", "long_cache_read", "long_cache_write", "long_cache_write_5m", "long_cache_write_1h", "long_output", "long_reasoning")
+    result = [dict(zip(keys, row)) for row in rows]
+    for row in result:
+        tier_keys = ("input", "cache_read", "cache_write", "output", "reasoning")
+        has_tier_difference = any(
+            row.get(f"short_{key}") != row.get(f"long_{key}") for key in tier_keys
+        )
+        if not has_tier_difference:
+            row["context_threshold"] = None
+    return result
 
 
 def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -> Path:
@@ -93,7 +163,7 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
         if not model:
             continue
         row: dict[str, object] = {"vendor": vendor, "model": model}
-        for key in ("input", "cache_read", "cache_write", "output", "reasoning"):
+        for key in ("input", "cache_read", "cache_write", "cache_write_5m", "cache_write_1h", "output", "reasoning", "short_input", "short_cache_read", "short_cache_write", "short_cache_write_5m", "short_cache_write_1h", "short_output", "short_reasoning", "long_input", "long_cache_read", "long_cache_write", "long_cache_write_5m", "long_cache_write_1h", "long_output", "long_reasoning"):
             value = cost.get(key)
             if value in (None, ""):
                 row[key] = None
@@ -105,6 +175,34 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
             if numeric < 0:
                 raise ValueError(f"{model}: {key} cannot be negative")
             row[key] = numeric
+        for key in ("context_threshold",):
+            value = cost.get(key)
+            if value in (None, ""):
+                row[key] = None
+                continue
+            try:
+                row[key] = int(str(value))
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{model}: {key} must be a whole number") from error
+            if row[key] < 0:
+                raise ValueError(f"{model}: {key} cannot be negative")
+        for tier in ("short", "long"):
+            for base_key in ("input", "cache_read", "cache_write", "cache_write_5m", "cache_write_1h", "output", "reasoning"):
+                tier_key = f"{tier}_{base_key}"
+                if row[tier_key] is None:
+                    row[tier_key] = row[base_key]
+        row["input"] = row["input"] if row["input"] is not None else row["short_input"]
+        row["output"] = row["output"] if row["output"] is not None else row["short_output"]
+        row["cache_read"] = row["cache_read"] if row["cache_read"] is not None else row["short_cache_read"]
+        row["cache_write"] = row["cache_write"] if row["cache_write"] is not None else row["short_cache_write"]
+        row["cache_write_5m"] = row["cache_write_5m"] if row["cache_write_5m"] is not None else row["cache_write"]
+        row["cache_write_1h"] = row["cache_write_1h"] if row["cache_write_1h"] is not None else row["cache_write"]
+        row["reasoning"] = row["reasoning"] if row["reasoning"] is not None else row["short_reasoning"]
+        for tier in ("short", "long"):
+            for base_key in ("input", "cache_read", "cache_write", "cache_write_5m", "cache_write_1h", "output", "reasoning"):
+                tier_key = f"{tier}_{base_key}"
+                if row[tier_key] is None:
+                    row[tier_key] = row[base_key]
         if row["input"] is None or row["output"] is None:
             raise ValueError(f"{model}: input and output costs are required")
         cleaned.append(row)
@@ -113,6 +211,7 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
     config_path = path or mapping_config_path()
     with connect_database(config_path) as connection, connection:
         _initialize_cost_tables(connection)
+        model_costs_migration.migration_001_model_costs(connection, _SEED_COSTS)
         existing_models = {
             _canonical(row[0])
             for row in connection.execute("SELECT model FROM model_costs").fetchall()
@@ -127,12 +226,15 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
         connection.execute("DELETE FROM model_costs")
         connection.executemany(
             """INSERT INTO model_costs
-            (vendor, model, input, cache_read, cache_write, output, reasoning)
-            VALUES (:vendor, :model, :input, :cache_read, :cache_write, :output, :reasoning)""",
+            (vendor, model, input, cache_read, cache_write, cache_write_5m, cache_write_1h, output, reasoning,
+             context_threshold, short_input, short_cache_read,
+             short_cache_write, short_cache_write_5m, short_cache_write_1h, short_output, short_reasoning, long_input, long_cache_read,
+             long_cache_write, long_cache_write_5m, long_cache_write_1h, long_output, long_reasoning)
+            VALUES (:vendor, :model, :input, :cache_read, :cache_write, :cache_write_5m, :cache_write_1h, :output, :reasoning,
+                    :context_threshold, :short_input,
+                    :short_cache_read, :short_cache_write, :short_cache_write_5m, :short_cache_write_1h, :short_output, :short_reasoning,
+                    :long_input, :long_cache_read, :long_cache_write, :long_cache_write_5m, :long_cache_write_1h, :long_output, :long_reasoning)""",
             cleaned,
-        )
-        connection.execute(
-            "INSERT OR REPLACE INTO tracker_metadata (key, value) VALUES ('model_costs_json_seeded', '1')"
         )
     _PRICING_COST_CACHE.pop(config_path, None)
     return config_path
@@ -144,32 +246,6 @@ def _pricing_costs() -> list[dict[str, object]]:
     if config_path not in _PRICING_COST_CACHE:
         _PRICING_COST_CACHE[config_path] = load_model_costs(config_path)
     return _PRICING_COST_CACHE[config_path]
-
-
-def _migrate_legacy_mappings(connection: sqlite3.Connection) -> None:
-    """Copy the former JSON mappings exactly once to avoid losing user settings."""
-    migrated = connection.execute(
-        "SELECT 1 FROM tracker_metadata WHERE key = 'model_mappings_json_migrated'"
-    ).fetchone()
-    if migrated:
-        return
-    try:
-        payload = json.loads(_legacy_mapping_path().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        payload = {}
-    mappings = payload.get("mappings") if isinstance(payload, dict) else {}
-    if isinstance(mappings, dict):
-        connection.executemany(
-            "INSERT OR IGNORE INTO model_mappings (deployment, model) VALUES (?, ?)",
-            [
-                (str(deployment).strip(), str(model).strip())
-                for deployment, model in mappings.items()
-                if str(deployment).strip() and str(model).strip()
-            ],
-        )
-    connection.execute(
-        "INSERT INTO tracker_metadata (key, value) VALUES ('model_mappings_json_migrated', '1')"
-    )
 
 
 def _seed_model_mappings(connection: sqlite3.Connection, config_path: Path) -> None:
@@ -197,7 +273,6 @@ def load_model_mappings(path: Path | None = None) -> dict[str, str]:
     try:
         with connect_database(path or mapping_config_path()) as connection, connection:
             _initialize_mapping_tables(connection)
-            _migrate_legacy_mappings(connection)
             _seed_model_mappings(connection, path or mapping_config_path())
             rows = connection.execute(
                 "SELECT deployment, model FROM model_mappings ORDER BY deployment COLLATE NOCASE"
@@ -234,9 +309,6 @@ def save_model_mappings(mappings: dict[str, str], path: Path | None = None) -> P
         connection.executemany(
             "INSERT INTO model_mappings (deployment, model) VALUES (?, ?)",
             sorted(cleaned.items(), key=lambda item: item[0].lower()),
-        )
-        connection.execute(
-            "INSERT OR REPLACE INTO tracker_metadata (key, value) VALUES ('model_mappings_json_migrated', '1')"
         )
         connection.execute(
             "INSERT OR REPLACE INTO tracker_metadata (key, value) VALUES ('model_mapping_json_seeded', '1')"
@@ -281,6 +353,26 @@ def cost_for_tokens(tokens: dict[str, object], model: object, output_includes_re
     return sum(cost_breakdown(tokens, model, output_includes_reasoning).values())
 
 
+def _context_token_count(tokens: dict[str, object]) -> int:
+    """Return the prompt context represented by input and cache token fields."""
+    return sum(
+        value for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens")
+        for value in [tokens.get(key)]
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    )
+
+
+def _tier_price(price: dict[str, Any], tokens: dict[str, object]) -> dict[str, object]:
+    """Select the configured short or long context rate tier."""
+    context_tokens = _context_token_count(tokens)
+    threshold = price.get("context_threshold")
+    tier = "long" if isinstance(threshold, int) and context_tokens >= threshold else "short"
+    tier_keys = ("input", "cache_read", "cache_write", "cache_write_5m", "cache_write_1h", "output", "reasoning")
+    if any(price.get(f"{tier}_{key}") is not None for key in tier_keys):
+        return {key: price.get(f"{tier}_{key}") for key in tier_keys}
+    return price
+
+
 def cost_breakdown(tokens: dict[str, object], model: object, output_includes_reasoning: bool = True) -> dict[str, float]:
     """Return USD cost by normalized token category."""
     if _canonical(model) == "synthetic":
@@ -294,6 +386,7 @@ def cost_breakdown(tokens: dict[str, object], model: object, output_includes_rea
     price = find_model(model)
     if price is None:
         return {}
+    price = _tier_price(price, tokens)
 
     def value(key: str) -> int:
         candidate = tokens.get(key)
@@ -304,10 +397,17 @@ def cost_breakdown(tokens: dict[str, object], model: object, output_includes_rea
     regular_output = max(0, output - reasoning) if output_includes_reasoning else output
     cache_read_price = price["cache_read"] if price["cache_read"] is not None else price["input"]
     cache_write_price = price["cache_write"] if price["cache_write"] is not None else price["input"]
+    cache_write_5m_price = price.get("cache_write_5m") or cache_write_price
+    cache_write_1h_price = price.get("cache_write_1h") or cache_write_price
+    cache_write_5m = value("cacheWrite5mTokens")
+    cache_write_1h = value("cacheWrite1hTokens")
+    cache_write = value("cacheWriteTokens") if not (cache_write_5m or cache_write_1h) else 0
     return {
         "inputTokens": value("inputTokens") * price["input"] / 1_000_000,
         "cacheReadTokens": value("cacheReadTokens") * cache_read_price / 1_000_000,
-        "cacheWriteTokens": value("cacheWriteTokens") * cache_write_price / 1_000_000,
+        "cacheWrite5mTokens": cache_write_5m * cache_write_5m_price / 1_000_000,
+        "cacheWrite1hTokens": cache_write_1h * cache_write_1h_price / 1_000_000,
+        "cacheWriteTokens": cache_write * cache_write_price / 1_000_000,
         "outputTokens": regular_output * price["output"] / 1_000_000,
         "reasoningTokens": reasoning * (price["reasoning"] or price["output"]) / 1_000_000,
     }
@@ -344,6 +444,14 @@ def apply_costs(session: dict) -> dict:
             if isinstance(value, int) and not isinstance(value, bool):
                 target_tokens[key] += value
             target_costs[key] += component_costs.get(key) or 0.0
+        # Detailed Anthropic cache-creation costs are returned separately by
+        # cost_breakdown(), but the normalized cost breakdown keeps the
+        # provider-neutral five-category shape. Roll both TTL-specific costs
+        # into the shared cache-write cost bucket.
+        target_costs["cacheWriteTokens"] += sum(
+            component_costs.get(key) or 0.0
+            for key in CANONICAL_CACHE_WRITE_TOKEN_KEYS
+        )
         return bool(component_costs)
 
     linked_agents: set[int] = set()

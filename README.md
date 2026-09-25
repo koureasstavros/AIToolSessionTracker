@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "tracker", "llm", "slm", "model", "session", "turn", "invocation", "agents", "tools", "context"]
 license: "apache-2.0"
-version: v0.0.38
+version: v0.0.39
 ---
 
 # AI Tool Session Tracker
@@ -429,7 +429,9 @@ The adapters extract the public model identifier from transcript fields such as
 deployment/display aliases are only used when no model identifier is available.
 Pricing is stored locally in `src/common/model_costs.json` as USD per one million
 tokens. The calculated cost uses uncached input, cache-read input,
-cache-write input, regular output, and output reasoning tokens. Reasoning tokens
+cache-write input, regular output, and output reasoning tokens. Claude cache
+creation usage is split into 5-minute and 1-hour input-cache writes, priced at
+the corresponding Anthropic rates. Reasoning tokens
 are included in output totals but are charged at the separate reasoning rate,
 so they are not counted twice. A model absent from the table displays an
 unavailable cost instead of guessing a rate.

@@ -35,6 +35,18 @@ from src.providers import cognition_devin_local_provider
 from src.providers import google_antigravity_local_provider
 from src.providers import m365_copilot_local_provider
 
+CANONICAL_CACHE_WRITE_TOKEN_KEYS = (
+    "cacheWrite5mTokens",
+    "cacheWrite1hTokens",
+)
+CANONICAL_TOKEN_KEYS = (
+    "inputTokens",
+    "cacheReadTokens",
+    "cacheWriteTokens",
+    *CANONICAL_CACHE_WRITE_TOKEN_KEYS,
+    "outputTokens",
+    "reasoningTokens",
+)
 TOKEN_KEYS = (
     "inputTokens",
     "cacheReadTokens",
@@ -301,13 +313,6 @@ def acquire_instance_mutex() -> bool:
     return True
 
 
-TOKEN_ALIASES = {
-    "inputTokens": ("input_tokens", "prompt_tokens", "promptTokens", "inputTokens"),
-    "cacheReadTokens": ("cached_tokens", "cachedTokens", "input_cached_tokens", "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"),
-    "cacheWriteTokens": ("cache_write_input_tokens", "input_cache_write_tokens", "cache_creation_input_tokens", "cacheWriteTokens"),
-    "outputTokens": ("output_tokens", "completion_tokens", "outputTokens"),
-    "reasoningTokens": ("reasoning_output_tokens", "reasoning_tokens", "thinking_tokens", "thinkingTokens", "reasoningTokens"),
-}
 class SessionData(TypedDict, total=False):
     """Provider-neutral conversation contract returned to the UI layer."""
 
@@ -333,13 +338,19 @@ class SessionData(TypedDict, total=False):
 def normalize_session_data(value: dict) -> SessionData:
     """Ensure every provider returns the same conversation shape."""
     tokens = blank_tokens()
+    detailed_cache_tokens = {
+        key: None for key in CANONICAL_CACHE_WRITE_TOKEN_KEYS
+    }
     supplied_tokens = value.get("tokens")
     supplied_token_keys = set(supplied_tokens) if isinstance(supplied_tokens, dict) else set()
     if isinstance(supplied_tokens, dict):
-        for key in TOKEN_KEYS:
+        for key in CANONICAL_TOKEN_KEYS:
             candidate = supplied_tokens.get(key)
             if isinstance(candidate, int) and not isinstance(candidate, bool):
-                tokens[key] = candidate
+                if key in detailed_cache_tokens:
+                    detailed_cache_tokens[key] = candidate
+                else:
+                    tokens[key] = candidate
     result: SessionData = {
         "id": str(value.get("id", "")),
         "name": str(value.get("name") or value.get("id", "")),
@@ -352,6 +363,10 @@ def normalize_session_data(value: dict) -> SessionData:
         "project": value.get("project") if isinstance(value.get("project"), str) else None,
         "live": bool(value.get("live", False)),
     }
+    if any(detailed_cache_tokens[key] is not None for key in CANONICAL_CACHE_WRITE_TOKEN_KEYS):
+        result["tokens"] = dict(tokens)
+        for key, candidate in detailed_cache_tokens.items():
+            result["tokens"][key] = candidate
     result["costUsd"] = value.get("costUsd") if isinstance(value.get("costUsd"), (int, float)) else None
     result["pricingModel"] = value.get("pricingModel") if isinstance(value.get("pricingModel"), str) else None
     provider = value.get("provider") if isinstance(value.get("provider"), str) else ""
@@ -370,7 +385,16 @@ def normalize_session_data(value: dict) -> SessionData:
         if missing_output and "uncategorizedOutput" not in flags:
             flags.append("uncategorizedOutput")
     result["tokenFlags"] = flags
-    result["tokenFields"] = [key for key in TOKEN_KEYS if key in supplied_fields] if has_supplied_fields else list(TOKEN_KEYS if isinstance(supplied_tokens, dict) else [])
+    normalized_token_fields = [key for key in TOKEN_KEYS if key in supplied_fields] if has_supplied_fields else list(TOKEN_KEYS if isinstance(supplied_tokens, dict) else [])
+    if has_supplied_fields:
+        normalized_token_fields.extend(
+            key for key in CANONICAL_CACHE_WRITE_TOKEN_KEYS if key in supplied_fields
+        )
+    elif isinstance(supplied_tokens, dict):
+        normalized_token_fields.extend(
+            key for key in CANONICAL_CACHE_WRITE_TOKEN_KEYS if key in supplied_tokens
+        )
+    result["tokenFields"] = normalized_token_fields
     for key in ("source", "_source", "_sources", "_kind", "_source_label", "_surface", "_session_id", "_db_metadata", "_db_issue", "_has_data", "_devin_session", "_devin_session_id", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation", "outputTokensExcludeReasoning"):
         if key in value:
             result[key] = value[key]
@@ -697,38 +721,25 @@ def subtract_cached_input(session: dict) -> None:
 
 
 def usage_from(source: object) -> dict[str, int | None]:
+    """Normalize an already provider-normalized usage mapping."""
     if not isinstance(source, dict):
         return blank_tokens()
-    # Claude may put cache creation and reasoning details in nested usage
-    # objects. Normalize those fields before applying the provider aliases.
-    normalized = dict(source)
-    cache_creation = source.get("cache_creation")
-    if isinstance(cache_creation, dict) and "cache_creation_input_tokens" not in normalized:
-        normalized["cache_creation_input_tokens"] = cache_creation.get("input_tokens")
-    output_details = source.get("output_tokens_details")
-    if isinstance(output_details, dict) and not any(alias in normalized for alias in TOKEN_ALIASES["reasoningTokens"]):
-        for alias in TOKEN_ALIASES["reasoningTokens"]:
-            if alias in output_details:
-                normalized[alias] = output_details[alias]
-                break
     result = blank_tokens()
-    for key, aliases in TOKEN_ALIASES.items():
-        result[key] = next(
-            (value for name in aliases if (value := number(normalized.get(name))) is not None),
-            None,
-        )
+    result.update({key: None for key in CANONICAL_CACHE_WRITE_TOKEN_KEYS})
+    for key in CANONICAL_TOKEN_KEYS:
+        result[key] = number(source.get(key))
+    detailed_cache_write = (result["cacheWrite5mTokens"] or 0) + (result["cacheWrite1hTokens"] or 0)
+    if detailed_cache_write:
+        result["cacheWriteTokens"] = detailed_cache_write
     return result
 
 
 def token_fields_from_sources(*sources: object) -> list[str]:
     """Return canonical token categories whose source fields are present."""
-    fields = []
-    dictionaries = [source for source in sources if isinstance(source, dict)]
-    for key, aliases in TOKEN_ALIASES.items():
-        nested = [source.get("output_tokens_details") for source in dictionaries if isinstance(source.get("output_tokens_details"), dict)]
-        if any(alias in source for source in dictionaries for alias in aliases) or any(alias in source for source in nested for alias in aliases):
-            fields.append(key)
-    return fields
+    return [
+        key for key in CANONICAL_TOKEN_KEYS
+        if any(isinstance(source, dict) and key in source for source in sources)
+    ]
 
 
 def safe_json_lines(path: Path) -> list[dict]:
@@ -1066,7 +1077,7 @@ def parse_session(folder: Path) -> dict:
                     session["model"] = session["model"] or str(model_name)
                     usage = model.get("usage") or {}
                     if isinstance(usage, dict):
-                        for key, value in usage_from(usage).items():
+                        for key, value in github_copilot_local_provider.usage_from(usage).items():
                             if value is not None:
                                 session["tokens"][key] = (session["tokens"][key] or 0) + value
 
@@ -1209,8 +1220,7 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
                 summary["_has_data"] = any(
                     isinstance(request, dict)
                     and (isinstance(request.get("message"), dict) and request["message"].get("text")
-                        or request.get("promptTokens") is not None
-                        or request.get("completionTokens") is not None
+                        or github_copilot_local_provider.has_usage(request)
                          or any(isinstance(item, dict) and item.get("value") for item in (request.get("response") or [])))
                     for request in requests
                 )
@@ -1225,9 +1235,7 @@ def session_summary(path: Path, provider: str, kind: str) -> dict:
                     key = record.get("k")
                     value = record.get("v")
                     has_usage = (
-                        key[2] in {"promptTokens", "completionTokens", "inputTokens", "outputTokens", "reasoningTokens"}
-                        and isinstance(value, (int, float))
-                        and not isinstance(value, bool)
+                        github_copilot_local_provider.has_usage({str(key[2]): value})
                         if isinstance(key, list) and len(key) >= 3 else False
                     )
                     has_message = (key[2] == "message" and isinstance(value, dict) and value.get("text")
@@ -1354,7 +1362,8 @@ def parse_export_session(path: Path, provider: str) -> dict:
             info = {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or info.get("last_token_usage") or {}
         if isinstance(usage, dict):
-            usage_fields = token_fields_from_sources(usage)
+            usage_adapter = anthropic_claude_local_provider if provider == "claude" else None
+            usage_fields = usage_adapter.token_fields_from_sources(usage) if usage_adapter else token_fields_from_sources(usage)
             turn.setdefault("tokenFields", [])
             turn["tokenFields"] = list(set(turn["tokenFields"]) | set(usage_fields))
             # Claude Code may persist one assistant API response as separate
@@ -1367,7 +1376,8 @@ def parse_export_session(path: Path, provider: str) -> dict:
             if usage_id is None or str(usage_id) not in seen_usage_records:
                 if usage_id is not None:
                     seen_usage_records.add(str(usage_id))
-                for key, value in usage_from(usage).items():
+                usage_values = usage_adapter.usage_from(usage) if usage_adapter else usage_from(usage)
+                for key, value in usage_values.items():
                     if value is not None:
                         turn["tokens"][key] = (turn["tokens"][key] or 0) + value
     session["turns"] = list(turns.values())
@@ -1785,8 +1795,17 @@ def displayed_token_value(tokens: dict[str, int | None], key: str) -> int | None
     return max(0, value - reasoning)
 
 
+def display_token_costs(costs: dict[str, float]) -> dict[str, float]:
+    """Fold detailed cache-write prices into the visible cache-write card."""
+    normalized = dict(costs)
+    normalized["cacheWriteTokens"] = (
+        normalized.get("cacheWriteTokens") or 0.0
+    ) + sum(normalized.get(key) or 0.0 for key in CANONICAL_CACHE_WRITE_TOKEN_KEYS)
+    return normalized
+
+
 def token_cards(tokens: dict[str, int | None], model: str | None = None, extra_class: str = "", costs: dict[str, float] | None = None, token_flags: list[str] | None = None) -> str:
-    costs = costs if costs is not None else pricing.cost_breakdown(tokens, model)
+    costs = display_token_costs(costs if costs is not None else pricing.cost_breakdown(tokens, model))
     return "".join(
         f'<div class="metric {extra_class}" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}{token_warning_markup(token_flags, key)}</span><strong>{fmt(displayed_token_value(tokens, key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
         for key in TOKEN_KEYS
@@ -1795,7 +1814,7 @@ def token_cards(tokens: dict[str, int | None], model: str | None = None, extra_c
 
 def invocation_token_cards(tokens: dict[str, int | None], model: str | None = None, token_flags: list[str] | None = None, costs: dict[str, float] | None = None) -> str:
     """Render per-invocation usage grouped by the side of the model exchange."""
-    costs = costs if costs is not None else pricing.cost_breakdown(tokens, model)
+    costs = display_token_costs(costs if costs is not None else pricing.cost_breakdown(tokens, model))
     def cards(keys: tuple[str, ...]) -> str:
         return "".join(
             f'<div class="metric compact" data-metric="{esc(key)}"><span>{esc(TOKEN_LABELS[key])}{token_warning_markup(token_flags, key)}</span><strong>{fmt(displayed_token_value(tokens, key))} / {fmt_cost(costs.get(key) if tokens.get(key) is not None else None)}</strong></div>'
@@ -1825,6 +1844,10 @@ def invocation_rollup(invocation: dict) -> tuple[dict[str, int | None], dict[str
             if isinstance(value, int) and not isinstance(value, bool):
                 totals[key] = (totals[key] or 0) + value
             costs[key] += token_costs.get(key) or 0.0
+        costs["cacheWriteTokens"] += sum(
+            token_costs.get(key) or 0.0
+            for key in CANONICAL_CACHE_WRITE_TOKEN_KEYS
+        )
 
     add_usage(parent_tokens, invocation.get("model"))
     agent_count = 0
@@ -1910,6 +1933,10 @@ def model_usage_breakdown(session: dict, dimension: str = "model") -> list[dict]
             accounted[key] += value
             if local is not None:
                 local[key] += value
+        row["costs"]["cacheWriteTokens"] += sum(
+            token_costs.get(key) or 0.0
+            for key in CANONICAL_CACHE_WRITE_TOKEN_KEYS
+        )
 
     def add_agent(agent: object, local: dict[str, int] | None = None) -> None:
         if not isinstance(agent, dict) or id(agent) in seen_agents:
@@ -2118,6 +2145,20 @@ def best_practices_findings(session: dict) -> list[dict[str, object]]:
                     "Session gap exceeded 5 minutes",
                     f"The next turn started after {minutes:.0f} minutes; continue sooner to improve cache reuse.",
                 )
+            previous_cache_write_1h = previous_turn.get("tokens", {}).get("cacheWrite1hTokens")
+            if (
+                isinstance(previous_cache_write_1h, int)
+                and not isinstance(previous_cache_write_1h, bool)
+                and previous_cache_write_1h > 0
+                and previous_time
+                and current_time - previous_time > 3600
+            ):
+                hours = (current_time - previous_time) / 3600
+                add_finding(
+                    "cache_ttl",
+                    "1-hour prompt cache expired",
+                    f"The next turn started after {hours:.1f} hours; the previous 1-hour prompt cache may no longer be reusable.",
+                )
         previous_turn = turn
         previous_time = current_time
         if current_context is not None:
@@ -2134,6 +2175,7 @@ def best_practices_markup(session: dict) -> str:
         "effort": "Reasoning effort stability",
         "context": "Internal context stability",
         "idle": "Session timing",
+        "cache_ttl": "Cache TTL stability",
     }
     for finding in findings:
         cost = finding.get("cost")
@@ -2563,54 +2605,112 @@ def render_model_costs_page() -> str:
         value = row.get(key)
         return "" if value is None else f"{float(value):g}"
 
+    def rate_cells(row: dict[str, object], tier: str) -> str:
+        """Render rate cells, merging equal 5m/1h cache rates."""
+        keys = ("input", "cache_read", "cache_write", "output", "reasoning")
+        cells = ''.join(
+            f'<td><input name="cost_{tier}_{key}" type="number" min="0" step="any" value="{esc(field_value(row, f"{tier}_{key}"), quote=True)}" placeholder="{esc(field_value(row, key), quote=True)}"{" required" if key in {"input", "output"} else ""}></td>'
+            for key in keys
+        )
+        cache_5m = field_value(row, f"{tier}_cache_write_5m")
+        cache_1h = field_value(row, f"{tier}_cache_write_1h")
+        if cache_5m == cache_1h:
+            merged = (
+                f'<td colspan="2" class="cache-write-merged">'
+                f'<input name="cost_{tier}_cache_write_5m" type="number" min="0" step="any" value="{esc(cache_5m, quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}">'
+                f'<input name="cost_{tier}_cache_write_1h" type="hidden" value="{esc(cache_1h, quote=True)}">'
+                '</td>'
+            )
+        else:
+            merged = (
+                f'<td><input name="cost_{tier}_cache_write_5m" type="number" min="0" step="any" value="{esc(cache_5m, quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}"></td>'
+                f'<td><input name="cost_{tier}_cache_write_1h" type="number" min="0" step="any" value="{esc(cache_1h, quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}"></td>'
+            )
+        return cells.replace(
+            f'<td><input name="cost_{tier}_cache_write" type="number" min="0" step="any" value="{esc(field_value(row, f"{tier}_cache_write"), quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}"></td>',
+            f'<td><input name="cost_{tier}_cache_write" type="number" min="0" step="any" value="{esc(field_value(row, f"{tier}_cache_write"), quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}"></td>' + merged,
+        )
+
     def row_markup(row: dict[str, object] | None = None) -> str:
         row = row or {}
-        return (
-            '<tr class="cost-row">'
-            f'<td><input name="cost_vendor" value="{esc(str(row.get("vendor") or "Custom"), quote=True)}" placeholder="Vendor" required></td>'
-            f'<td><input name="cost_model" value="{esc(str(row.get("model") or ""), quote=True)}" placeholder="Model ID" required></td>'
-            + "".join(
-                f'<td><input name="cost_{key}" type="number" min="0" step="any" value="{esc(field_value(row, key), quote=True)}" placeholder="—"{" required" if key in {"input", "output"} else ""}></td>'
-                for key in ("input", "cache_read", "cache_write", "output", "reasoning")
+        if row.get("context_threshold") is None:
+            rates = rate_cells(row, "short")
+            long_rates = rate_cells(row, "long")
+            return (
+                '<tr class="cost-row cost-single-row">'
+                f'<td><input name="cost_vendor" value="{esc(str(row.get("vendor") or "Custom"), quote=True)}" placeholder="Vendor" required></td>'
+                f'<td><input name="cost_model" value="{esc(str(row.get("model") or ""), quote=True)}" placeholder="Model ID" required></td>'
+                '<td><input name="cost_context_threshold" type="number" min="0" step="1" value="" placeholder="Optional"></td>' + rates
+                + '<td><button type="button" class="mapping-remove cost-remove" aria-label="Remove model cost">×</button></td></tr>'
+                + '<tr class="cost-row cost-long-editor" hidden><td class="cost-tier-label" style="display:none">Long context</td><td style="display:none"></td><td style="display:none"></td>' + long_rates + '<td style="display:none"></td></tr>'
             )
-            + '<td><button type="button" class="mapping-remove cost-remove" aria-label="Remove model cost">×</button></td></tr>'
+        metadata = (
+            f'<td rowspan="2"><input name="cost_vendor" value="{esc(str(row.get("vendor") or "Custom"), quote=True)}" placeholder="Vendor" required></td>'
+            f'<td rowspan="2"><input name="cost_model" value="{esc(str(row.get("model") or ""), quote=True)}" placeholder="Model ID" required></td>'
+            + f'<td rowspan="2"><input name="cost_context_threshold" type="number" min="0" step="1" value="{esc(field_value(row, "context_threshold"), quote=True)}" placeholder="272001" required></td>'
         )
+        tiers = []
+        for tier, label in (("short", "Short context"), ("long", "Long context")):
+            rates = rate_cells(row, tier)
+            tiers.append(
+                f'<tr class="cost-row cost-tier-row">{metadata if tier == "short" else ""}{rates}'
+                + ('<td rowspan="2"><button type="button" class="mapping-remove cost-remove" aria-label="Remove model cost">×</button></td>' if tier == "short" else '')
+                + '</tr>'
+            )
+        return ''.join(tiers)
 
     rows = "".join(row_markup(row) for row in pricing.load_model_costs()) or row_markup()
     script = """<script>(function(){
         var body=document.getElementById('cost-rows'),add=document.getElementById('cost-add');
         if(!body||!add)return;
         add.addEventListener('click',function(){
-            var row=body.querySelector('.cost-row'),clone=row.cloneNode(true);
-            clone.querySelectorAll('input').forEach(function(input){
-                input.value=input.name==='cost_vendor'?'Custom':'';
-            });
-            body.appendChild(clone);
+            var rows=Array.from(body.querySelectorAll('.cost-row')),group=rows.slice(0,2);
+            if(group.length<2)return;
+            var clones=group.map(function(row){return row.cloneNode(true);});
+            clones.forEach(function(row){row.querySelectorAll('input').forEach(function(input){input.value=input.name==='cost_vendor'?'Custom':'';});body.appendChild(row);});
+        });
+        body.addEventListener('input',function(event){
+            if(!event.target.matches('input[name="cost_context_threshold"]'))return;
+            var first=event.target.closest('.cost-row');
+            if(!first||first.classList.contains('cost-long-editor'))return;
+            var editor=first.nextElementSibling;
+            if(editor){
+                editor.hidden=!event.target.value;
+                var merged=Boolean(event.target.value);
+                first.classList.toggle('cost-single-row',!merged);
+                first.classList.toggle('cost-tier-row',merged);
+                Array.from(first.children).forEach(function(cell,index){
+                    if(index<3||index===first.children.length-1){
+                        if(merged)cell.rowSpan=2;else cell.removeAttribute('rowspan');
+                    }
+                });
+                editor.querySelectorAll('input').forEach(function(input){
+                    if(/_(input|output)$/.test(input.name))input.required=Boolean(event.target.value);
+                });
+            }
         });
         body.addEventListener('click',function(event){
             var remove=event.target.closest('.cost-remove');
             if(!remove)return;
-            var row=remove.closest('.cost-row'),rows=body.querySelectorAll('.cost-row');
-            if(rows.length>1){row.remove();return;}
-            row.querySelectorAll('input').forEach(function(input){
-                input.value=input.name==='cost_vendor'?'Custom':'';
-            });
+            var row=remove.closest('.cost-row'),group=row.classList.contains('cost-long-editor')?[row.previousElementSibling,row]:[row,row.nextElementSibling].filter(Boolean),rows=body.querySelectorAll('.cost-row');
+            if(rows.length>2){group.forEach(function(item){item.remove();});return;}
+            group.forEach(function(item){item.querySelectorAll('input').forEach(function(input){input.value=input.name==='cost_vendor'?'Custom':'';});});
         });
     })();</script>"""
     return (
         '<main class="detail settings-page"><style>'
         '.cost-table-wrap{max-height:55vh;overflow:auto;border:1px solid var(--line);border-radius:9px}'
-        '.cost-table{width:100%;min-width:960px;border-collapse:collapse;background:#101a2a}'
+        '.cost-table{width:100%;min-width:1180px;border-collapse:collapse;background:#101a2a}'
         '.cost-table th,.cost-table td{padding:8px;border-bottom:1px solid var(--line);text-align:left;font-size:11px}'
         '.cost-table th{position:sticky;top:0;background:#162338;color:#9bb1cc;font-size:9px;letter-spacing:.06em;text-transform:uppercase}'
         '.cost-table input{width:100%;min-width:74px;box-sizing:border-box;border:1px solid #31435f;border-radius:6px;background:#0c1627;color:#dbe9ff;padding:7px}'
-        '.cost-table td:nth-child(1) input,.cost-table td:nth-child(2) input{min-width:130px}.cost-table td:last-child{width:36px}'
+        '.cost-table td:nth-child(1) input,.cost-table td:nth-child(2) input{min-width:130px}.cost-table td:last-child{width:36px}.cost-model-row td{border-bottom:0}.cost-tier-row td{border-bottom:1px solid var(--line)}.cost-tier-label{color:#9bb1cc;font-size:10px!important;font-weight:600;white-space:nowrap}'
         '</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div>'
         '<h1>Model costs</h1><p class="settings-intro">Manage rates in USD per one million tokens. The bundled <code>model_costs.json</code> catalog is copied to <code>'
         + esc(pricing.mapping_config_path()) + '</code> the first time the app opens; later changes are stored only in the database.</p></div>'
         + '<div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>' + exit_action() + '</div></header>'
         + '<section class="settings-card"><div class="section-heading"><div><span class="section-kicker">COST CATALOG</span><h2>Model ID to Token Rates</h2></div><span class="muted">Blank cache or reasoning rates are treated as unavailable</span></div>'
-        + '<form method="post" action="/settings"><input type="hidden" name="settings_action" value="model-costs"><div class="cost-table-wrap"><table class="cost-table"><thead><tr><th>Vendor</th><th>Model</th><th>Input tokens</th><th>Input cache read tokens</th><th>Input cache write tokens</th><th>Output tokens</th><th>Output reasoning tokens</th><th></th></tr></thead><tbody id="cost-rows">'
+        + '<form method="post" action="/settings"><input type="hidden" name="settings_action" value="model-costs"><div class="cost-table-wrap"><table class="cost-table"><thead><tr><th>Vendor</th><th>Model</th><th>Context threshold</th><th>Input / 1M</th><th>Cache read / 1M</th><th>Cache write (legacy) / 1M</th><th>Cache write 5m / 1M</th><th>Cache write 1h / 1M</th><th>Output / 1M</th><th>Reasoning / 1M</th><th></th></tr></thead><tbody id="cost-rows">'
         + rows + '</tbody></table></div><div class="settings-actions"><button type="button" class="settings-secondary" id="cost-add">Add model</button><button type="submit" class="settings-primary">Save costs</button></div></form>'
         + script + '</section></main>'
     )
@@ -2916,7 +3016,7 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/settings":
             form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
             if form.get("settings_action", [""])[0] == "model-costs":
-                fields = ("vendor", "model", "input", "cache_read", "cache_write", "output", "reasoning")
+                fields = ("vendor", "model", "context_threshold", "short_input", "short_cache_read", "short_cache_write", "short_cache_write_5m", "short_cache_write_1h", "short_output", "short_reasoning", "long_input", "long_cache_read", "long_cache_write", "long_cache_write_5m", "long_cache_write_1h", "long_output", "long_reasoning")
                 values = {field: form.get(f"cost_{field}", []) for field in fields}
                 row_count = max((len(items) for items in values.values()), default=0)
                 costs = [

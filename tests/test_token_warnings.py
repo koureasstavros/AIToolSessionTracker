@@ -1,6 +1,6 @@
 import unittest
 
-from session_token_viewer import normalize_session_data, token_cards, token_warning, turn_timestamp, usage_from
+from session_token_viewer import best_practices_findings, normalize_session_data, token_cards, token_warning, turn_timestamp, usage_from
 
 
 class TokenWarningTests(unittest.TestCase):
@@ -18,10 +18,9 @@ class TokenWarningTests(unittest.TestCase):
         self.assertGreater(turn_timestamp({"raw": ['{"timestamp":"2026-09-10T12:00:00Z"}']}), 0)
         self.assertEqual(turn_timestamp({"timestamp": 1_000_000_000_000}), 1_000_000_000)
 
-    def test_thinking_tokens_are_normalized_as_reasoning_tokens(self) -> None:
-        self.assertEqual(usage_from({"thinking_tokens": 17})["reasoningTokens"], 17)
-        self.assertEqual(usage_from({"thinkingTokens": 19})["reasoningTokens"], 19)
-        self.assertEqual(usage_from({"output_tokens_details": {"thinking_tokens": 0}})["reasoningTokens"], 0)
+    def test_canonical_reasoning_tokens_are_preserved(self) -> None:
+        self.assertEqual(usage_from({"reasoningTokens": 17})["reasoningTokens"], 17)
+        self.assertEqual(usage_from({"reasoningTokens": 0})["reasoningTokens"], 0)
 
     def test_antigravity_marks_session_turn_and_invocation_estimated(self) -> None:
         session = normalize_session_data({
@@ -99,6 +98,90 @@ class TokenWarningTests(unittest.TestCase):
 
         self.assertIn("865 /", markup)
         self.assertNotIn("1,412 /", markup)
+
+    def test_cache_ttl_costs_are_shown_in_the_cache_write_card(self) -> None:
+        markup = token_cards(
+            {
+                "cacheWriteTokens": 2_000_000,
+                "cacheWrite5mTokens": 1_000_000,
+                "cacheWrite1hTokens": 1_000_000,
+            },
+            "claude-haiku-4-5",
+        )
+
+        self.assertIn("3.25", markup)
+
+    def test_claude_warns_when_one_hour_cache_ttl_has_expired(self) -> None:
+        session = {
+            "provider": "claude",
+            "model": "claude-sonnet-4-5",
+            "turns": [
+                {
+                    "model": "claude-sonnet-4-5",
+                    "timestamp": "2026-09-25T10:00:00Z",
+                    "tokens": {"cacheWrite1hTokens": 100},
+                    "invocations": [],
+                },
+                {
+                    "model": "claude-sonnet-4-5",
+                    "timestamp": "2026-09-25T11:00:01Z",
+                    "tokens": {"inputTokens": 100, "cacheReadTokens": 0},
+                    "invocations": [],
+                },
+            ],
+        }
+
+        findings = best_practices_findings(session)
+
+        self.assertTrue(any(finding["kind"] == "cache_ttl" for finding in findings))
+
+    def test_claude_does_not_warn_before_one_hour_cache_ttl(self) -> None:
+        session = {
+            "provider": "claude",
+            "model": "claude-sonnet-4-5",
+            "turns": [
+                {
+                    "model": "claude-sonnet-4-5",
+                    "timestamp": "2026-09-25T10:00:00Z",
+                    "tokens": {"cacheWrite1hTokens": 100},
+                    "invocations": [],
+                },
+                {
+                    "model": "claude-sonnet-4-5",
+                    "timestamp": "2026-09-25T10:59:59Z",
+                    "tokens": {"inputTokens": 100, "cacheReadTokens": 0},
+                    "invocations": [],
+                },
+            ],
+        }
+
+        findings = best_practices_findings(session)
+
+        self.assertFalse(any(finding["kind"] == "cache_ttl" for finding in findings))
+
+    def test_api_cache_ttl_data_warns_after_one_hour_for_github_route(self) -> None:
+        session = {
+            "provider": "copilot",
+            "model": "provider-model-123",
+            "turns": [
+                {
+                    "model": "provider-model-123",
+                    "timestamp": "2026-09-25T10:00:00Z",
+                    "tokens": {"cacheWrite1hTokens": 100},
+                    "invocations": [],
+                },
+                {
+                    "model": "anthropic/claude-sonnet-4-5",
+                    "timestamp": "2026-09-25T11:00:01Z",
+                    "tokens": {"inputTokens": 100, "cacheReadTokens": 0},
+                    "invocations": [],
+                },
+            ],
+        }
+
+        findings = best_practices_findings(session)
+
+        self.assertTrue(any(finding["kind"] == "cache_ttl" for finding in findings))
 
 
 if __name__ == "__main__":

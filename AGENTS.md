@@ -32,6 +32,12 @@ Recent commits use short, task-focused summaries such as `Fixing and testing imp
 
 The app reads sensitive local transcripts and must remain local-only. Do not add telemetry, cloud uploads, or sample session data containing real prompts, paths, tool results, or secrets. Preserve archive path-traversal validation and treat deletion behavior as destructive and irreversible.
 
+## Database Schema Changes
+
+Do not add runtime column-reordering/renaming or one-off schema-reordering/renaming migrations to source files while doing changes. Apply column-order/name changes directly to the local SQLite database with a one-time script, then keep only the final schema definition in source code. Migration state for that direct database change should remain documented in code comments or repository guidance, not persisted as an additional database marker.
+
+Database and data migrations belong in dedicated modules under the sibling `src/migrations/` package. Filenames must end with `_migration.py`. Number every migration explicitly (for example, `MIGRATION_001` and `migration_001_*`) and keep migration execution calls in the owning feature module.
+
 ## Session Scanning and Empty Sessions
 
 Keep the initial sidebar scan lightweight. Provider indexes should return basic

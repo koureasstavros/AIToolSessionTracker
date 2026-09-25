@@ -12,6 +12,45 @@ def _viewer():
     return viewer
 
 
+TOKEN_ALIASES = {
+    "inputTokens": ("input_tokens", "prompt_tokens", "promptTokens", "inputTokens"),
+    "cacheReadTokens": ("cached_tokens", "cachedTokens", "input_cached_tokens", "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"),
+    "cacheWriteTokens": ("cache_write_input_tokens", "input_cache_write_tokens", "cache_creation_input_tokens", "cacheWriteTokens"),
+    "outputTokens": ("output_tokens", "completion_tokens", "outputTokens"),
+    "reasoningTokens": ("reasoning_output_tokens", "reasoning_tokens", "thinking_tokens", "thinkingTokens", "reasoningTokens"),
+}
+
+
+def normalize_usage(source: dict) -> dict:
+    """Normalize Claude usage aliases to the viewer's canonical fields."""
+    normalized = {}
+    for key, aliases in TOKEN_ALIASES.items():
+        for alias in aliases:
+            if alias in source:
+                normalized[key] = source[alias]
+                break
+    output_details = source.get("output_tokens_details")
+    if isinstance(output_details, dict) and "reasoningTokens" not in normalized:
+        for alias in TOKEN_ALIASES["reasoningTokens"]:
+            if alias in output_details:
+                normalized["reasoningTokens"] = output_details[alias]
+                break
+    cache_creation = source.get("cache_creation")
+    if isinstance(cache_creation, dict):
+        normalized["cacheWrite5mTokens"] = cache_creation.get("ephemeral_5m_input_tokens")
+        normalized["cacheWrite1hTokens"] = cache_creation.get("ephemeral_1h_input_tokens")
+        normalized.setdefault("cacheWriteTokens", cache_creation.get("input_tokens"))
+    return normalized
+
+
+def usage_from(source: dict) -> dict:
+    return _viewer().usage_from(normalize_usage(source))
+
+
+def token_fields_from_sources(*sources: object) -> list[str]:
+    return _viewer().token_fields_from_sources(*(normalize_usage(source) for source in sources if isinstance(source, dict)))
+
+
 def display_root(root: Path) -> Path:
     return Path.home() / ".claude" / "sessions"
 
@@ -390,7 +429,7 @@ def details(summary: dict) -> dict:
         info = payload.get("info") or {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or (info.get("last_token_usage") if isinstance(info, dict) else {})
         if isinstance(usage, dict):
-            usage_fields = viewer.token_fields_from_sources(usage)
+            usage_fields = token_fields_from_sources(usage)
             session_token_fields.update(usage_fields)
             turn.setdefault("tokenFields", [])
             turn["tokenFields"] = list(set(turn["tokenFields"]) | set(usage_fields))
@@ -404,21 +443,25 @@ def details(summary: dict) -> dict:
             usage_id = message_id or record.get("requestId")
             if usage_id is None:
                 usage_id = record.get("uuid")
-            normalized_usage = viewer.usage_from(usage)
+            normalized_usage = usage_from(usage)
             if usage_id is None:
                 usage_delta = normalized_usage
             else:
                 usage_key = str(usage_id)
                 previous_usage = seen_usage_records.get(usage_key, viewer.blank_tokens())
                 usage_delta = {
-                    key: (normalized_usage[key] or 0) - (previous_usage[key] or 0)
-                    for key in viewer.TOKEN_KEYS
+                    key: (normalized_usage.get(key) or 0) - (previous_usage.get(key) or 0)
+                    for key in viewer.CANONICAL_TOKEN_KEYS
                 }
                 seen_usage_records[usage_key] = normalized_usage
             for key, value in usage_delta.items():
                 if value is not None:
+                    if key in viewer.CANONICAL_CACHE_WRITE_TOKEN_KEYS and normalized_usage.get(key) is None:
+                        continue
+                    turn["tokens"].setdefault(key, None)
                     turn["tokens"][key] = (turn["tokens"][key] or 0) + value
                     if invocation is not None:
+                        invocation["tokens"].setdefault(key, None)
                         invocation["tokens"][key] = (invocation["tokens"][key] or 0) + value
         if not result["model"] and payload.get("model"):
             result["model"] = payload["model"]
@@ -432,9 +475,12 @@ def details(summary: dict) -> dict:
     result["turns"] = list(turns.values())
     result["model"] = viewer.model_from_records(records) or result["model"] or "claude"
     result["deployment"] = viewer.deployment_from_records(records)
-    result["tokenFields"] = [key for key in viewer.TOKEN_KEYS if key in session_token_fields]
-    for key in viewer.TOKEN_KEYS:
-        values = [turn["tokens"][key] for turn in result["turns"] if turn["tokens"][key] is not None]
+    result["tokenFields"] = [
+        key for key in viewer.CANONICAL_TOKEN_KEYS
+        if key in session_token_fields
+    ]
+    for key in viewer.CANONICAL_TOKEN_KEYS:
+        values = [turn["tokens"].get(key) for turn in result["turns"] if turn["tokens"].get(key) is not None]
         if values:
             result["tokens"][key] = sum(values)
     result["source"] = str(summary.get("_source", ""))

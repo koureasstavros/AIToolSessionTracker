@@ -13,6 +13,39 @@ def _viewer():
     return viewer
 
 
+TOKEN_ALIASES = {
+    "inputTokens": ("input_tokens", "prompt_tokens", "promptTokens", "inputTokens"),
+    "cacheReadTokens": ("cached_tokens", "cachedTokens", "input_cached_tokens", "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"),
+    "cacheWriteTokens": ("cache_write_input_tokens", "input_cache_write_tokens", "cache_creation_input_tokens", "cacheWriteTokens"),
+    "outputTokens": ("output_tokens", "completion_tokens", "outputTokens"),
+    "reasoningTokens": ("reasoning_output_tokens", "reasoning_tokens", "thinking_tokens", "thinkingTokens", "reasoningTokens"),
+}
+
+
+def normalize_usage(source: dict) -> dict:
+    normalized = {}
+    for key, aliases in TOKEN_ALIASES.items():
+        for alias in aliases:
+            if alias in source:
+                normalized[key] = source[alias]
+                break
+    output_details = source.get("output_tokens_details")
+    if isinstance(output_details, dict) and "reasoningTokens" not in normalized:
+        for alias in TOKEN_ALIASES["reasoningTokens"]:
+            if alias in output_details:
+                normalized["reasoningTokens"] = output_details[alias]
+                break
+    return normalized
+
+
+def usage_from(source: dict) -> dict:
+    return _viewer().usage_from(normalize_usage(source))
+
+
+def token_fields_from_sources(*sources: object) -> list[str]:
+    return _viewer().token_fields_from_sources(*(normalize_usage(source) for source in sources if isinstance(source, dict)))
+
+
 def display_root(root: Path) -> Path:
     return Path.home() / ".codex" / "sessions"
 
@@ -243,8 +276,8 @@ def details(summary: dict) -> dict:
         turn["raw"].append(json.dumps(record, indent=2, ensure_ascii=False))
         info = payload.get("info") or {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or (info.get("last_token_usage") if isinstance(info, dict) else {})
-        normalized_usage = viewer.usage_from(usage) if isinstance(usage, dict) else viewer.blank_tokens()
-        usage_fields = viewer.token_fields_from_sources(usage)
+        normalized_usage = usage_from(usage) if isinstance(usage, dict) else viewer.blank_tokens()
+        usage_fields = token_fields_from_sources(usage)
         session_token_fields.update(usage_fields)
         turn.setdefault("tokenFields", [])
         turn["tokenFields"] = list(set(turn["tokenFields"]) | set(usage_fields))

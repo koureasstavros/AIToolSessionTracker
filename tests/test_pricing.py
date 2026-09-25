@@ -31,6 +31,24 @@ class PricingTests(unittest.TestCase):
 
             self.assertTrue(any(row["model"] == "gpt-6-astra" for row in costs))
 
+    def test_context_thresholds_migrate_into_existing_cost_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            pricing.load_model_costs(database_path)
+            with closing(sqlite3.connect(database_path)) as database:
+                database.execute(
+                    "UPDATE model_costs SET context_threshold = NULL WHERE model = 'gpt-5.4'"
+                )
+                database.execute(
+                    "DELETE FROM tracker_metadata WHERE key = 'model_costs_migrated'"
+                )
+                database.commit()
+
+            costs = pricing.load_model_costs(database_path)
+
+            threshold = next(row["context_threshold"] for row in costs if row["model"] == "gpt-5.4")
+            self.assertEqual(threshold, 272000)
+
     def test_deleted_bundled_model_stays_deleted_after_save_and_reload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
@@ -78,6 +96,25 @@ class PricingTests(unittest.TestCase):
                     "cacheWriteTokens": 1_000_000,
                 }
                 self.assertAlmostEqual(pricing.cost_for_tokens(tokens, "cache-fallback"), 6.0)
+
+    def test_context_size_selects_short_or_long_price_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            pricing.save_model_costs([{
+                "vendor": "Test", "model": "context-tiered", "context_threshold": 101,
+                "short_input": 1, "short_output": 2,
+                "long_input": 3, "long_output": 4,
+            }], database_path)
+            with patch.object(pricing, "mapping_config_path", return_value=database_path):
+                pricing._PRICING_COST_CACHE.pop(database_path, None)
+                self.assertAlmostEqual(
+                    pricing.cost_for_tokens({"inputTokens": 100, "outputTokens": 1_000_000}, "context-tiered"),
+                    2.0001,
+                )
+                self.assertAlmostEqual(
+                    pricing.cost_for_tokens({"inputTokens": 101, "outputTokens": 1_000_000}, "context-tiered"),
+                    4.000303,
+                )
 
     def test_separate_reasoning_output_is_priced_without_double_subtraction(self) -> None:
         tokens = {"outputTokens": 600_000, "reasoningTokens": 400_000}
@@ -183,6 +220,43 @@ class PricingTests(unittest.TestCase):
             "claude-opus-4-5": 15.5,
         })
 
+    def test_anthropic_cache_creation_rates_are_split_by_ttl(self) -> None:
+        tokens = {
+            "cacheWrite5mTokens": 1_000_000,
+            "cacheWrite1hTokens": 1_000_000,
+        }
+        self.assertAlmostEqual(
+            pricing.cost_for_tokens(tokens, "claude-haiku-4-5"),
+            3.25,
+        )
+
+    def test_apply_costs_includes_anthropic_cache_creation_rates(self) -> None:
+        tokens = {
+            "inputTokens": 0,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 2_000_000,
+            "cacheWrite5mTokens": 1_000_000,
+            "cacheWrite1hTokens": 1_000_000,
+            "outputTokens": 0,
+            "reasoningTokens": 0,
+        }
+        session = {
+            "model": "claude-haiku-4-5",
+            "tokens": dict(tokens),
+            "turns": [{
+                "model": "claude-haiku-4-5",
+                "tokens": dict(tokens),
+                "invocations": [{"model": "claude-haiku-4-5", "tokens": dict(tokens)}],
+            }],
+        }
+
+        pricing.apply_costs(session)
+
+        expected = pricing.cost_for_tokens(tokens, "claude-haiku-4-5")
+        self.assertEqual(expected, 3.25)
+        self.assertAlmostEqual(session["costUsd"], expected)
+        self.assertAlmostEqual(session["turns"][0]["costUsd"], expected)
+
     def test_google_antigravity_models_have_costs(self) -> None:
         self._assert_model_costs({
             "gemini-2.5-flash-lite": 0.51,
@@ -200,7 +274,9 @@ class PricingTests(unittest.TestCase):
             with patch.object(pricing, "mapping_config_path", return_value=database_path):
                 pricing._PRICING_COST_CACHE.pop(database_path, None)
                 self._assert_model_costs({
+                    "swe-1": 0.0,
                     "swe-1-5": 0.0,
+                    "swe-1-5-mini": 0.0,
                     "swe-1-6": 3.2,
                     "swe-1-6-fast": 3.2,
                     "swe-1-6-slow": 3.2,

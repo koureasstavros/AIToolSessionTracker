@@ -221,6 +221,32 @@ class ClaudeInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(turn["invocations"][1]["tokens"]["outputTokens"], 30)
         self.assertEqual(turn["tokens"]["outputTokens"], 42)
 
+    def test_cache_creation_usage_preserves_five_minute_and_one_hour_ttls(self) -> None:
+        usage = {
+            "input_tokens": 10,
+            "cache_read_input_tokens": 20,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 30,
+                "ephemeral_1h_input_tokens": 40,
+            },
+            "output_tokens": 50,
+        }
+        records = [
+            {"type": "user", "uuid": "user-1", "sessionId": "session-1", "message": {"role": "user", "content": "Inspect this"}},
+            {"type": "assistant", "uuid": "assistant-1", "message": {"id": "message-1", "role": "assistant", "content": "Done", "usage": usage}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session-1.jsonl"
+            path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+            session = anthropic_claude_local_provider.details({"_source": path})
+
+        tokens = session["tokens"]
+        turn_tokens = session["turns"][0]["tokens"]
+        self.assertEqual(tokens["cacheWrite5mTokens"], 30)
+        self.assertEqual(tokens["cacheWrite1hTokens"], 40)
+        self.assertEqual(turn_tokens["cacheWrite5mTokens"], 30)
+        self.assertEqual(turn_tokens["cacheWrite1hTokens"], 40)
+
     def test_background_task_notification_stays_in_originating_turn(self) -> None:
         records = [
             {"type": "user", "uuid": "user-1", "promptId": "turn-1", "sessionId": "session-1", "message": {"role": "user", "content": "Run an agent"}},

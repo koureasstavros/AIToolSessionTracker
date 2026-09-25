@@ -17,6 +17,37 @@ def _viewer():
     return viewer
 
 
+TOKEN_ALIASES = {
+    "inputTokens": ("input_tokens", "prompt_tokens", "promptTokens", "inputTokens"),
+    "cacheReadTokens": ("cached_tokens", "cachedTokens", "input_cached_tokens", "cached_input_tokens", "cache_read_input_tokens", "cacheReadTokens"),
+    "cacheWriteTokens": ("cache_write_input_tokens", "input_cache_write_tokens", "cache_creation_input_tokens", "cacheWriteTokens"),
+    "outputTokens": ("output_tokens", "completion_tokens", "outputTokens"),
+    "reasoningTokens": ("reasoning_output_tokens", "reasoning_tokens", "thinking_tokens", "thinkingTokens", "reasoningTokens"),
+}
+
+
+def normalize_usage(source: dict) -> dict:
+    normalized = {}
+    for key, aliases in TOKEN_ALIASES.items():
+        for alias in aliases:
+            if alias in source:
+                normalized[key] = source[alias]
+                break
+    return normalized
+
+
+def usage_from(source: dict) -> dict:
+    return _viewer().usage_from(normalize_usage(source))
+
+
+def token_fields_from_sources(*sources: object) -> list[str]:
+    return _viewer().token_fields_from_sources(*(normalize_usage(source) for source in sources if isinstance(source, dict)))
+
+
+def has_usage(source: dict) -> bool:
+    return any(value is not None for value in normalize_usage(source).values())
+
+
 def _read_session_state(folder: Path) -> dict:
     """Parse the Copilot session-state workspace.yaml/events.jsonl format."""
     viewer = _viewer()
@@ -310,7 +341,7 @@ def _read_chat(path: Path) -> dict:
             turn["assistant"] = [str(item["value"]) for item in response if isinstance(item, dict) and item.get("value")]
         result = request.get("result") if isinstance(request.get("result"), dict) else {}
         metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-        request_token_fields = viewer.token_fields_from_sources(request, metadata)
+        request_token_fields = token_fields_from_sources(request, metadata)
         turn["tokenFields"] = request_token_fields
         session_token_fields.update(request_token_fields)
         for instruction_key in ("renderedGlobalContext", "renderedSystemMessage", "internalInstructions", "toolInstructions"):
@@ -342,7 +373,7 @@ def _read_chat(path: Path) -> dict:
             request.get("completionTokens") or metadata.get("outputTokens") or metadata.get("completionTokens")
         )
         for usage_source in (request, metadata):
-            for key, value in viewer.usage_from(usage_source).items():
+            for key, value in usage_from(usage_source).items():
                 # request.promptTokens/completionTokens are aggregate turn
                 # totals. metadata.promptTokens/outputTokens describe the
                 # final model round and must not overwrite those aggregates.
@@ -364,7 +395,7 @@ def _read_chat(path: Path) -> dict:
                 invocation = {
                     "index": round_index,
                     "tokens": viewer.blank_tokens(),
-                    "tokenFields": viewer.token_fields_from_sources(metadata),
+                    "tokenFields": token_fields_from_sources(metadata),
                     "tools": [],
                     "assistant": [str(round_data["response"])] if round_data.get("response") else [],
                 }
