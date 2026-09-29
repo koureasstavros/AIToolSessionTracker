@@ -4,6 +4,12 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Tracker, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.40 — 2026-09-29
+
+- Added timing kpi labels into hierarchy like active and idle
+- Added provider specific context content handling with tags
+- Refactored internal database migrations
+
 ### Version v0.0.39 — 2026-09-25
 
 - Added short and long token context handling for costs into settings and viewer

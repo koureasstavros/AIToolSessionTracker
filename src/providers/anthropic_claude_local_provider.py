@@ -19,6 +19,76 @@ TOKEN_ALIASES = {
     "outputTokens": ("output_tokens", "completion_tokens", "outputTokens"),
     "reasoningTokens": ("reasoning_output_tokens", "reasoning_tokens", "thinking_tokens", "thinkingTokens", "reasoningTokens"),
 }
+CLAUDE_CONTEXT_TAGS = {
+    "ide_selection",
+    "ide_opened_file",
+    "system-reminder",
+    "environment_context",
+    "local-command-caveat",
+    "local-command-stdout",
+}
+
+
+def _split_claude_context(content: str) -> tuple[str, list[tuple[str, str]]]:
+    """Separate allowlisted Claude context tags from the human prompt."""
+    pattern = re.compile(
+        r"<(?P<tag>[A-Za-z][A-Za-z0-9_-]*)>(?P<body>.*?)</(?P=tag)>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    context: list[tuple[str, str]] = []
+
+    def replace(match: re.Match[str]) -> str:
+        tag = match.group("tag").lower()
+        body = match.group("body").strip()
+        if tag not in CLAUDE_CONTEXT_TAGS or not body:
+            return match.group(0)
+        context.append((tag, body))
+        return ""
+
+    return pattern.sub(replace, content).strip(), context
+
+
+def _split_ide_selection(content: str) -> tuple[str, list[str]]:
+    """Backward-compatible helper for callers interested only in selections."""
+    prompt, context = _split_claude_context(content)
+    return prompt, [body for tag, body in context if tag == "ide_selection"]
+
+
+def _clean_title(value: object, fallback: str) -> str:
+    """Remove provider context blocks before using a Claude title."""
+    text = str(value or "").strip()
+    opening = re.match(r"<([A-Za-z][A-Za-z0-9_-]*)>", text)
+    if opening and opening.group(1).lower() in CLAUDE_CONTEXT_TAGS and not re.search(
+        rf"</{re.escape(opening.group(1))}>", text, re.IGNORECASE
+    ):
+        return fallback
+    prompt, _ = _split_claude_context(text)
+    if prompt.strip():
+        return prompt.strip()
+    if opening and opening.group(1).lower() in CLAUDE_CONTEXT_TAGS:
+        return fallback
+    return text or fallback
+
+
+def _user_prompt_title(records: list[dict], fallback: str) -> str:
+    """Derive a title from user text after removing provider context blocks."""
+    for record in records:
+        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else record
+        role = message.get("role") or payload.get("role") or record.get("role")
+        if role != "user":
+            continue
+        content = message.get("content") or payload.get("content") or payload.get("text")
+        parts = content if isinstance(content, list) else [content]
+        text = "\n".join(
+            str(part.get("text", "")) if isinstance(part, dict) else str(part or "")
+            for part in parts
+        )
+        prompt, _ = _split_claude_context(text)
+        prompt = _viewer().clean_session_prompt(prompt)
+        if prompt:
+            return prompt[:77].rstrip() + "..." if len(prompt) > 80 else prompt
+    return fallback
 
 
 def normalize_usage(source: dict) -> dict:
@@ -205,7 +275,11 @@ def index(root: Path) -> list[dict]:
         records = viewer.safe_json_lines(entry["_source"])
         explicit_name = viewer.explicit_conversation_name(records, entry["id"])
         if explicit_name:
-            entry["name"] = explicit_name
+            entry["name"] = _clean_title(explicit_name, entry["id"])
+        else:
+            entry["name"] = _clean_title(entry.get("name"), entry["id"])
+        if entry["name"] == entry["id"]:
+            entry["name"] = _user_prompt_title(records, entry["id"])
         source_path = str(entry["_source"]).replace("\\", "/")
         if "local-agent-mode-sessions" in source_path:
             entry["_surface"] = "Desktop"
@@ -360,9 +434,13 @@ def details(summary: dict) -> dict:
                 if previous_was_tool_result:
                     viewer.add_internal_instruction(current_turn, "Claude provider instructions", str(content))
                 else:
-                    current_turn["user"] = str(content)
+                    prompt, context = _split_claude_context(str(content))
+                    for tag, body in context:
+                        label = "Claude IDE selection" if tag == "ide_selection" else f"Claude {tag} context"
+                        viewer.add_internal_instruction(current_turn, label, body)
+                    current_turn["user"] = prompt
                     viewer.add_attached_files(current_turn, viewer.files_from_content(raw_content))
-                    viewer.add_attached_files(current_turn, viewer.mentioned_files(content))
+                    viewer.add_attached_files(current_turn, viewer.mentioned_files(prompt))
             previous_was_tool_result = False
             continue
 
@@ -471,7 +549,11 @@ def details(summary: dict) -> dict:
         result["id"] = str(first.get("sessionId") or first.get("session_id") or first.get("conversationId") or first.get("conversation_id") or result["id"])
         result["name"] = viewer.explicit_conversation_name(records, result["id"]) or str(first.get("title") or first.get("name") or first.get("summary") or first.get("conversationTitle") or result["id"])
         if result["name"] == result["id"]:
-            result["name"] = viewer.derived_conversation_name(records, result["id"])
+            result["name"] = _clean_title(
+                viewer.derived_conversation_name(records, result["id"]), result["id"]
+            )
+        if result["name"] == result["id"]:
+            result["name"] = _user_prompt_title(records, result["id"])
     result["turns"] = list(turns.values())
     result["model"] = viewer.model_from_records(records) or result["model"] or "claude"
     result["deployment"] = viewer.deployment_from_records(records)

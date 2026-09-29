@@ -18,8 +18,6 @@ TOKEN_FIELDS = {
     "reasoningTokens": ("reasoning_tokens", "reasoningTokens"),
 }
 UUID_PATTERN = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
-
-
 def _viewer():
     import session_token_viewer as viewer
     return viewer
@@ -164,7 +162,6 @@ def _title(session: dict, rows: list[dict]) -> str:
 
 
 def index(root: Path | None = None) -> list[dict]:
-    viewer = _viewer()
     db_path = display_root(root)
     entries = []
     connection = _connect(root)
@@ -182,6 +179,7 @@ def index(root: Path | None = None) -> list[dict]:
                     "_provider": "cognition_devin",
                     "_kind": "external",
                     "id": display_id,
+                    "_session_id": session_id,
                     "name": _title(session, rows),
                     "updated": session.get("last_activity_at") or 0,
                     "project": session.get("working_directory") or None,
@@ -189,8 +187,6 @@ def index(root: Path | None = None) -> list[dict]:
                     "_has_data": _has_data(rows),
                     "_source_label": surface,
                     "_surface": surface,
-                    "_devin_session": session,
-                    "_devin_session_id": session_id,
                 }
                 if session.get("hidden"):
                     entry["_has_data"] = False
@@ -221,9 +217,9 @@ def _estimate(text: str) -> int:
 def details(summary: dict) -> dict:
     viewer = _viewer()
     db_path = Path(summary["_source"])
-    session_meta = summary.get("_devin_session") if isinstance(summary.get("_devin_session"), dict) else {}
-    session_id = str(summary.get("_id") or summary.get("id") or "")
-    db_session_id = str(summary.get("_devin_session_id") or session_meta.get("id") or session_id)
+    session_id = str(summary.get("id") or "")
+    db_session_id = str(summary.get("_session_id") or session_id)
+    session_meta = {}
     connection = _connect(db_path)
     updated = float(summary.get("updated") or 0)
     result = viewer.new_session(session_id, summary.get("name") or session_id, updated, model=summary.get("model") or _model(session_meta, []), project=session_meta.get("working_directory") or summary.get("project"))
@@ -308,8 +304,7 @@ def details(summary: dict) -> dict:
 
 def delete(summary: dict) -> None:
     db_path = Path(summary.get("_source", ""))
-    session_meta = summary.get("_devin_session") if isinstance(summary.get("_devin_session"), dict) else {}
-    session_id = str(summary.get("_devin_session_id") or session_meta.get("id") or summary.get("id") or "")
+    session_id = str(summary.get("_session_id") or summary.get("id") or "")
     if not session_id:
         return
     connection = _connect(db_path)

@@ -69,7 +69,7 @@ class CognitionDevinProviderTests(unittest.TestCase):
         self.assertEqual(entries[0]["name"], "Inspect the app")
         self.assertEqual(entries[0]["id"], "11111111-2222-3333-4444-555555555555")
         self.assertEqual(entries[0]["model"], "swe-1-6-slow")
-        self.assertEqual(normalized["_devin_session_id"], "devin-session")
+        self.assertEqual(normalized["_session_id"], "devin-session")
         self.assertEqual(entries[0]["_source_label"], "CLI")
         self.assertEqual(details["surface"], "CLI")
         self.assertEqual(len(details["turns"]), 1)

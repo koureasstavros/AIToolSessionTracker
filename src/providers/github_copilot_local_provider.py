@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -24,6 +25,29 @@ TOKEN_ALIASES = {
     "outputTokens": ("output_tokens", "completion_tokens", "outputTokens"),
     "reasoningTokens": ("reasoning_output_tokens", "reasoning_tokens", "thinking_tokens", "thinkingTokens", "reasoningTokens"),
 }
+COPILOT_CONTEXT_TAGS = {"ide_selection", "ide_opened_file", "system-reminder", "environment_context"}
+
+
+def _split_context(content: str) -> tuple[str, list[tuple[str, str]]]:
+    pattern = re.compile(r"<(?P<tag>[A-Za-z][A-Za-z0-9_-]*)>(?P<body>.*?)</(?P=tag)>", re.DOTALL | re.IGNORECASE)
+    context: list[tuple[str, str]] = []
+
+    def replace(match: re.Match[str]) -> str:
+        tag, body = match.group("tag").lower(), match.group("body").strip()
+        if tag not in COPILOT_CONTEXT_TAGS or not body:
+            return match.group(0)
+        context.append((tag, body))
+        return ""
+
+    return pattern.sub(replace, content).strip(), context
+
+
+def _clean_title(value: object, fallback: str) -> str:
+    text = str(value or "").strip()
+    prompt, _ = _split_context(text)
+    if prompt:
+        return prompt
+    return fallback if re.match(r"<([A-Za-z][A-Za-z0-9_-]*)>", text) else text or fallback
 
 
 def normalize_usage(source: dict) -> dict:
@@ -335,7 +359,10 @@ def _read_chat(path: Path) -> dict:
             turn["model"] = request["modelId"]
         message = request.get("message") or {}
         if isinstance(message, dict):
-            turn["user"] = str(message.get("text") or "")
+            prompt, context = _split_context(str(message.get("text") or ""))
+            turn["user"] = prompt
+            for tag, body in context:
+                viewer.add_internal_instruction(turn, f"Copilot {tag} context", body)
         response = request.get("response") or []
         if isinstance(response, list):
             turn["assistant"] = [str(item["value"]) for item in response if isinstance(item, dict) and item.get("value")]
@@ -502,6 +529,37 @@ def _read_chat(path: Path) -> dict:
     session["deployment"] = viewer.deployment_from_records(records)
     session["tokenFields"] = [key for key in viewer.TOKEN_KEYS if key in session_token_fields]
     session["_embedded_subagents"] = embedded_subagents
+    return session
+
+def _read_chat_editing_session(state_path: Path) -> dict:
+    """Read VS Code's chatEditingSessions baseline, timeline, and snapshots."""
+    viewer = _viewer()
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return viewer.new_session(state_path.parent.name, state_path.parent.name, 0)
+    session_id = state_path.parent.name
+    try:
+        updated = state_path.stat().st_mtime
+    except OSError:
+        updated = 0
+    session = viewer.new_session(session_id, session_id, updated, "GitHub Copilot")
+    session["_kind"] = "copilot-editing-session"
+    telemetry_models = {
+        str(entry.get("telemetryInfo", {}).get("modelId"))
+        for entry in state.get("recentSnapshot", {}).get("entries", [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("telemetryInfo"), dict)
+        and entry["telemetryInfo"].get("modelId")
+    }
+    if telemetry_models:
+        session["model"] = sorted(telemetry_models)[-1]
+    turn = viewer.new_turn("editing-session")
+    turn["user"] = "File editing activity"
+    turn["model"] = session.get("model")
+    invocation = {"index": 1, "assistant": [], "tools": [], "tokens": viewer.blank_tokens()}
+    turn["invocations"] = [invocation]
+    session["turns"] = [turn]
     return session
 
 
@@ -679,6 +737,18 @@ def index(root: Path) -> list[dict]:
     entries: list[dict] = []
     for scan_root in _roots(root):
         try:
+            editing_states = list(scan_root.rglob("chatEditingSessions/*/state.json"))
+            for state_path in editing_states:
+                entry = viewer.session_summary(state_path, "copilot", "copilot-editing-session")
+                entry["id"] = state_path.parent.name
+                entry["name"] = state_path.parent.name
+                entry["_source"] = state_path.parent
+                entry["_kind"] = "copilot-editing-session"
+                # File edits are tool activity, not meaningful conversation
+                # content. Keep edit-only sessions available through Show
+                # empty, but exclude them from the normal sidebar.
+                entry["_has_data"] = False
+                entries.append(entry)
             chat_files = (scan_root.glob("*.jsonl") if scan_root.name == "emptyWindowChatSessions"
                           else scan_root.rglob("chatSessions/*.jsonl"))
             chat_paths = list(chat_files)
@@ -686,6 +756,7 @@ def index(root: Path) -> list[dict]:
                 if viewer.is_subagent_path(path):
                     continue
                 entry = viewer.session_summary(path, "copilot", "copilot-chat")
+                entry["name"] = _clean_title(entry.get("name"), entry["id"])
                 entry["_children"] = [
                     viewer.session_summary(child, "copilot", "copilot-chat")
                     for child in viewer.related_subagent_paths(path, chat_paths)
@@ -801,9 +872,17 @@ def details(summary: dict) -> dict:
             parsed.append(_read_db(source["_session_id"], source["_source"]))
         elif kind == "copilot-chat":
             parsed.append(_read_chat(source["_source"]))
+        elif kind == "copilot-editing-session":
+            parsed.append(_read_chat_editing_session(source["_source"] / "state.json"))
         else:
             parsed.append(_read_session_state(source["_source"]))
-    result = parsed[0]
+    if sources and sources[0].get("_kind") == "copilot-editing-session" and len(parsed) > 1:
+        result = parsed[1]
+        result["_kind"] = "copilot-editing-session"
+        sources = sources[1:]
+        parsed = parsed[1:]
+    else:
+        result = parsed[0]
     # The same session may have a sparse session-state event stream and a
     # complete database transcript. Fill missing messages and usage from every
     # source, matching turns by their stable id and then by ordinal position.

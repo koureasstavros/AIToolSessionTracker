@@ -25,7 +25,8 @@ from typing import TypedDict
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 from src.common import source_otel
-from src.common import source_pricing as pricing
+from src.common import model_mapping
+from src.common import model_costs as pricing
 from src.common import source_routing
 from src.providers import github_copilot_local_provider
 from src.providers import openai_codex_local_provider
@@ -395,7 +396,7 @@ def normalize_session_data(value: dict) -> SessionData:
             key for key in CANONICAL_CACHE_WRITE_TOKEN_KEYS if key in supplied_tokens
         )
     result["tokenFields"] = normalized_token_fields
-    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_surface", "_session_id", "_db_metadata", "_db_issue", "_has_data", "_devin_session", "_devin_session_id", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation", "outputTokensExcludeReasoning"):
+    for key in ("source", "_source", "_sources", "_kind", "_source_label", "_surface", "_session_id", "_db_metadata", "_db_issue", "_has_data", "provider", "_children", "subagents", "ownTokens", "subagentTokens", "relation", "outputTokensExcludeReasoning"):
         if key in value:
             result[key] = value[key]
     for turn in result["turns"]:
@@ -562,6 +563,156 @@ def new_session(session_id: str, name: str, updated: float, model: str | None = 
 
 def new_turn(turn_id: str) -> dict:
     return {"id": turn_id, "user": "", "assistant": [], "tokens": blank_tokens(), "raw": []}
+
+
+def _duration_value(value: object) -> float | None:
+    """Return a positive duration in milliseconds from a persisted value."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return float(value)
+    return None
+
+
+def _event_timestamps(records: object) -> list[float]:
+    """Extract event timestamps, in seconds, from provider raw records."""
+    timestamps: list[float] = []
+    timestamp_keys = {"timestamp", "createdAt", "created_at", "startTime", "endTime", "ts", "time"}
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key, candidate in value.items():
+                if key in timestamp_keys:
+                    if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                        timestamps.append(float(candidate) / 1000 if candidate > 100_000_000_000 else float(candidate))
+                    elif isinstance(candidate, str):
+                        try:
+                            timestamps.append(datetime.fromisoformat(candidate.replace("Z", "+00:00")).timestamp())
+                        except ValueError:
+                            pass
+                visit(candidate)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, str):
+            try:
+                visit(json.loads(value))
+            except json.JSONDecodeError:
+                pass
+
+    visit(records)
+    return timestamps
+
+
+def interaction_bounds(value: dict) -> tuple[float, float] | None:
+    """Resolve request and response bounds in seconds for an interaction."""
+    start = value.get("_otel_start")
+    end = value.get("_otel_end")
+    if isinstance(start, (int, float)) and isinstance(end, (int, float)) and end >= start:
+        return start / 1_000_000_000, end / 1_000_000_000
+    bounds = _event_timestamps([
+        {"startTime": value.get("startTime") or value.get("startedAt") or value.get("createdAt")},
+        {"endTime": value.get("endTime") or value.get("completedAt") or value.get("updatedAt")},
+    ])
+    if len(bounds) == 2 and bounds[1] >= bounds[0]:
+        return bounds[0], bounds[1]
+    timestamps = _event_timestamps(value.get("raw", []))
+    if len(timestamps) >= 2:
+        return min(timestamps), max(timestamps)
+    return None
+
+
+def interaction_duration_ms(value: dict) -> float | None:
+    """Resolve active request-to-response duration from persisted timing."""
+    for key in ("activeDurationMs", "active_duration_ms", "durationMs", "duration_ms"):
+        duration = _duration_value(value.get(key))
+        if duration is not None:
+            return duration
+    bounds = interaction_bounds(value)
+    if bounds is not None:
+        return max(0.0, (bounds[1] - bounds[0]) * 1000)
+    return None
+
+
+def apply_interaction_durations(session: dict) -> dict:
+    """Attach active and idle durations, summing active time into the session."""
+    session_active = 0.0
+    session_idle = 0.0
+    previous_turn_end = None
+    has_active = False
+    has_idle = False
+    for turn in session.get("turns", []):
+        if not isinstance(turn, dict):
+            continue
+        turn_duration = interaction_duration_ms(turn)
+        turn_bounds = interaction_bounds(turn)
+        if previous_turn_end is not None and turn_bounds is not None and turn_bounds[0] >= previous_turn_end:
+            turn["idleDurationMs"] = (turn_bounds[0] - previous_turn_end) * 1000
+            session_idle += turn["idleDurationMs"]
+            has_idle = True
+        if turn_bounds is not None:
+            previous_turn_end = turn_bounds[1]
+        invocations = turn.get("invocations") if isinstance(turn.get("invocations"), list) else []
+        invocation_durations = []
+        previous_invocation_end = None
+        for invocation in invocations:
+            if not isinstance(invocation, dict):
+                continue
+            duration = interaction_duration_ms(invocation)
+            invocation_bounds = interaction_bounds(invocation)
+            if previous_invocation_end is not None and invocation_bounds is not None and invocation_bounds[0] >= previous_invocation_end:
+                invocation["idleDurationMs"] = (invocation_bounds[0] - previous_invocation_end) * 1000
+            if invocation_bounds is not None:
+                previous_invocation_end = invocation_bounds[1]
+            if duration is not None:
+                invocation["activeDurationMs"] = duration
+                invocation_durations.append(duration)
+        if turn_duration is None and invocation_durations:
+            turn_duration = sum(invocation_durations)
+        elif turn_duration is not None and len(invocations) == 1 and not invocation_durations:
+            invocations[0]["activeDurationMs"] = turn_duration
+        if turn_duration is not None:
+            turn["activeDurationMs"] = turn_duration
+            session_active += turn_duration
+            has_active = True
+    if has_active:
+        session["activeDurationMs"] = session_active
+    if has_idle:
+        session["idleDurationMs"] = session_idle
+    return session
+
+
+def format_duration(value: object) -> str:
+    """Format milliseconds using the largest useful human time unit."""
+    duration = _duration_value(value)
+    if duration is None:
+        return "Unknown"
+    seconds = duration / 1000
+    if seconds < 1:
+        return f"{duration:.0f} ms"
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    minutes = seconds / 60
+    if minutes < 60:
+        whole, remainder = divmod(int(round(seconds)), 60)
+        return f"{whole}m {remainder}s" if remainder else f"{whole}m"
+    hours = minutes / 60
+    if hours < 24:
+        whole, remainder = divmod(int(round(minutes)), 60)
+        return f"{whole}h {remainder}m" if remainder else f"{whole}h"
+    days = hours / 24
+    if days < 7:
+        whole, remainder = divmod(int(round(hours)), 24)
+        return f"{whole}d {remainder}h" if remainder else f"{whole}d"
+    weeks = days / 7
+    if weeks < 4.345:
+        whole, remainder = divmod(int(round(days)), 7)
+        return f"{whole}w {remainder}d" if remainder else f"{whole}w"
+    months = days / 30.4375
+    if days < 365.25 and round(months) < 12:
+        whole, remainder = divmod(int(round(days)), 30)
+        return f"{whole}mo {remainder}d" if remainder else f"{whole}mo"
+    years = days / 365.25
+    whole, remainder = divmod(int(round(months)), 12)
+    return f"{whole}y {remainder}mo" if remainder else f"{whole}y"
 
 
 def normalize_reasoning_effort(value: object) -> str | None:
@@ -1641,7 +1792,7 @@ def load_session_details(summary: dict, provider: str, force_refresh: bool = Fal
         return summary["_loaded_details"]
     details = source_otel.details(summary, provider) if summary.get("_route") == "otel" or summary.get("_kind") == "otel" else PROVIDER_ADAPTERS[provider].details(summary)
     details["provider"] = provider
-    loaded = pricing.apply_costs(normalize_session_data(details))
+    loaded = apply_interaction_durations(pricing.apply_costs(normalize_session_data(details)))
     summary["_loaded_details"] = loaded
     return loaded
 
@@ -1751,8 +1902,14 @@ def turn_timestamp(turn: dict, fallback: float = 0) -> float:
 
 def display_model_name(model: object) -> str:
     """Show the public model name instead of a provider deployment path."""
-    price = pricing.find_model(model)
-    return str(price["model"] if price else model or "Unavailable")
+    raw_model = str(model or "Unavailable")
+    deployment_name = raw_model.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    mappings = pricing.load_model_mappings()
+    mapped_model = model_mapping.mapped_model(model, mappings) or model_mapping.mapped_model(deployment_name, mappings)
+    if mapped_model:
+        return str(mapped_model)
+    price = pricing.find_model(model) or pricing.find_model(deployment_name)
+    return str(price["model"] if price else deployment_name)
 
 
 def display_effort_label(reasoning_effort: object) -> str | None:
@@ -2520,6 +2677,8 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
     totals = {key: 0 for key in TOKEN_KEYS}
     total_costs = {key: 0.0 for key in TOKEN_KEYS}
     total_cost = 0.0
+    total_active_duration = 0.0
+    total_idle_duration = 0.0
     groups: dict[str, dict] = {}
     timeline_points: dict[str, dict[str, float]] = (
         {f"{hour:02d}:00": {"tokens": 0.0, "cost": 0.0} for hour in range(24)}
@@ -2530,6 +2689,7 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
         if not isinstance(session, dict):
             session = load_session_details(summary, provider)
         model_rows = model_usage_breakdown(session, group) if group in {"model", "effort"} else [None]
+        duration_added = False
         for model_row in model_rows:
             bucket_label = model_row["model"] if model_row is not None else statistics_group_key(session, group, provider, summary, time_range)
             bucket = groups.setdefault(bucket_label, {
@@ -2537,6 +2697,8 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
                 "tokens": {key: 0 for key in TOKEN_KEYS},
                 "costs": {key: 0.0 for key in TOKEN_KEYS},
                 "cost": 0.0,
+                "activeDurationMs": 0.0,
+                "idleDurationMs": 0.0,
                 "items": [],
             })
             bucket["sessions"] += 1
@@ -2557,6 +2719,14 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
             if isinstance(source_cost, (int, float)):
                 bucket["cost"] += source_cost
                 total_cost += source_cost
+            if not duration_added:
+                active_duration = session.get("activeDurationMs") or 0
+                idle_duration = session.get("idleDurationMs") or 0
+                bucket["activeDurationMs"] += active_duration
+                bucket["idleDurationMs"] += idle_duration
+                total_active_duration += active_duration
+                total_idle_duration += idle_duration
+                duration_added = True
         timestamp = session.get("updated") or 0
         if timestamp:
             timeline_label = datetime.fromtimestamp(timestamp).strftime("%H:00") if time_range == "today" else datetime.fromtimestamp(timestamp).date().isoformat()
@@ -2572,9 +2742,9 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
         f'<tr><td data-sort="{esc(label, quote=True)}"><a class="stats-group-link stats-navigation" href="/?{urlencode({"view": "statistics", "provider": provider, "group": group, "group_value": label})}">{esc(label)}</a></td><td data-sort="{bucket["sessions"]}">{bucket["sessions"]:,}</td>'
         + "".join(f'<td data-sort="{bucket["tokens"][key] or 0}">{fmt(bucket["tokens"][key])}</td>' for key in TOKEN_KEYS)
         + "".join(f'<td data-sort="{bucket["costs"][key]:.6f}">{fmt_cost(bucket["costs"][key])}</td>' for key in TOKEN_KEYS)
-        + f'<td data-sort="{sum(bucket["tokens"].values())}">{fmt(sum(bucket["tokens"].values()))}</td><td data-sort="{bucket["cost"]:.6f}">{fmt_cost(bucket["cost"])}</td></tr>'
+        + f'<td data-sort="{sum(bucket["tokens"].values())}">{fmt(sum(bucket["tokens"].values()))}</td><td data-sort="{bucket["cost"]:.6f}">{fmt_cost(bucket["cost"])}</td><td data-sort="{bucket["activeDurationMs"]}">{format_duration(bucket["activeDurationMs"])}</td><td data-sort="{bucket["idleDurationMs"]}">{format_duration(bucket["idleDurationMs"])}</td></tr>'
         for label, bucket in ordered_groups
-    ) or '<tr><td colspan="14">No session data is available.</td></tr>'
+    ) or '<tr><td colspan="16">No session data is available.</td></tr>'
     related = ""
     if selected_group in groups:
         if group == "model":
@@ -2589,10 +2759,10 @@ def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_gr
             )
         related = f'<section class="stats-related"><div class="section-heading"><div><span class="section-kicker">SELECTED GROUP</span><h2>Sessions in {esc(selected_group)}</h2></div></div><div class="stats-table-wrap"><table class="stats-table related-table"><thead><tr><th data-sort-column="0">Session ID<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="1">Session name<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="2">Provider<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="3">Model<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="4">Total tokens<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="5">Total cost<span class="sort-arrow default" aria-hidden="true"></span></th></tr></thead><tbody>{session_rows}</tbody></table></div></section>'
     timeline_markup = f'<section class="timeline-section"><div class="section-heading"><div><span class="section-kicker">TIMELINE</span><h2>Tokens and cost over time</h2></div></div>{render_timeline_svg(timeline_points, time_range, provider)}</section>{related}'
-    table_markup = f'<section class="stats-table-section"><div class="section-heading"><div><span class="section-kicker">BREAKDOWN</span><h2>By {heading.lower()}</h2></div></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th data-sort-column="0">{heading}<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="1">Sessions<span class="sort-arrow default" aria-hidden="true"></span></th>{"".join(f"<th data-sort-column=\"{i + 2}\">{esc(TOKEN_LABELS[key])}<span class=\"sort-arrow default\" aria-hidden=\"true\"></span></th>" for i, key in enumerate(TOKEN_KEYS))}{"".join(f"<th data-sort-column=\"{i + 7}\">{esc(TOKEN_LABELS[key])} cost<span class=\"sort-arrow default\" aria-hidden=\"true\"></span></th>" for i, key in enumerate(TOKEN_KEYS))}<th data-sort-column="12">Total tokens<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="13">Total cost<span class="sort-arrow default" aria-hidden="true"></span></th></tr></thead><tbody>{rows}</tbody></table></div></section>{related}'
+    table_markup = f'<section class="stats-table-section"><div class="section-heading"><div><span class="section-kicker">BREAKDOWN</span><h2>By {heading.lower()}</h2></div></div><div class="stats-table-wrap"><table class="stats-table"><thead><tr><th data-sort-column="0">{heading}<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="1">Sessions<span class="sort-arrow default" aria-hidden="true"></span></th>{"".join(f"<th data-sort-column=\"{i + 2}\">{esc(TOKEN_LABELS[key])}<span class=\"sort-arrow default\" aria-hidden=\"true\"></span></th>" for i, key in enumerate(TOKEN_KEYS))}{"".join(f"<th data-sort-column=\"{i + 7}\">{esc(TOKEN_LABELS[key])} cost<span class=\"sort-arrow default\" aria-hidden=\"true\"></span></th>" for i, key in enumerate(TOKEN_KEYS))}<th data-sort-column="12">Total tokens<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="13">Total cost<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="14">Active duration<span class="sort-arrow default" aria-hidden="true"></span></th><th data-sort-column="15">Idle duration<span class="sort-arrow default" aria-hidden="true"></span></th></tr></thead><tbody>{rows}</tbody></table></div></section>{related}'
     refresh_url = esc("/?" + urlencode({"view": "statistics", "provider": provider, "group": group, "range": time_range, "refresh": 1}), quote=True)
     return f'''<main class="detail statistics"><style>.stats-toolbar{{display:flex;align-items:center;gap:16px;margin:28px 0 18px;padding:12px 14px;border:1px solid #223753;border-radius:9px;background:#101d30}}.stats-filters{{display:flex;gap:7px;flex-wrap:wrap}}.stats-filter{{padding:7px 11px;border:1px solid #315479;border-radius:7px;color:#a9c9e9;text-decoration:none;font-size:12px}}.stats-filter:hover,.stats-filter.selected{{background:#24558a;color:#fff}}.stats-table-section,.stats-related,.timeline-section{{width:100%;max-width:1500px;margin:30px auto 0}}.stats-table-wrap{{width:100%;overflow:auto;border:1px solid #223753;border-radius:9px}}.stats-table{{width:100%;min-width:0;table-layout:fixed;border-collapse:collapse;background:#101a2a}}.stats-table th,.stats-table td{{width:auto;padding:11px 8px;border-bottom:1px solid #22304a;text-align:right;font-size:11px;white-space:normal;overflow-wrap:anywhere}}.stats-table th:first-child,.stats-table td:first-child{{text-align:left}}.stats-table th{{color:#91a8c7;font-size:10px;text-transform:uppercase;letter-spacing:.5px;cursor:pointer;user-select:none;position:relative;padding-right:22px}}.stats-table th:hover{{color:#cfe0ff;background:#1a2a42}}.stats-table th .sort-arrow.default{{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:8px;height:8px;opacity:.3;transition:opacity .15s}}.stats-table th .sort-arrow.default::before,.stats-table th .sort-arrow.default::after,.stats-table th .sort-arrow.asc::before,.stats-table th .sort-arrow.desc::after{{content:"";position:absolute;left:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent}}.stats-table th .sort-arrow.default::before{{top:0;border-bottom:4px solid #91a8c7}}.stats-table th .sort-arrow.default::after{{bottom:0;border-top:4px solid #91a8c7}}.stats-table th:hover .sort-arrow.default{{opacity:.6}}.stats-table th.sort-active .sort-arrow.default{{display:none}}.stats-table th .sort-arrow.asc,.stats-table th .sort-arrow.desc{{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:8px;height:5px;opacity:1}}.stats-table th .sort-arrow.asc::before{{top:0;border-bottom:5px solid #fff}}.stats-table th .sort-arrow.desc::after{{bottom:0;border-top:5px solid #fff}}.stats-table th.sort-active{{color:#fff}}.stats-table td{{color:#cbd8e8}}.stats-table tr:last-child td{{border-bottom:0}}.stats-group-link{{color:#9ed1ff;text-decoration:none}}.stats-group-link:hover{{color:#fff;text-decoration:underline}}.timeline-chart{{padding:16px;border:1px solid #223753;border-radius:9px;background:#101a2a}}.timeline-chart svg{{display:block;width:100%;height:auto}}.timeline-axis{{stroke:#34445c;stroke-width:1}}.timeline-chart text{{fill:#7e8ea5;font-size:11px}}.timeline-tokens,.timeline-cost{{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}}.timeline-tokens{{stroke:#54c99f}}.timeline-cost{{stroke:#f07878}}.tokens-axis-label,.tokens-axis-title{{fill:#54c99f!important}}.cost-axis-label,.cost-axis-title{{fill:#f07878!important}}.timeline-legend{{display:flex;gap:18px;margin:0 0 8px;font-size:11px}}.timeline-key:before{{display:inline-block;width:9px;height:9px;margin-right:6px;border-radius:50%;content:""}}.tokens-key:before{{background:#54c99f}}.cost-key:before{{background:#f07878}}.timeline-empty{{padding:28px;border:1px dashed #34445c;border-radius:9px;color:#7e8ea5;text-align:center}}.statistics-link{{margin-top:8px;border-top:1px solid #223451}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>All providers</div><h1>Statistics</h1><p class="muted">Aggregate token and cost information across loaded sessions.</p></div><div class="detail-actions"><a class="icon-button detail-refresh" href="{refresh_url}" title="Scan sessions again" aria-label="Scan sessions again">↻</a><a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>{exit_action()}</div></header>
-        <section class="overview"><div class="section-heading"><div><span class="section-kicker">TOTAL</span><h2>All providers</h2></div><div class="overview-stats"><span><b>{session_count:,}</b> sessions</span><span><b>{fmt_unit(sum(totals.values()))}</b> tokens</span><span><b>{fmt_unit(total_cost, True)}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/session</span><span><b>{fmt_cost(average_cost)}</b> avg cost/session</span></div></div><div class="metrics">{token_cards(totals, costs=total_costs)}</div></section>
+        <section class="overview"><div class="section-heading"><div><span class="section-kicker">TOTAL</span><h2>All providers</h2></div><div class="overview-stats"><span><b>{session_count:,}</b> sessions</span><span><b>{fmt_unit(sum(totals.values()))}</b> tokens</span><span><b>{fmt_unit(total_cost, True)}</b> cost</span><span><b>{fmt_unit(average_tokens)}</b> avg tokens/session</span><span><b>{fmt_cost(average_cost)}</b> avg cost/session</span><span><b>{format_duration(total_active_duration)}</b> active</span><span><b>{format_duration(total_idle_duration)}</b> idle</span></div></div><div class="metrics">{token_cards(totals, costs=total_costs)}</div></section>
         {timeline_markup if group == "timeline" else table_markup}</main>'''
 def session_tool(summary: dict, provider: str) -> str:
     """Return the product surface reported by the owning provider."""
@@ -2820,12 +2990,15 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             turn_label = index if provider == "copilot" else turn.get("turn_index", index)
             raw_url = esc("/?" + urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "session": chosen["id"], "turn": index, "raw": 1}), quote=True)
             invocation_markup = ""
-            show_invocation_breakdown = len(invocations) > 1 or tools_are_nested
+            show_invocation_breakdown = bool(invocations) and (len(invocations) > 1 or tools_are_nested or any(
+                isinstance(invocation, dict) and (interaction_duration_ms(invocation) is not None or invocation.get("idleDurationMs") is not None)
+                for invocation in invocations
+            ))
             if show_invocation_breakdown:
                 invocation_markup = '<details class="turn-invocations"><summary><span><span class="invocation-icon" aria-hidden="true">I</span> Invocations</span><span class="summary-count">' + str(len(invocations)) + '</span></summary><div class="invocations-list">' + "".join(
                     f'<div class="turn-invocation"><div class="invocation-name"><span><i></i>Invocation {esc(invocation.get("index", invocation_index))}</span>'
                     f'{" <span class=\"turn-kind\">Usage summary</span>" if invocation.get("kind") == "usage_summary" else ""}'
-                    f'{invocation_model_markup(invocation, turn, chosen)}</div><div class="invocation-content">{invocation_subagent_badge(invocation)}{invocation_tools(invocation)}{invocation_total_cards(invocation, invocation.get("model") or turn.get("model") or chosen.get("model"), invocation.get("tokenFlags") or turn.get("tokenFlags") or chosen.get("tokenFlags"))}</div></div>'
+                    f'{invocation_model_markup(invocation, turn, chosen)}<span class="invocation-count">Active {esc(format_duration(invocation.get("activeDurationMs")))}</span><span class="invocation-count">Idle {esc(format_duration(invocation.get("idleDurationMs")))}</span></div><div class="invocation-content">{invocation_subagent_badge(invocation)}{invocation_tools(invocation)}{invocation_total_cards(invocation, invocation.get("model") or turn.get("model") or chosen.get("model"), invocation.get("tokenFlags") or turn.get("tokenFlags") or chosen.get("tokenFlags"))}</div></div>'
                     for invocation_index, invocation in enumerate(invocations, 1) if isinstance(invocation, dict)
                 ) + '</div></details>'
             invocation_label = f'{len(invocations)} {"invocation" if len(invocations) == 1 else "invocations"}'
@@ -2841,7 +3014,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 if turn_effort_label else ""
             )
             turn_time_label = format_timestamp(turn_timestamp(turn, chosen.get("updated", 0)))
-            turn_total_badges = f'<span class="invocation-count">Time {esc(turn_time_label)}</span><span class="invocation-count">Model {esc(turn_model_label)}</span>{turn_effort_markup}<span class="invocation-count">Invocations {len(invocations)}</span><span class="invocation-count">Tools {len(tools)}</span><span class="invocation-count">Tokens {fmt_unit(turn_token_total)}</span><span class="invocation-count">Cost {fmt_cost(turn.get("costUsd"))}</span>'
+            turn_total_badges = f'<span class="invocation-count">Time {esc(turn_time_label)}</span><span class="invocation-count">Active {esc(format_duration(turn.get("activeDurationMs")))}</span><span class="invocation-count">Idle {esc(format_duration(turn.get("idleDurationMs")))}</span><span class="invocation-count">Model {esc(turn_model_label)}</span>{turn_effort_markup}<span class="invocation-count">Invocations {len(invocations)}</span><span class="invocation-count">Tools {len(tools)}</span><span class="invocation-count">Tokens {fmt_unit(turn_token_total)}</span><span class="invocation-count">Cost {fmt_cost(turn.get("costUsd"))}</span>'
             turns += f'''<article class="turn" id="turn-{index}"><header><div class="turn-number"><span>{index:02d}</span><div><b>Turn {esc(turn_label)}</b><small>Turn activity</small></div></div><div class="turn-badges">{turn_total_badges}{kind_label}</div></header>
                 <details class="message user turn-message user-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">U</span><label>User</label></summary><p>{esc(turn["user"] or "(no user message)")}</p>{files_markup}</details>
                 <details class="message assistant turn-message assistant-content"><summary class="role"><span aria-hidden="true" style="display:grid;place-items:center;width:22px;min-width:22px;height:22px;flex:0 0 22px;border-radius:7px">AI</span><label>Assistant</label></summary><p>{esc(assistant)}</p></details>
@@ -2917,7 +3090,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
             f'<span>{esc(session_effort_label)}</span>' if session_effort_label else ""
         )
         detail = f'''<main class="detail"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>{esc(PROVIDERS.get(provider, provider))}</div><h1>{esc(chosen["name"])}</h1>
-            <div class="header-chips"><span>Surface: {esc(session_tool(chosen_summary, provider))}</span><span>Timestamp: {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span><span>Model: {esc(display_model_name(chosen.get("pricingModel") or chosen.get("model")))}</span>{session_effort_markup}</div>
+            <div class="header-chips"><span>Surface: {esc(session_tool(chosen_summary, provider))}</span><span>Timestamp: {esc(format_timestamp(chosen.get("updated", chosen_summary.get("updated", 0))))}</span><span>Active: {esc(format_duration(chosen.get("activeDurationMs")))}</span><span>Idle: {esc(format_duration(chosen.get("idleDurationMs")))}</span><span>Model: {esc(display_model_name(chosen.get("pricingModel") or chosen.get("model")))}</span>{session_effort_markup}</div>
                 </div><div class="detail-actions">{best_practices_markup(chosen)}{model_analysis_markup(chosen)}<a class="icon-button detail-refresh clickable" href="{refresh_conversation_url}" title="Refresh conversation" aria-label="Refresh conversation">↻</a>{f'''<a class="session-export-button" href="/export?{esc(urlencode({'provider': provider, 'session': chosen['id']}), quote=True)}" title="Export this session's source files" aria-label="Export this session's source files">⇩</a><form class="detail-delete" method="post" action="/delete" onsubmit="return confirm('Delete this conversation and its stored data?');"><input type="hidden" name="provider" value="{esc(provider)}"><input type="hidden" name="show_empty" value="{int(show_empty)}"><input type="hidden" name="session" value="{esc(chosen["id"])}"><button type="submit" class="icon-button danger" title="Delete conversation" aria-label="Delete conversation">×</button></form>''' if supports_local_actions else ''}<a class="icon-button" href="/?view=settings" title="Settings" aria-label="Settings">⚙</a>{exit_action()}</div></header>
             <section class="session-facts"><div><span>Session ID</span><code>{esc(chosen["id"])}</code><button type="button" class="copy-value" data-copy="{esc(chosen["id"], quote=True)}">Copy</button></div><div><span>Project</span><code>{esc(chosen.get("project") or "Unavailable")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("project") or "Unavailable", quote=True)}">Copy</button></div><div><span>Source</span><code>{esc(chosen.get("source") or "Unknown")}</code><button type="button" class="copy-value" data-copy="{esc(chosen.get("source") or "Unknown", quote=True)}">Copy</button></div></section>
             {token_accounting_note(provider, len(chosen["turns"]))}

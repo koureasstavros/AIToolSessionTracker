@@ -5,11 +5,42 @@ from pathlib import Path
 from unittest.mock import patch
 
 import session_token_viewer
-from src.common import source_pricing as pricing
+from src.common import model_costs as pricing
 from src.providers import anthropic_claude_local_provider
 
 
 class ClaudeInvocationGroupingTests(unittest.TestCase):
+    def test_ide_selection_is_parsed_as_context(self) -> None:
+        prompt, selections = anthropic_claude_local_provider._split_ide_selection(
+            "Please fix this.\n<ide_selection>const value = 1;</ide_selection>"
+        )
+
+        self.assertEqual(prompt, "Please fix this.")
+        self.assertEqual(selections, ["const value = 1;"])
+
+    def test_only_allowlisted_provider_tags_become_context(self) -> None:
+        prompt, context = anthropic_claude_local_provider._split_claude_context(
+            "Use <custom_tag>literally</custom_tag>."
+            "<system-reminder>Provider context</system-reminder>"
+        )
+
+        self.assertEqual(prompt, "Use <custom_tag>literally</custom_tag>.")
+        self.assertEqual(context, [("system-reminder", "Provider context")])
+
+    def test_context_tags_are_excluded_from_title(self) -> None:
+        self.assertEqual(
+            anthropic_claude_local_provider._clean_title(
+                "<ide_selection>selected code</ide_selection>Fix the bug", "fallback"
+            ),
+            "Fix the bug",
+        )
+        self.assertEqual(
+            anthropic_claude_local_provider._clean_title(
+                "<custom_tag>keep this</custom_tag>", "fallback"
+            ),
+            "<custom_tag>keep this</custom_tag>",
+        )
+
     def test_shared_transcript_without_surface_metadata_is_mixed(self) -> None:
         self.assertEqual(
             anthropic_claude_local_provider.tool({"_source": Path("session.jsonl")}),

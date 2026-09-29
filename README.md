@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "tracker", "llm", "slm", "model", "session", "turn", "invocation", "agents", "tools", "context"]
 license: "apache-2.0"
-version: v0.0.39
+version: v0.0.40
 ---
 
 # AI Tool Session Tracker
@@ -147,6 +147,22 @@ Delegated-agent usage is linked back to the owning turn and invocation for
 display and totals, while each model interaction retains its own token and
 cost information.
 
+### Interaction timing
+
+When request and response timestamps are available, the viewer displays timing
+at invocation, turn, and session level:
+
+- **Active duration** is the time from an interaction request to its response.
+	Turn active duration is derived from its invocations when necessary, and
+	session active duration is the sum of its turn active durations.
+- **Idle duration** is the gap between the response of one interaction and the
+	request of the next. It is shown between invocations within a turn and
+	between turns within a session; session idle duration is the sum of those
+	turn-to-turn gaps.
+
+Unavailable timestamps are shown as `Unknown`; the viewer does not estimate
+timing from token counts or text length.
+
 ## Supported providers
 
 Provider-specific storage paths, formats, token behavior, and limitations are
@@ -289,6 +305,8 @@ Every provider returns conversations using the same normalized fields:
 - `id`, `name`, `updated`, `model`, `reasoningEffort`, `project` and `source`
 - `provider`, the provider (ai tool family)
 - `surface`, the harness (ai tool inteface)
+- `activeDurationMs` and `idleDurationMs` when the source includes enough
+	timing information to normalize them
 - `turns`, including user content, assistant content
 - `invocations`, including tools, commands, subagents, etc
 - `tokens`, containing:

@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from src.common.tracker_database import config_database_path, connect_database
-from src.migrations import model_costs_migration
+from src.common import model_mapping
+from src.migrations import migration_config
 
 _SEED_COSTS = json.loads((Path(__file__).with_name("model_costs.json")).read_text(encoding="utf-8"))
 _SEED_MAPPINGS = json.loads((Path(__file__).with_name("model_mapping.json")).read_text(encoding="utf-8"))
-_PRICING_COST_CACHE: dict[Path, list[dict[str, object]]] = {}
+_MODEL_COST_CACHE: dict[Path, list[dict[str, object]]] = {}
+_MODEL_MAPPING_CACHE: dict[Path, dict[str, str]] = {}
 _DELETED_MODEL_COSTS: dict[Path, set[str]] = {}
 _DELETED_MODEL_MAPPINGS: dict[Path, set[str]] = {}
 CANONICAL_CACHE_WRITE_TOKEN_KEYS = ("cacheWrite5mTokens", "cacheWrite1hTokens")
@@ -27,45 +29,6 @@ def mapping_config_path() -> Path:
     return config_database_path()
 
 
-def _initialize_mapping_tables(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS model_mappings (deployment TEXT PRIMARY KEY COLLATE NOCASE, model TEXT NOT NULL)"
-    )
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS tracker_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-    )
-
-
-def _initialize_cost_tables(connection: sqlite3.Connection) -> None:
-    _initialize_mapping_tables(connection)
-    connection.execute(
-        """CREATE TABLE IF NOT EXISTS model_costs (
-            vendor TEXT NOT NULL,
-            model TEXT PRIMARY KEY COLLATE NOCASE,
-            context_threshold INTEGER DEFAULT NULL,
-            input REAL NOT NULL,
-            cache_read REAL,
-            cache_write REAL,
-            cache_write_5m REAL,
-            cache_write_1h REAL,
-            output REAL NOT NULL,
-            reasoning REAL,
-            short_input REAL,
-            short_cache_read REAL,
-            short_cache_write REAL,
-            short_cache_write_5m REAL,
-            short_cache_write_1h REAL,
-            short_output REAL,
-            short_reasoning REAL,
-            long_input REAL,
-            long_cache_read REAL,
-            long_cache_write REAL,
-            long_cache_write_5m REAL,
-            long_cache_write_1h REAL,
-            long_output REAL,
-            long_reasoning REAL
-        )"""
-    )
 def _seed_model_costs(connection: sqlite3.Connection, config_path: Path) -> None:
     """Add bundled model costs that are missing without overwriting edits."""
     deleted = _DELETED_MODEL_COSTS.get(config_path, set())
@@ -134,8 +97,7 @@ def load_model_costs(path: Path | None = None) -> list[dict[str, object]]:
     """Load database-backed model prices in USD per million tokens."""
     try:
         with connect_database(path or mapping_config_path()) as connection, connection:
-            _initialize_cost_tables(connection)
-            model_costs_migration.migration_001_model_costs(connection, _SEED_COSTS)
+            migration_config.migration_001_model_costs(connection, _SEED_COSTS)
             _seed_model_costs(connection, path or mapping_config_path())
             rows = connection.execute(
                 "SELECT vendor, model, input, cache_read, cache_write, cache_write_5m, cache_write_1h, output, reasoning, context_threshold, short_input, short_cache_read, short_cache_write, short_cache_write_5m, short_cache_write_1h, short_output, short_reasoning, long_input, long_cache_read, long_cache_write, long_cache_write_5m, long_cache_write_1h, long_output, long_reasoning FROM model_costs ORDER BY vendor COLLATE NOCASE, model COLLATE NOCASE"
@@ -210,8 +172,7 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
         raise ValueError("Model names must be unique")
     config_path = path or mapping_config_path()
     with connect_database(config_path) as connection, connection:
-        _initialize_cost_tables(connection)
-        model_costs_migration.migration_001_model_costs(connection, _SEED_COSTS)
+        migration_config.migration_001_model_costs(connection, _SEED_COSTS)
         existing_models = {
             _canonical(row[0])
             for row in connection.execute("SELECT model FROM model_costs").fetchall()
@@ -236,16 +197,16 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
                     :long_input, :long_cache_read, :long_cache_write, :long_cache_write_5m, :long_cache_write_1h, :long_output, :long_reasoning)""",
             cleaned,
         )
-    _PRICING_COST_CACHE.pop(config_path, None)
+    _MODEL_COST_CACHE.pop(config_path, None)
     return config_path
 
 
-def _pricing_costs() -> list[dict[str, object]]:
+def _model_costs() -> list[dict[str, object]]:
     """Cache catalog reads used repeatedly while building session cost totals."""
     config_path = mapping_config_path()
-    if config_path not in _PRICING_COST_CACHE:
-        _PRICING_COST_CACHE[config_path] = load_model_costs(config_path)
-    return _PRICING_COST_CACHE[config_path]
+    if config_path not in _MODEL_COST_CACHE:
+        _MODEL_COST_CACHE[config_path] = load_model_costs(config_path)
+    return _MODEL_COST_CACHE[config_path]
 
 
 def _seed_model_mappings(connection: sqlite3.Connection, config_path: Path) -> None:
@@ -270,16 +231,22 @@ def _seed_model_mappings(connection: sqlite3.Connection, config_path: Path) -> N
 
 def load_model_mappings(path: Path | None = None) -> dict[str, str]:
     """Load deployment-to-pricing-model mappings from the tracker database."""
+    config_path = path or mapping_config_path()
+    cached = _MODEL_MAPPING_CACHE.get(config_path)
+    if cached is not None:
+        return dict(cached)
     try:
-        with connect_database(path or mapping_config_path()) as connection, connection:
-            _initialize_mapping_tables(connection)
-            _seed_model_mappings(connection, path or mapping_config_path())
+        with connect_database(config_path) as connection, connection:
+            migration_config.migration_model_mapping_schema(connection)
+            _seed_model_mappings(connection, config_path)
             rows = connection.execute(
                 "SELECT deployment, model FROM model_mappings ORDER BY deployment COLLATE NOCASE"
             ).fetchall()
     except (OSError, sqlite3.Error):
         return {}
-    return {str(deployment): str(model) for deployment, model in rows}
+    result = {str(deployment): str(model) for deployment, model in rows}
+    _MODEL_MAPPING_CACHE[config_path] = result
+    return dict(result)
 
 
 def save_model_mappings(mappings: dict[str, str], path: Path | None = None) -> Path:
@@ -291,7 +258,7 @@ def save_model_mappings(mappings: dict[str, str], path: Path | None = None) -> P
         if str(deployment).strip() and str(model).strip()
     }
     with connect_database(config_path) as connection, connection:
-        _initialize_mapping_tables(connection)
+        migration_config.migration_model_mapping_schema(connection)
         existing_deployments = {
             _canonical(row[0])
             for row in connection.execute("SELECT deployment FROM model_mappings").fetchall()
@@ -313,18 +280,13 @@ def save_model_mappings(mappings: dict[str, str], path: Path | None = None) -> P
         connection.execute(
             "INSERT OR REPLACE INTO tracker_metadata (key, value) VALUES ('model_mapping_json_seeded', '1')"
         )
+    _MODEL_MAPPING_CACHE.pop(config_path, None)
     return config_path
 
 
 def mapped_model(model: object) -> str | None:
-    """Return an explicitly configured pricing model for a deployment ID."""
-    if not isinstance(model, str) or not model.strip():
-        return None
-    wanted = _canonical(model)
-    for deployment, pricing_model in load_model_mappings().items():
-        if _canonical(deployment) == wanted:
-            return pricing_model
-    return None
+    """Compatibility wrapper for the common deployment mapping helper."""
+    return model_mapping.mapped_model(model, load_model_mappings())
 
 
 def find_model(model: object) -> dict[str, Any] | None:
@@ -335,7 +297,7 @@ def find_model(model: object) -> dict[str, Any] | None:
     if explicit_mapping:
         model = explicit_mapping
     wanted = _canonical(model)
-    costs = _pricing_costs()
+    costs = _model_costs()
     exact = next((row for row in costs if _canonical(row["model"]) == wanted), None)
     if exact:
         return exact

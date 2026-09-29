@@ -5,7 +5,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from src.common import source_pricing as pricing
+from src.common import model_costs as pricing
 
 
 class PricingTests(unittest.TestCase):
@@ -106,7 +106,7 @@ class PricingTests(unittest.TestCase):
                 "long_input": 3, "long_output": 4,
             }], database_path)
             with patch.object(pricing, "mapping_config_path", return_value=database_path):
-                pricing._PRICING_COST_CACHE.pop(database_path, None)
+                pricing._MODEL_COST_CACHE.pop(database_path, None)
                 self.assertAlmostEqual(
                     pricing.cost_for_tokens({"inputTokens": 100, "outputTokens": 1_000_000}, "context-tiered"),
                     2.0001,
@@ -272,7 +272,7 @@ class PricingTests(unittest.TestCase):
             database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
             pricing.load_model_costs(database_path)
             with patch.object(pricing, "mapping_config_path", return_value=database_path):
-                pricing._PRICING_COST_CACHE.pop(database_path, None)
+                pricing._MODEL_COST_CACHE.pop(database_path, None)
                 self._assert_model_costs({
                     "swe-1": 0.0,
                     "swe-1-5": 0.0,

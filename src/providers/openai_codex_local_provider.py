@@ -20,6 +20,27 @@ TOKEN_ALIASES = {
     "outputTokens": ("output_tokens", "completion_tokens", "outputTokens"),
     "reasoningTokens": ("reasoning_output_tokens", "reasoning_tokens", "thinking_tokens", "thinkingTokens", "reasoningTokens"),
 }
+CODEX_CONTEXT_TAGS = {"ide_selection", "ide_opened_file", "system-reminder", "environment_context"}
+
+
+def _split_context(content: str) -> tuple[str, list[tuple[str, str]]]:
+    pattern = re.compile(r"<(?P<tag>[A-Za-z][A-Za-z0-9_-]*)>(?P<body>.*?)</(?P=tag)>", re.DOTALL | re.IGNORECASE)
+    context: list[tuple[str, str]] = []
+
+    def replace(match: re.Match[str]) -> str:
+        tag, body = match.group("tag").lower(), match.group("body").strip()
+        if tag not in CODEX_CONTEXT_TAGS or not body:
+            return match.group(0)
+        context.append((tag, body))
+        return ""
+
+    return pattern.sub(replace, content).strip(), context
+
+
+def _clean_title(value: object, fallback: str) -> str:
+    text = str(value or "").strip()
+    prompt, _ = _split_context(text)
+    return prompt or (fallback if re.match(r"<([A-Za-z][A-Za-z0-9_-]*)>", text) else text or fallback)
 
 
 def normalize_usage(source: dict) -> dict:
@@ -163,6 +184,7 @@ def index(root: Path) -> list[dict]:
     parent_ids: dict[str, str] = {}
     for path in files:
         entry = viewer.session_summary(path, "codex", "external")
+        entry["name"] = _clean_title(entry.get("name"), entry["id"])
         records = viewer.safe_json_lines(path)
         metadata = _subagent_metadata(records)
         entry["_children"] = []
@@ -322,8 +344,11 @@ def details(summary: dict) -> dict:
             if instruction_name:
                 viewer.add_internal_instruction(turn, instruction_name, content)
             elif not internal and not turn["user"]:
-                turn["user"] = str(content)
-                viewer.add_attached_files(turn, viewer.mentioned_files(content))
+                prompt, context = _split_context(str(content))
+                turn["user"] = prompt
+                for tag, body in context:
+                    viewer.add_internal_instruction(turn, f"Codex {tag} context", body)
+                viewer.add_attached_files(turn, viewer.mentioned_files(prompt))
         elif content and role in {"developer", "system"}:
             label = "Codex developer instructions" if role == "developer" else "Codex system instructions"
             viewer.add_internal_instruction(turn, label, content)
@@ -349,7 +374,9 @@ def details(summary: dict) -> dict:
         first = records[0]
         result["id"], result["name"] = identity(first, result["id"])
         if result["name"] == result["id"]:
-            result["name"] = viewer.derived_conversation_name(records, result["id"])
+            result["name"] = _clean_title(
+                viewer.derived_conversation_name(records, result["id"]), result["id"]
+            )
     result["turns"] = list(turns.values())
     result["model"] = result["model"] or "codex"
     result["deployment"] = viewer.deployment_from_records(records)
