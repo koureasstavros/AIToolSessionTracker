@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.common import model_costs as pricing
+from session_token_viewer import render_model_costs_page
 
 
 class PricingTests(unittest.TestCase):
@@ -18,6 +19,13 @@ class PricingTests(unittest.TestCase):
 
         self.assertGreater(count, 1)
         self.assertTrue(any(row["model"] == "gpt-4o" for row in costs))
+        expected_models = {
+            "claude-opus-5-5",
+            "gpt-6-luna",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+        }
+        self.assertTrue(expected_models.issubset({row["model"] for row in costs}))
 
     def test_model_costs_add_missing_bundled_entries_on_later_load(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -70,6 +78,46 @@ class PricingTests(unittest.TestCase):
             with patch.object(pricing, "mapping_config_path", return_value=database_path):
                 self.assertTrue(any(row["model"] == "test-model" for row in pricing.load_model_costs()))
                 self.assertEqual(pricing.cost_for_tokens({"inputTokens": 1_000_000, "outputTokens": 1_000_000}, "test-model"), 6.0)
+
+    def test_cache_threshold_round_trips_with_model_costs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            pricing.save_model_costs([{
+                "vendor": "Test", "model": "cache-threshold",
+                "cache_threshold": "true", "input": 1, "output": 2,
+                "short_cache_write_5m": 3, "short_cache_write_1h": 4,
+            }], database_path)
+
+            saved = next(row for row in pricing.load_model_costs(database_path) if row["model"] == "cache-threshold")
+
+        self.assertEqual(saved["cache_threshold"], 1)
+        self.assertEqual(saved["short_cache_write_5m"], 3.0)
+        self.assertEqual(saved["short_cache_write_1h"], 4.0)
+
+    def test_cache_threshold_override_on_bundled_model_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            pricing.load_model_costs(database_path)
+            with closing(sqlite3.connect(database_path)) as database:
+                database.execute("UPDATE model_costs SET cache_threshold = 1 WHERE model = 'gpt-4o'")
+                database.commit()
+
+            saved = next(row for row in pricing.load_model_costs(database_path) if row["model"] == "gpt-4o")
+
+        self.assertEqual(saved["cache_threshold"], 1)
+
+    def test_model_cost_page_hides_hourly_cache_rate_when_threshold_is_false(self) -> None:
+        rows = [
+            {"vendor": "Test", "model": "no-hourly", "cache_threshold": 0},
+            {"vendor": "Test", "model": "hourly", "cache_threshold": 1},
+        ]
+        with patch.object(pricing, "load_model_costs", return_value=rows):
+            page = render_model_costs_page()
+
+        self.assertIn("<th>Context threshold</th><th>Cache threshold</th>", page)
+        self.assertNotIn("Cache write (legacy)", page)
+        self.assertIn('name="cost_short_cache_write_1h" type="hidden"', page)
+        self.assertIn('name="cost_short_cache_write_1h" type="number"', page)
 
     def test_reasoning_tokens_use_reasoning_rate_instead_of_being_added_twice(self) -> None:
         tokens = {
@@ -147,6 +195,9 @@ class PricingTests(unittest.TestCase):
             mappings = pricing.load_model_mappings(database_path)
 
             self.assertEqual(mappings["GPT56LUNA-GS"], "gpt-5.6-luna")
+            self.assertEqual(mappings["GPT6LUNA-GS"], "gpt-6-luna")
+            self.assertEqual(mappings["GPT6SOL-GS"], "gpt-6-sol")
+            self.assertEqual(mappings["GPT61SOL-GS"], "gpt-6.1-sol")
             with closing(sqlite3.connect(database_path)) as database:
                 self.assertEqual(
                     database.execute(

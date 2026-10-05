@@ -4,6 +4,11 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Tracker, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.41 — 2026-10-05
+
+- Added more pre-defined model names, info, costs into model costs page
+- Added a per-model cache threshold toggle for 5m and 1h cache-write rates and removed the legacy cache-write field from Model Costs
+
 ### Version v0.0.40 — 2026-09-29
 
 - Added timing kpi labels into hierarchy like active and idle

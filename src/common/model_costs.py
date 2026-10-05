@@ -9,7 +9,7 @@ from typing import Any
 
 from src.common.tracker_database import config_database_path, connect_database
 from src.common import model_mapping
-from src.migrations import migration_config
+from src.migrations import migration_config, migration_config_001, migration_config_002
 
 _SEED_COSTS = json.loads((Path(__file__).with_name("model_costs.json")).read_text(encoding="utf-8"))
 _SEED_MAPPINGS = json.loads((Path(__file__).with_name("model_mapping.json")).read_text(encoding="utf-8"))
@@ -31,6 +31,16 @@ def mapping_config_path() -> Path:
 
 def _seed_model_costs(connection: sqlite3.Connection, config_path: Path) -> None:
     """Add bundled model costs that are missing without overwriting edits."""
+    def cache_threshold_for(row: dict[str, object]) -> int:
+        if "cache_threshold" in row:
+            return int(bool(row["cache_threshold"]))
+        for tier in ("short", "long"):
+            five_minute = row.get(f"{tier}_cache_write_5m", row.get("cache_write_5m", row.get("cache_write")))
+            one_hour = row.get(f"{tier}_cache_write_1h", row.get("cache_write_1h", row.get("cache_write")))
+            if five_minute is not None and one_hour is not None and five_minute != one_hour:
+                return 1
+        return 0
+
     deleted = _DELETED_MODEL_COSTS.get(config_path, set())
     bundled_costs = [
         {
@@ -43,6 +53,7 @@ def _seed_model_costs(connection: sqlite3.Connection, config_path: Path) -> None
             "output": row.get("output", row.get("short_output")),
             "reasoning": row.get("reasoning", row.get("short_reasoning")),
             "context_threshold": row.get("context_threshold"),
+            "cache_threshold": cache_threshold_for(row),
             "short_input": row.get("short_input", row.get("input")),
             "short_cache_read": row.get("short_cache_read", row.get("cache_read")),
             "short_cache_write": row.get("short_cache_write", row.get("cache_write")),
@@ -64,11 +75,11 @@ def _seed_model_costs(connection: sqlite3.Connection, config_path: Path) -> None
     connection.executemany(
         """INSERT OR IGNORE INTO model_costs
         (model, vendor, input, cache_read, cache_write, cache_write_5m, cache_write_1h, output, reasoning,
-         context_threshold,
+         context_threshold, cache_threshold,
          short_input, short_cache_read, short_cache_write, short_cache_write_5m, short_cache_write_1h, short_output, short_reasoning,
          long_input, long_cache_read, long_cache_write, long_cache_write_5m, long_cache_write_1h, long_output, long_reasoning)
         VALUES (:model, :vendor, :input, :cache_read, :cache_write, :cache_write_5m, :cache_write_1h, :output, :reasoning,
-            :context_threshold,
+            :context_threshold, :cache_threshold,
             :short_input, :short_cache_read, :short_cache_write, :short_cache_write_5m, :short_cache_write_1h, :short_output, :short_reasoning,
             :long_input, :long_cache_read, :long_cache_write, :long_cache_write_5m, :long_cache_write_1h, :long_output, :long_reasoning)""",
         bundled_costs,
@@ -77,6 +88,7 @@ def _seed_model_costs(connection: sqlite3.Connection, config_path: Path) -> None
         """UPDATE model_costs SET input = :input, cache_read = :cache_read,
             cache_write = :cache_write, cache_write_5m = :cache_write_5m,
             cache_write_1h = :cache_write_1h, output = :output, reasoning = :reasoning,
+            cache_threshold = :cache_threshold,
             short_input = :short_input, short_cache_read = :short_cache_read,
             short_cache_write = :short_cache_write, short_cache_write_5m = :short_cache_write_5m,
             short_cache_write_1h = :short_cache_write_1h, short_output = :short_output,
@@ -85,7 +97,8 @@ def _seed_model_costs(connection: sqlite3.Connection, config_path: Path) -> None
             long_cache_write_5m = :long_cache_write_5m, long_cache_write_1h = :long_cache_write_1h,
             long_output = :long_output, long_reasoning = :long_reasoning
             WHERE model = :model AND short_input = input AND long_input = input
-            AND short_output = output AND long_output = output""",
+            AND short_output = output AND long_output = output
+            AND cache_threshold = :cache_threshold""",
         bundled_costs,
     )
     connection.execute(
@@ -97,14 +110,15 @@ def load_model_costs(path: Path | None = None) -> list[dict[str, object]]:
     """Load database-backed model prices in USD per million tokens."""
     try:
         with connect_database(path or mapping_config_path()) as connection, connection:
-            migration_config.migration_001_model_costs(connection, _SEED_COSTS)
+            migration_config_001.migration_001_model_costs(connection, _SEED_COSTS)
+            migration_config_002.migration_002_cache_threshold(connection)
             _seed_model_costs(connection, path or mapping_config_path())
             rows = connection.execute(
-                "SELECT vendor, model, input, cache_read, cache_write, cache_write_5m, cache_write_1h, output, reasoning, context_threshold, short_input, short_cache_read, short_cache_write, short_cache_write_5m, short_cache_write_1h, short_output, short_reasoning, long_input, long_cache_read, long_cache_write, long_cache_write_5m, long_cache_write_1h, long_output, long_reasoning FROM model_costs ORDER BY vendor COLLATE NOCASE, model COLLATE NOCASE"
+                "SELECT vendor, model, input, cache_read, cache_write, cache_write_5m, cache_write_1h, output, reasoning, context_threshold, cache_threshold, short_input, short_cache_read, short_cache_write, short_cache_write_5m, short_cache_write_1h, short_output, short_reasoning, long_input, long_cache_read, long_cache_write, long_cache_write_5m, long_cache_write_1h, long_output, long_reasoning FROM model_costs ORDER BY vendor COLLATE NOCASE, model COLLATE NOCASE"
             ).fetchall()
     except (OSError, sqlite3.Error):
         return []
-    keys = ("vendor", "model", "input", "cache_read", "cache_write", "cache_write_5m", "cache_write_1h", "output", "reasoning", "context_threshold", "short_input", "short_cache_read", "short_cache_write", "short_cache_write_5m", "short_cache_write_1h", "short_output", "short_reasoning", "long_input", "long_cache_read", "long_cache_write", "long_cache_write_5m", "long_cache_write_1h", "long_output", "long_reasoning")
+    keys = ("vendor", "model", "input", "cache_read", "cache_write", "cache_write_5m", "cache_write_1h", "output", "reasoning", "context_threshold", "cache_threshold", "short_input", "short_cache_read", "short_cache_write", "short_cache_write_5m", "short_cache_write_1h", "short_output", "short_reasoning", "long_input", "long_cache_read", "long_cache_write", "long_cache_write_5m", "long_cache_write_1h", "long_output", "long_reasoning")
     result = [dict(zip(keys, row)) for row in rows]
     for row in result:
         tier_keys = ("input", "cache_read", "cache_write", "output", "reasoning")
@@ -137,6 +151,16 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
             if numeric < 0:
                 raise ValueError(f"{model}: {key} cannot be negative")
             row[key] = numeric
+        cache_threshold = cost.get("cache_threshold", False)
+        if isinstance(cache_threshold, str):
+            normalized_threshold = cache_threshold.strip().lower()
+            if normalized_threshold not in {"true", "false", "1", "0"}:
+                raise ValueError(f"{model}: cache_threshold must be true or false")
+            row["cache_threshold"] = int(normalized_threshold in {"true", "1"})
+        elif cache_threshold in (True, False, 0, 1):
+            row["cache_threshold"] = int(bool(cache_threshold))
+        else:
+            raise ValueError(f"{model}: cache_threshold must be true or false")
         for key in ("context_threshold",):
             value = cost.get(key)
             if value in (None, ""):
@@ -172,7 +196,8 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
         raise ValueError("Model names must be unique")
     config_path = path or mapping_config_path()
     with connect_database(config_path) as connection, connection:
-        migration_config.migration_001_model_costs(connection, _SEED_COSTS)
+        migration_config_001.migration_001_model_costs(connection, _SEED_COSTS)
+        migration_config_002.migration_002_cache_threshold(connection)
         existing_models = {
             _canonical(row[0])
             for row in connection.execute("SELECT model FROM model_costs").fetchall()
@@ -188,11 +213,11 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
         connection.executemany(
             """INSERT INTO model_costs
             (vendor, model, input, cache_read, cache_write, cache_write_5m, cache_write_1h, output, reasoning,
-             context_threshold, short_input, short_cache_read,
+             context_threshold, cache_threshold, short_input, short_cache_read,
              short_cache_write, short_cache_write_5m, short_cache_write_1h, short_output, short_reasoning, long_input, long_cache_read,
              long_cache_write, long_cache_write_5m, long_cache_write_1h, long_output, long_reasoning)
             VALUES (:vendor, :model, :input, :cache_read, :cache_write, :cache_write_5m, :cache_write_1h, :output, :reasoning,
-                    :context_threshold, :short_input,
+                    :context_threshold, :cache_threshold, :short_input,
                     :short_cache_read, :short_cache_write, :short_cache_write_5m, :short_cache_write_1h, :short_output, :short_reasoning,
                     :long_input, :long_cache_read, :long_cache_write, :long_cache_write_5m, :long_cache_write_1h, :long_output, :long_reasoning)""",
             cleaned,

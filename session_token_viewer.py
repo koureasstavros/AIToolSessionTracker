@@ -2776,29 +2776,33 @@ def render_model_costs_page() -> str:
         return "" if value is None else f"{float(value):g}"
 
     def rate_cells(row: dict[str, object], tier: str) -> str:
-        """Render rate cells, merging equal 5m/1h cache rates."""
-        keys = ("input", "cache_read", "cache_write", "output", "reasoning")
+        """Render standard rates and optional 5m/1h cache-write rates."""
+        keys = ("input", "cache_read")
         cells = ''.join(
-            f'<td><input name="cost_{tier}_{key}" type="number" min="0" step="any" value="{esc(field_value(row, f"{tier}_{key}"), quote=True)}" placeholder="{esc(field_value(row, key), quote=True)}"{" required" if key in {"input", "output"} else ""}></td>'
+            f'<td><input name="cost_{tier}_{key}" type="number" min="0" step="any" value="{esc(field_value(row, f"{tier}_{key}"), quote=True)}" placeholder="{esc(field_value(row, key), quote=True)}"{" required" if key == "input" else ""}></td>'
             for key in keys
         )
         cache_5m = field_value(row, f"{tier}_cache_write_5m")
         cache_1h = field_value(row, f"{tier}_cache_write_1h")
-        if cache_5m == cache_1h:
-            merged = (
-                f'<td colspan="2" class="cache-write-merged">'
-                f'<input name="cost_{tier}_cache_write_5m" type="number" min="0" step="any" value="{esc(cache_5m, quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}">'
-                f'<input name="cost_{tier}_cache_write_1h" type="hidden" value="{esc(cache_1h, quote=True)}">'
-                '</td>'
-            )
-        else:
-            merged = (
-                f'<td><input name="cost_{tier}_cache_write_5m" type="number" min="0" step="any" value="{esc(cache_5m, quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}"></td>'
-                f'<td><input name="cost_{tier}_cache_write_1h" type="number" min="0" step="any" value="{esc(cache_1h, quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}"></td>'
-            )
-        return cells.replace(
-            f'<td><input name="cost_{tier}_cache_write" type="number" min="0" step="any" value="{esc(field_value(row, f"{tier}_cache_write"), quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}"></td>',
-            f'<td><input name="cost_{tier}_cache_write" type="number" min="0" step="any" value="{esc(field_value(row, f"{tier}_cache_write"), quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}"></td>' + merged,
+        cache_enabled = bool(row.get("cache_threshold"))
+        cache_1h_type = "number" if cache_enabled else "hidden"
+        cache_cells = (
+            f'<td><input name="cost_{tier}_cache_write_5m" type="number" min="0" step="any" value="{esc(cache_5m, quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}"></td>'
+            f'<td class="cache-write-1h-cell"><input name="cost_{tier}_cache_write_1h" type="{cache_1h_type}" min="0" step="any" value="{esc(cache_1h, quote=True)}" placeholder="{esc(field_value(row, "cache_write"), quote=True)}"></td>'
+        )
+        cells += cache_cells
+        for key in ("output", "reasoning"):
+            cells += f'<td><input name="cost_{tier}_{key}" type="number" min="0" step="any" value="{esc(field_value(row, f"{tier}_{key}"), quote=True)}" placeholder="{esc(field_value(row, key), quote=True)}"{" required" if key == "output" else ""}></td>'
+        return cells
+
+    def cache_threshold_cell(row: dict[str, object], rowspan: bool = False) -> str:
+        span = ' rowspan="2"' if rowspan else ""
+        value = "true" if row.get("cache_threshold") else "false"
+        return (
+            f'<td{span}><select name="cost_cache_threshold">'
+            f'<option value="true"{" selected" if value == "true" else ""}>True</option>'
+            f'<option value="false"{" selected" if value == "false" else ""}>False</option>'
+            '</select></td>'
         )
 
     def row_markup(row: dict[str, object] | None = None) -> str:
@@ -2810,14 +2814,16 @@ def render_model_costs_page() -> str:
                 '<tr class="cost-row cost-single-row">'
                 f'<td><input name="cost_vendor" value="{esc(str(row.get("vendor") or "Custom"), quote=True)}" placeholder="Vendor" required></td>'
                 f'<td><input name="cost_model" value="{esc(str(row.get("model") or ""), quote=True)}" placeholder="Model ID" required></td>'
-                '<td><input name="cost_context_threshold" type="number" min="0" step="1" value="" placeholder="Optional"></td>' + rates
+                '<td><input name="cost_context_threshold" type="number" min="0" step="1" value="" placeholder="Optional"></td>'
+                + cache_threshold_cell(row) + rates
                 + '<td><button type="button" class="mapping-remove cost-remove" aria-label="Remove model cost">×</button></td></tr>'
-                + '<tr class="cost-row cost-long-editor" hidden><td class="cost-tier-label" style="display:none">Long context</td><td style="display:none"></td><td style="display:none"></td>' + long_rates + '<td style="display:none"></td></tr>'
+                + '<tr class="cost-row cost-long-editor" hidden><td class="cost-tier-label" style="display:none">Long context</td><td style="display:none"></td><td style="display:none"></td><td style="display:none"></td>' + long_rates + '<td style="display:none"></td></tr>'
             )
         metadata = (
             f'<td rowspan="2"><input name="cost_vendor" value="{esc(str(row.get("vendor") or "Custom"), quote=True)}" placeholder="Vendor" required></td>'
             f'<td rowspan="2"><input name="cost_model" value="{esc(str(row.get("model") or ""), quote=True)}" placeholder="Model ID" required></td>'
             + f'<td rowspan="2"><input name="cost_context_threshold" type="number" min="0" step="1" value="{esc(field_value(row, "context_threshold"), quote=True)}" placeholder="272001" required></td>'
+            + cache_threshold_cell(row, rowspan=True)
         )
         tiers = []
         for tier, label in (("short", "Short context"), ("long", "Long context")):
@@ -2833,11 +2839,36 @@ def render_model_costs_page() -> str:
     script = """<script>(function(){
         var body=document.getElementById('cost-rows'),add=document.getElementById('cost-add');
         if(!body||!add)return;
+        var updateCacheThreshold=function(first){
+            if(!first)return;
+            var enabled=first.querySelector('select[name="cost_cache_threshold"]').value==='true';
+            var rows=[first];
+            if(first.classList.contains('cost-tier-row'))rows.push(first.nextElementSibling);
+            else if(first.nextElementSibling&&first.nextElementSibling.classList.contains('cost-long-editor'))rows.push(first.nextElementSibling);
+            rows.forEach(function(row){
+                if(!row)return;
+                var cell=row.querySelector('.cache-write-1h-cell'),input=cell&&cell.querySelector('input');
+                if(input)input.type=enabled?'number':'hidden';
+            });
+            var showHourly=Array.from(body.querySelectorAll('select[name="cost_cache_threshold"]')).some(function(select){return select.value==='true';});
+            var heading=body.closest('table').querySelector('.cache-write-1h-heading');
+            if(heading)heading.hidden=!showHourly;
+            body.querySelectorAll('.cache-write-1h-cell').forEach(function(cell){cell.hidden=!showHourly;});
+        };
+        body.querySelectorAll('.cost-row:not(.cost-long-editor):not(.cost-tier-row)').forEach(updateCacheThreshold);
+        body.querySelectorAll('.cost-tier-row').forEach(function(row){if(row.querySelector('select[name="cost_cache_threshold"]'))updateCacheThreshold(row);});
         add.addEventListener('click',function(){
             var rows=Array.from(body.querySelectorAll('.cost-row')),group=rows.slice(0,2);
             if(group.length<2)return;
             var clones=group.map(function(row){return row.cloneNode(true);});
-            clones.forEach(function(row){row.querySelectorAll('input').forEach(function(input){input.value=input.name==='cost_vendor'?'Custom':'';});body.appendChild(row);});
+            clones.forEach(function(row){row.querySelectorAll('input').forEach(function(input){input.value=input.name==='cost_vendor'?'Custom':'';});});
+            var threshold=clones[0].querySelector('select[name="cost_cache_threshold"]');
+            if(threshold)threshold.value='false';
+            clones.forEach(function(row){body.appendChild(row);});
+            updateCacheThreshold(clones[0]);
+        });
+        body.addEventListener('change',function(event){
+            if(event.target.matches('select[name="cost_cache_threshold"]'))updateCacheThreshold(event.target.closest('.cost-row'));
         });
         body.addEventListener('input',function(event){
             if(!event.target.matches('input[name="cost_context_threshold"]'))return;
@@ -2850,21 +2881,23 @@ def render_model_costs_page() -> str:
                 first.classList.toggle('cost-single-row',!merged);
                 first.classList.toggle('cost-tier-row',merged);
                 Array.from(first.children).forEach(function(cell,index){
-                    if(index<3||index===first.children.length-1){
+                    if(index<4||index===first.children.length-1){
                         if(merged)cell.rowSpan=2;else cell.removeAttribute('rowspan');
                     }
                 });
                 editor.querySelectorAll('input').forEach(function(input){
                     if(/_(input|output)$/.test(input.name))input.required=Boolean(event.target.value);
                 });
+                updateCacheThreshold(first);
             }
         });
         body.addEventListener('click',function(event){
             var remove=event.target.closest('.cost-remove');
             if(!remove)return;
             var row=remove.closest('.cost-row'),group=row.classList.contains('cost-long-editor')?[row.previousElementSibling,row]:[row,row.nextElementSibling].filter(Boolean),rows=body.querySelectorAll('.cost-row');
-            if(rows.length>2){group.forEach(function(item){item.remove();});return;}
+            if(rows.length>2){group.forEach(function(item){item.remove();});var remaining=body.querySelector('select[name="cost_cache_threshold"]');if(remaining)updateCacheThreshold(remaining.closest('.cost-row'));else body.closest('table').querySelector('.cache-write-1h-heading').hidden=true;return;}
             group.forEach(function(item){item.querySelectorAll('input').forEach(function(input){input.value=input.name==='cost_vendor'?'Custom':'';});});
+            var threshold=group[0].querySelector('select[name="cost_cache_threshold"]');if(threshold){threshold.value='false';updateCacheThreshold(group[0]);}
         });
     })();</script>"""
     return (
@@ -2880,7 +2913,7 @@ def render_model_costs_page() -> str:
         + esc(pricing.mapping_config_path()) + '</code> the first time the app opens; later changes are stored only in the database.</p></div>'
         + '<div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>' + exit_action() + '</div></header>'
         + '<section class="settings-card"><div class="section-heading"><div><span class="section-kicker">COST CATALOG</span><h2>Model ID to Token Rates</h2></div><span class="muted">Blank cache or reasoning rates are treated as unavailable</span></div>'
-        + '<form method="post" action="/settings"><input type="hidden" name="settings_action" value="model-costs"><div class="cost-table-wrap"><table class="cost-table"><thead><tr><th>Vendor</th><th>Model</th><th>Context threshold</th><th>Input / 1M</th><th>Cache read / 1M</th><th>Cache write (legacy) / 1M</th><th>Cache write 5m / 1M</th><th>Cache write 1h / 1M</th><th>Output / 1M</th><th>Reasoning / 1M</th><th></th></tr></thead><tbody id="cost-rows">'
+        + '<form method="post" action="/settings"><input type="hidden" name="settings_action" value="model-costs"><div class="cost-table-wrap"><table class="cost-table"><thead><tr><th>Vendor</th><th>Model</th><th>Context threshold</th><th>Cache threshold</th><th>Input / 1M</th><th>Cache read / 1M</th><th>Cache write 5m / 1M</th><th class="cache-write-1h-heading">Cache write 1h / 1M</th><th>Output / 1M</th><th>Reasoning / 1M</th><th></th></tr></thead><tbody id="cost-rows">'
         + rows + '</tbody></table></div><div class="settings-actions"><button type="button" class="settings-secondary" id="cost-add">Add model</button><button type="submit" class="settings-primary">Save costs</button></div></form>'
         + script + '</section></main>'
     )
@@ -3189,7 +3222,7 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/settings":
             form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
             if form.get("settings_action", [""])[0] == "model-costs":
-                fields = ("vendor", "model", "context_threshold", "short_input", "short_cache_read", "short_cache_write", "short_cache_write_5m", "short_cache_write_1h", "short_output", "short_reasoning", "long_input", "long_cache_read", "long_cache_write", "long_cache_write_5m", "long_cache_write_1h", "long_output", "long_reasoning")
+                fields = ("vendor", "model", "context_threshold", "cache_threshold", "short_input", "short_cache_read", "short_cache_write", "short_cache_write_5m", "short_cache_write_1h", "short_output", "short_reasoning", "long_input", "long_cache_read", "long_cache_write", "long_cache_write_5m", "long_cache_write_1h", "long_output", "long_reasoning")
                 values = {field: form.get(f"cost_{field}", []) for field in fields}
                 row_count = max((len(items) for items in values.values()), default=0)
                 costs = [

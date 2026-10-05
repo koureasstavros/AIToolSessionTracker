@@ -36,7 +36,7 @@ The app reads sensitive local transcripts and must remain local-only. Do not add
 
 Do not add runtime column-reordering/renaming or one-off schema-reordering/renaming migrations to source files while doing changes. Apply column-order/name changes directly to the local SQLite database with a one-time script, then keep only the final schema definition in source code. Migration state for that direct database change should remain documented in code comments or repository guidance, not persisted as an additional database marker.
 
-Database and data migrations belong in dedicated modules under the sibling `src/migrations/` package. Filenames must end with `_migration.py`. Number every migration explicitly (for example, `MIGRATION_001` and `migration_001_*`) and keep migration execution calls in the owning feature module.
+Database and data migrations belong in dedicated modules under the sibling `src/migrations/` package. Keep each feature area's initial schema creation code in its unnumbered base module, such as `migration_config.py` or `migration_content.py`. Number follow-up migrations with the matching `migration_<area>_XXX.py` convention, such as `migration_config_001.py`, `migration_config_002.py`, or `migration_content_001.py`, and keep migration execution calls in the owning feature module. Each numbered module should expose a matching migration identifier (for example, `MIGRATION_001`) and contain only that migration area's upgrade logic; shared initial schema helpers remain in the unnumbered base module.
 
 ## Session Scanning and Empty Sessions
 
