@@ -4,19 +4,16 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from src.common.tracker_database import config_database_path, connect_database
+from src.common.tracker_database import config_database_path, connect_config_database
 from src.common import model_mapping
-from src.migrations import migration_config, migration_config_001, migration_config_002
 
 _SEED_COSTS = json.loads((Path(__file__).with_name("model_costs.json")).read_text(encoding="utf-8"))
-_SEED_MAPPINGS = json.loads((Path(__file__).with_name("model_mapping.json")).read_text(encoding="utf-8"))
 _MODEL_COST_CACHE: dict[Path, list[dict[str, object]]] = {}
-_MODEL_MAPPING_CACHE: dict[Path, dict[str, str]] = {}
 _DELETED_MODEL_COSTS: dict[Path, set[str]] = {}
-_DELETED_MODEL_MAPPINGS: dict[Path, set[str]] = {}
 CANONICAL_CACHE_WRITE_TOKEN_KEYS = ("cacheWrite5mTokens", "cacheWrite1hTokens")
 
 
@@ -109,9 +106,7 @@ def _seed_model_costs(connection: sqlite3.Connection, config_path: Path) -> None
 def load_model_costs(path: Path | None = None) -> list[dict[str, object]]:
     """Load database-backed model prices in USD per million tokens."""
     try:
-        with connect_database(path or mapping_config_path()) as connection, connection:
-            migration_config_001.migration_001_model_costs(connection, _SEED_COSTS)
-            migration_config_002.migration_002_cache_threshold(connection)
+        with connect_config_database(path or mapping_config_path()) as connection:
             _seed_model_costs(connection, path or mapping_config_path())
             rows = connection.execute(
                 "SELECT vendor, model, input, cache_read, cache_write, cache_write_5m, cache_write_1h, output, reasoning, context_threshold, cache_threshold, short_input, short_cache_read, short_cache_write, short_cache_write_5m, short_cache_write_1h, short_output, short_reasoning, long_input, long_cache_read, long_cache_write, long_cache_write_5m, long_cache_write_1h, long_output, long_reasoning FROM model_costs ORDER BY vendor COLLATE NOCASE, model COLLATE NOCASE"
@@ -192,12 +187,15 @@ def save_model_costs(costs: list[dict[str, object]], path: Path | None = None) -
         if row["input"] is None or row["output"] is None:
             raise ValueError(f"{model}: input and output costs are required")
         cleaned.append(row)
-    if len({str(row["model"]).lower() for row in cleaned}) != len(cleaned):
-        raise ValueError("Model names must be unique")
+    seen_models: set[str] = set()
+    for row in cleaned:
+        model = str(row["model"])
+        key = model.lower()
+        if key in seen_models:
+            raise ValueError(f"Model '{model}' appears more than once. Rename or remove the duplicate before saving.")
+        seen_models.add(key)
     config_path = path or mapping_config_path()
-    with connect_database(config_path) as connection, connection:
-        migration_config_001.migration_001_model_costs(connection, _SEED_COSTS)
-        migration_config_002.migration_002_cache_threshold(connection)
+    with connect_config_database(config_path) as connection:
         existing_models = {
             _canonical(row[0])
             for row in connection.execute("SELECT model FROM model_costs").fetchall()
@@ -234,80 +232,19 @@ def _model_costs() -> list[dict[str, object]]:
     return _MODEL_COST_CACHE[config_path]
 
 
-def _seed_model_mappings(connection: sqlite3.Connection, config_path: Path) -> None:
-    """Add bundled deployment mappings that are missing without replacing edits."""
-    mappings = _SEED_MAPPINGS.get("mappings") if isinstance(_SEED_MAPPINGS, dict) else {}
-    deleted = _DELETED_MODEL_MAPPINGS.get(config_path, set())
-    if isinstance(mappings, dict):
-        connection.executemany(
-            "INSERT OR IGNORE INTO model_mappings (deployment, model) VALUES (?, ?)",
-            [
-                (str(deployment).strip(), str(model).strip())
-                for deployment, model in mappings.items()
-                if str(deployment).strip()
-                and _canonical(deployment) not in deleted
-                and str(model).strip()
-            ],
-        )
-    connection.execute(
-        "INSERT OR REPLACE INTO tracker_metadata (key, value) VALUES ('model_mapping_json_seeded', '1')"
-    )
-
-
 def load_model_mappings(path: Path | None = None) -> dict[str, str]:
-    """Load deployment-to-pricing-model mappings from the tracker database."""
-    config_path = path or mapping_config_path()
-    cached = _MODEL_MAPPING_CACHE.get(config_path)
-    if cached is not None:
-        return dict(cached)
-    try:
-        with connect_database(config_path) as connection, connection:
-            migration_config.migration_model_mapping_schema(connection)
-            _seed_model_mappings(connection, config_path)
-            rows = connection.execute(
-                "SELECT deployment, model FROM model_mappings ORDER BY deployment COLLATE NOCASE"
-            ).fetchall()
-    except (OSError, sqlite3.Error):
-        return {}
-    result = {str(deployment): str(model) for deployment, model in rows}
-    _MODEL_MAPPING_CACHE[config_path] = result
-    return dict(result)
+    """Compatibility wrapper for deployment mappings."""
+    return model_mapping.load_model_mappings(path or mapping_config_path())
+
+
+def validate_model_mapping_rows(rows: Iterable[tuple[object, object]]) -> dict[str, str]:
+    """Compatibility wrapper for deployment mapping validation."""
+    return model_mapping.validate_model_mapping_rows(rows)
 
 
 def save_model_mappings(mappings: dict[str, str], path: Path | None = None) -> Path:
-    """Persist deployment mappings in the shared local tracker database."""
-    config_path = path or mapping_config_path()
-    cleaned = {
-        str(deployment).strip(): str(model).strip()
-        for deployment, model in mappings.items()
-        if str(deployment).strip() and str(model).strip()
-    }
-    with connect_database(config_path) as connection, connection:
-        migration_config.migration_model_mapping_schema(connection)
-        existing_deployments = {
-            _canonical(row[0])
-            for row in connection.execute("SELECT deployment FROM model_mappings").fetchall()
-        }
-        bundled_deployments = {
-            _canonical(deployment)
-            for deployment in (_SEED_MAPPINGS.get("mappings", {}) if isinstance(_SEED_MAPPINGS, dict) else {})
-        }
-        submitted_deployments = {_canonical(deployment) for deployment in cleaned}
-        deleted = set(_DELETED_MODEL_MAPPINGS.get(config_path, set()))
-        deleted.difference_update(submitted_deployments)
-        deleted.update(existing_deployments.intersection(bundled_deployments) - submitted_deployments)
-        _DELETED_MODEL_MAPPINGS[config_path] = deleted
-        connection.execute("DELETE FROM model_mappings")
-        connection.executemany(
-            "INSERT INTO model_mappings (deployment, model) VALUES (?, ?)",
-            sorted(cleaned.items(), key=lambda item: item[0].lower()),
-        )
-        connection.execute(
-            "INSERT OR REPLACE INTO tracker_metadata (key, value) VALUES ('model_mapping_json_seeded', '1')"
-        )
-    _MODEL_MAPPING_CACHE.pop(config_path, None)
-    return config_path
-
+    """Compatibility wrapper for deployment mapping persistence."""
+    return model_mapping.save_model_mappings(mappings, path or mapping_config_path())
 
 def mapped_model(model: object) -> str | None:
     """Compatibility wrapper for the common deployment mapping helper."""

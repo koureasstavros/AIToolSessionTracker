@@ -2,7 +2,7 @@
 language: ["en"]
 tags: ["ai", "tool", "tracker", "llm", "slm", "model", "session", "turn", "invocation", "agents", "tools", "context"]
 license: "apache-2.0"
-version: v0.0.41
+version: v0.0.42
 ---
 
 # AI Tool Session Tracker
@@ -247,6 +247,10 @@ storage and transcript formats.
 
 ## Settings
 
+The local configuration database is initialized and upgraded at startup. Direct
+configuration reads or writes also apply pending upgrades to their database path.
+The OTEL content database is initialized separately when content storage is used.
+
 ### Model costs
 
 **Settings → Model costs** manages model pricing in USD per one million tokens,
@@ -262,7 +266,9 @@ deployment names to entries in that catalog.
 cost catalog. The bundled `src/common/model_mapping.json` aliases are copied to
 the local `AI-Tool-Session-Tracker-config.db` database on first launch; after that, settings
 edits remain local and are never replaced by the bundled defaults. Exact
-deployment matches take precedence over automatic model matching.
+deployment matches take precedence over automatic model matching. Use the
+Duplicate button beside a mapping to copy it, then give the copy a unique
+deployment name; duplicate names are highlighted and cannot be saved.
 
 ### Source Routing
 
@@ -271,7 +277,11 @@ provider: **Local storage** keeps the existing provider-specific discovery,
 while **OTEL service** shows only signals received for that provider. The
 bundled `src/common/source_routing.json` configuration seeds the local
 `source_routing` table on first launch and routes every provider to local
-storage by default.
+storage by default. Provider IDs use `github_copilot`, `openai_codex`,
+`anthropic_claude`, and `google_antigravity` in settings, URLs, archives, and
+newly ingested OTEL data. Older saved routes, OTEL records, links, and archive
+manifests using `copilot`, `codex`, `claude`, or `antigravity` are not migrated
+or accepted as provider IDs.
 
 ### Source OTEL
 
@@ -284,8 +294,8 @@ Received OTEL data is stored locally in `AI-Tool-Session-Tracker-content.db`, wh
 listener and routing settings remain in `AI-Tool-Session-Tracker-config.db`; no provider
 cloud API is contacted.
 
-Exporters should set `ai.session.provider` to `copilot`, `codex`, or `claude`,
-and can use `ai.session.id` to group spans
+Exporters should set `ai.session.provider` to `github_copilot`, `openai_codex`, or
+`anthropic_claude`, and can use `ai.session.id` to group spans
 into a session. The receiver recognizes common `gen_ai.usage.*_tokens` and
 `gen_ai.*.model` attributes. OTEL-backed sessions intentionally cannot be
 imported, exported, or deleted through the local-storage controls.
@@ -316,7 +326,11 @@ Every provider returns conversations using the same normalized fields:
 	- `outputTokens`
 	- `reasoningTokens`
 - `costUsd` at session, turn, and model-invocation levels when the extracted
-	model is present in [`src/common/model_costs.json`](src/common/model_costs.json)
+	model matches an entry in [`src/common/model_costs.json`](src/common/model_costs.json),
+	either directly or through a deployment alias in
+	[`src/common/model_mapping.json`](src/common/model_mapping.json). Changes made
+	in Model costs or Model mappings settings are read from the local configuration
+	database instead of replacing them with bundled defaults.
 - `raw`, raw event records
 
 The main application normalizes provider results before passing them to the

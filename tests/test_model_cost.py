@@ -5,8 +5,8 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from src.common import model_costs as pricing
-from session_token_viewer import render_model_costs_page
+from src.common import model_costs as pricing, model_mapping
+from session_token_viewer import PAGE, render_model_costs_page, render_settings_page
 
 
 class PricingTests(unittest.TestCase):
@@ -79,6 +79,18 @@ class PricingTests(unittest.TestCase):
                 self.assertTrue(any(row["model"] == "test-model" for row in pricing.load_model_costs()))
                 self.assertEqual(pricing.cost_for_tokens({"inputTokens": 1_000_000, "outputTokens": 1_000_000}, "test-model"), 6.0)
 
+    def test_duplicate_model_name_reports_name_without_changing_prices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            pricing.save_model_costs([{"model": "Unique", "input": 1, "output": 2}], database_path)
+            with self.assertRaisesRegex(ValueError, "Model 'unique' appears more than once"):
+                pricing.save_model_costs([
+                    {"model": "Unique", "input": 1, "output": 2},
+                    {"model": "unique", "input": 1, "output": 2},
+                ], database_path)
+            saved = pricing.load_model_costs(database_path)
+        self.assertEqual([row["model"] for row in saved if row["model"].lower() == "unique"], ["Unique"])
+
     def test_cache_threshold_round_trips_with_model_costs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
@@ -118,6 +130,14 @@ class PricingTests(unittest.TestCase):
         self.assertNotIn("Cache write (legacy)", page)
         self.assertIn('name="cost_short_cache_write_1h" type="hidden"', page)
         self.assertIn('name="cost_short_cache_write_1h" type="number"', page)
+        self.assertIn("var newRowMarkup=", page)
+        self.assertIn('class="cost-clone" title="Clone model cost" aria-label="Clone model cost"', page)
+        self.assertIn('class="cost-row-actions"', page)
+        self.assertIn("item.cloneNode(true)", page)
+        self.assertIn('id="cost-duplicate-warning" class="cost-duplicate-warning" role="alert" hidden', page)
+        self.assertIn("if(duplicate){event.preventDefault();duplicate.focus();}", page)
+        self.assertIn("if(event.target.matches('input[name=\"cost_model\"]'))duplicateModel();", page)
+        self.assertIn("input.classList.add('cost-duplicate')", page)
 
     def test_reasoning_tokens_use_reasoning_rate_instead_of_being_added_twice(self) -> None:
         tokens = {
@@ -187,6 +207,28 @@ class PricingTests(unittest.TestCase):
             with patch.object(pricing, "mapping_config_path", return_value=config_path):
                 self.assertEqual(pricing.mapped_model("TEST-GS"), "gpt-5.6-luna")
                 self.assertEqual(pricing.find_model("TEST-GS")["model"], "gpt-5.6-luna")
+
+    def test_duplicate_deployment_rows_are_rejected_without_losing_mappings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
+            model_mapping.save_model_mappings({"Test-GS": "test-model"}, database_path)
+            with self.assertRaisesRegex(ValueError, "Deployment 'test-gs' appears more than once"):
+                model_mapping.validate_model_mapping_rows([
+                    ("Test-GS", "test-model"), (" test-gs ", "another-model"),
+                ])
+            with self.assertRaisesRegex(ValueError, "Deployment 'test-gs' appears more than once"):
+                model_mapping.save_model_mappings({"Test-GS": "test-model", "test-gs": "another-model"}, database_path)
+            saved = model_mapping.load_model_mappings(database_path)
+        self.assertEqual(saved["Test-GS"], "test-model")
+        self.assertNotIn("test-gs", saved)
+
+    def test_model_mapping_page_offers_duplicate_and_inline_conflict_warning(self) -> None:
+        with patch.object(model_mapping, "load_model_mappings", return_value={"Test-GS": "test-model"}):
+            page = render_settings_page("model-mappings")
+        self.assertIn('class="mapping-duplicate" title="Duplicate mapping" aria-label="Duplicate mapping"', page)
+        self.assertIn('id="mapping-duplicate-warning" class="mapping-duplicate-warning" role="alert" hidden', page)
+        self.assertIn("copy.querySelectorAll('input')[index].value=input.value", PAGE)
+        self.assertIn("if(duplicate){event.preventDefault();duplicate.focus();}", PAGE)
 
     def test_model_mappings_seed_from_bundled_catalog_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

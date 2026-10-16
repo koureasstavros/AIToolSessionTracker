@@ -28,6 +28,7 @@ from src.common import source_otel
 from src.common import model_mapping
 from src.common import model_costs as pricing
 from src.common import source_routing
+from src.common.tracker_database import connect_config_database
 from src.providers import github_copilot_local_provider
 from src.providers import openai_codex_local_provider
 from src.providers import anthropic_claude_local_provider
@@ -63,28 +64,28 @@ TOKEN_LABELS = {
     "reasoningTokens": "Output reasoning",
 }
 PROVIDERS = {
-    "copilot": "GitHub Copilot",
-    "codex": "OpenAI Codex",
-    "claude": "Anthropic Claude Code",
+    "github_copilot": "GitHub Copilot",
+    "openai_codex": "OpenAI Codex",
+    "anthropic_claude": "Anthropic Claude Code",
     "xai_cursor": "xAI Cursor",
     "cognition_devin": "Cognition Devin",
-    "antigravity": "Google Antigravity",
+    "google_antigravity": "Google Antigravity",
     "m365_copilot": "Microsoft 365 Copilot",
 }
 TOKEN_ACCOUNTING_NOTES = {
-    "copilot": (
+    "github_copilot": (
         "GitHub Copilot",
         "Session totals come from shutdown usage, while output tokens are summed from assistant messages. Input and cache values are not normally attached to each turn; in multi-turn sessions they are allocated using each turn's output-token share, so those per-turn values are estimates while the session total remains exact.",
     ),
-    "codex": (
+    "openai_codex": (
         "OpenAI Codex",
         "Token counts come from token_count event records for each completed turn. The viewer aggregates those exact records and does not infer missing values or copy one invocation's usage onto its tools.",
     ),
-    "claude": (
+    "anthropic_claude": (
         "Anthropic Claude Code",
         "Token counts come from model-response usage fields, including input, cache, output, and reasoning values when provided. Missing values remain unavailable; tool calls do not receive separate token counts.",
     ),
-    "antigravity": (
+    "google_antigravity": (
         "Google Antigravity",
         "Native token usage is not consistently present in the local transcript. When usage is absent, the viewer estimates token counts from transcript content and prices them with the matching Gemini model rate. These values are estimates.",
     ),
@@ -109,7 +110,7 @@ def token_accounting_note(provider: str, turn_count: int) -> str:
         provider,
         (PROVIDERS.get(provider, provider), "Token values are read from the provider export when available; missing values are not inferred."),
     )
-    if provider == "copilot" and turn_count <= 1:
+    if provider == "github_copilot" and turn_count <= 1:
         description = "Session totals come from shutdown usage. For a single-turn session, those totals can be assigned directly to the turn. Output tokens are also summed from assistant messages."
     common_intro = f"Usage is read from persisted {provider_name} data when available. "
     description = common_intro + description
@@ -125,12 +126,12 @@ def token_accounting_note(provider: str, turn_count: int) -> str:
 APP_NAME = "AI Tool Session Tracker"
 LIVE_SESSION_WINDOW_SECONDS = 60
 PROVIDER_ADAPTERS = {
-    "copilot": github_copilot_local_provider,
-    "codex": openai_codex_local_provider,
-    "claude": anthropic_claude_local_provider,
+    "github_copilot": github_copilot_local_provider,
+    "openai_codex": openai_codex_local_provider,
+    "anthropic_claude": anthropic_claude_local_provider,
     "xai_cursor": xai_cursor_local_provider,
     "cognition_devin": cognition_devin_local_provider,
-    "antigravity": google_antigravity_local_provider,
+    "google_antigravity": google_antigravity_local_provider,
     "m365_copilot": m365_copilot_local_provider,
 }
 LOGGER = logging.getLogger(__name__)
@@ -1430,13 +1431,13 @@ def parse_export_session(path: Path, provider: str) -> dict:
     turns: dict[str, dict] = {}
     records = safe_json_lines(path)
     session["project"] = project_from_records(records)
-    if provider == "claude" and session.get("project"):
+    if provider == "anthropic_claude" and session.get("project"):
         normalized_project = session["project"].replace("/", "\\").lower()
         if "\\local-agent-mode-sessions\\" in normalized_project:
             # Claude Desktop's cwd is its private per-session output folder,
             # not a user project directory.
             session["project"] = None
-    if not session["project"] and provider == "claude" and path.parent.name.startswith(("c--", "d--")):
+    if not session["project"] and provider == "anthropic_claude" and path.parent.name.startswith(("c--", "d--")):
         encoded = path.parent.name
         session["project"] = encoded.replace("--", ":\\", 1).replace("-", "\\")
     if records and isinstance(records[0], dict):
@@ -1513,7 +1514,7 @@ def parse_export_session(path: Path, provider: str) -> dict:
             info = {}
         usage = payload.get("usage") or message.get("usage") or payload.get("usageMetadata") or info.get("last_token_usage") or {}
         if isinstance(usage, dict):
-            usage_adapter = anthropic_claude_local_provider if provider == "claude" else None
+            usage_adapter = anthropic_claude_local_provider if provider == "anthropic_claude" else None
             usage_fields = usage_adapter.token_fields_from_sources(usage) if usage_adapter else token_fields_from_sources(usage)
             turn.setdefault("tokenFields", [])
             turn["tokenFields"] = list(set(turn["tokenFields"]) | set(usage_fields))
@@ -2217,7 +2218,7 @@ def _best_practice_units(session: dict) -> list[dict]:
         if not valid_invocations:
             unit = dict(turn)
             unit["_analysis_turn"] = (
-                turn_number if session.get("provider") == "copilot"
+                turn_number if session.get("provider") == "github_copilot"
                 else turn.get("turn_index") if turn.get("turn_index") is not None else turn_number
             )
             units.append(unit)
@@ -2225,7 +2226,7 @@ def _best_practice_units(session: dict) -> list[dict]:
         for invocation in valid_invocations:
             unit = dict(turn)
             unit["_analysis_turn"] = (
-                turn_number if session.get("provider") == "copilot"
+                turn_number if session.get("provider") == "github_copilot"
                 else turn.get("turn_index") if turn.get("turn_index") is not None else turn_number
             )
             unit["model"] = invocation.get("model") or turn.get("model")
@@ -2615,7 +2616,7 @@ def statistics_group_key(session: dict, group: str, provider: str, summary: dict
     return date.isoformat()
 
 
-def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "all", provider: str = "copilot") -> str:
+def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "all", provider: str = "github_copilot") -> str:
     """Render a compact dual-line timeline for tokens and USD cost."""
     ordered = sorted(points.items())
     if not ordered:
@@ -2662,7 +2663,7 @@ def render_timeline_svg(points: dict[str, dict[str, float]], time_range: str = "
     return f'''<div class="timeline-chart"><div class="timeline-legend"><span class="timeline-key tokens-key">Tokens</span><span class="timeline-key cost-key">Cost</span><span class="timeline-hint">Hover points for details</span></div><svg viewBox="0 0 {width} {height}" role="img" aria-label="Token and cost timeline"><line class="timeline-axis" x1="{left}" y1="{top}" x2="{left}" y2="{height - bottom}"/><line class="timeline-axis" x1="{cost_axis}" y1="{top}" x2="{cost_axis}" y2="{height - bottom}"/><line class="timeline-axis" x1="{left}" y1="{height - bottom}" x2="{cost_axis}" y2="{height - bottom}"/>{token_ticks}{cost_ticks}<text class="tokens-axis-title" x="12" y="{top + chart_height / 2}" text-anchor="middle" transform="rotate(-90 12 {top + chart_height / 2})">Tokens</text><text class="cost-axis-title" x="{cost_axis + 22}" y="{top + chart_height / 2}" text-anchor="middle" transform="rotate(90 {cost_axis + 22} {top + chart_height / 2})">Cost</text><polyline class="timeline-tokens" points="{coordinates("tokens", max_tokens)}"/><polyline class="timeline-cost" points="{coordinates("cost", max_cost)}"/>{markers("tokens", max_tokens, "tokens-point")}{markers("cost", max_cost, "cost-point")}{labels}</svg></div>'''
 
 
-def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_group: str | None = None, time_range: str = "all", provider: str = "copilot") -> str:
+def render_statistics(summaries: list[tuple[str, dict]], group: str, selected_group: str | None = None, time_range: str = "all", provider: str = "github_copilot") -> str:
     """Render aggregate token and cost information across all providers."""
     if group not in {"project", "today", "day", "week", "month", "year", "tool", "model", "effort", "timeline"}:
         group = "day"
@@ -2816,7 +2817,7 @@ def render_model_costs_page() -> str:
                 f'<td><input name="cost_model" value="{esc(str(row.get("model") or ""), quote=True)}" placeholder="Model ID" required></td>'
                 '<td><input name="cost_context_threshold" type="number" min="0" step="1" value="" placeholder="Optional"></td>'
                 + cache_threshold_cell(row) + rates
-                + '<td><button type="button" class="mapping-remove cost-remove" aria-label="Remove model cost">×</button></td></tr>'
+                + '<td><div class="cost-row-actions"><button type="button" class="cost-clone" title="Clone model cost" aria-label="Clone model cost"><span aria-hidden="true">⧉</span></button><button type="button" class="mapping-remove cost-remove" aria-label="Remove model cost">×</button></div></td></tr>'
                 + '<tr class="cost-row cost-long-editor" hidden><td class="cost-tier-label" style="display:none">Long context</td><td style="display:none"></td><td style="display:none"></td><td style="display:none"></td>' + long_rates + '<td style="display:none"></td></tr>'
             )
         metadata = (
@@ -2830,15 +2831,47 @@ def render_model_costs_page() -> str:
             rates = rate_cells(row, tier)
             tiers.append(
                 f'<tr class="cost-row cost-tier-row">{metadata if tier == "short" else ""}{rates}'
-                + ('<td rowspan="2"><button type="button" class="mapping-remove cost-remove" aria-label="Remove model cost">×</button></td>' if tier == "short" else '')
+                + ('<td rowspan="2"><div class="cost-row-actions"><button type="button" class="cost-clone" title="Clone model cost" aria-label="Clone model cost"><span aria-hidden="true">⧉</span></button><button type="button" class="mapping-remove cost-remove" aria-label="Remove model cost">×</button></div></td>' if tier == "short" else '')
                 + '</tr>'
             )
         return ''.join(tiers)
 
     rows = "".join(row_markup(row) for row in pricing.load_model_costs()) or row_markup()
+    new_row_markup = json.dumps(row_markup())
     script = """<script>(function(){
         var body=document.getElementById('cost-rows'),add=document.getElementById('cost-add');
+        var newRowMarkup=__NEW_ROW_MARKUP__;
         if(!body||!add)return;
+        var form=body.closest('form'),warning=form.querySelector('#cost-duplicate-warning');
+        var clearDuplicateWarning=function(){
+            warning.hidden=true;
+            warning.textContent='';
+            body.querySelectorAll('input[name="cost_model"]').forEach(function(input){input.classList.remove('cost-duplicate');});
+        };
+        var duplicateModel=function(){
+            clearDuplicateWarning();
+            var names=new Map();
+            for(var input of body.querySelectorAll('input[name="cost_model"]')){
+                var name=input.value.trim(),key=name.toLowerCase();
+                if(!name)continue;
+                if(names.has(key)){
+                    names.get(key).classList.add('cost-duplicate');
+                    input.classList.add('cost-duplicate');
+                    warning.textContent='Model "'+name+'" already exists. Rename or remove the duplicate before saving.';
+                    warning.hidden=false;
+                    return input;
+                }
+                names.set(key,input);
+            }
+            return null;
+        };
+        form.addEventListener('submit',function(event){
+            var duplicate=duplicateModel();
+            if(duplicate){event.preventDefault();duplicate.focus();}
+        });
+        body.addEventListener('input',function(event){
+            if(event.target.matches('input[name="cost_model"]'))duplicateModel();
+        });
         var updateCacheThreshold=function(first){
             if(!first)return;
             var enabled=first.querySelector('select[name="cost_cache_threshold"]').value==='true';
@@ -2858,14 +2891,9 @@ def render_model_costs_page() -> str:
         body.querySelectorAll('.cost-row:not(.cost-long-editor):not(.cost-tier-row)').forEach(updateCacheThreshold);
         body.querySelectorAll('.cost-tier-row').forEach(function(row){if(row.querySelector('select[name="cost_cache_threshold"]'))updateCacheThreshold(row);});
         add.addEventListener('click',function(){
-            var rows=Array.from(body.querySelectorAll('.cost-row')),group=rows.slice(0,2);
-            if(group.length<2)return;
-            var clones=group.map(function(row){return row.cloneNode(true);});
-            clones.forEach(function(row){row.querySelectorAll('input').forEach(function(input){input.value=input.name==='cost_vendor'?'Custom':'';});});
-            var threshold=clones[0].querySelector('select[name="cost_cache_threshold"]');
-            if(threshold)threshold.value='false';
-            clones.forEach(function(row){body.appendChild(row);});
-            updateCacheThreshold(clones[0]);
+            body.insertAdjacentHTML('beforeend',newRowMarkup);
+            var first=body.lastElementChild.previousElementSibling;
+            updateCacheThreshold(first);
         });
         body.addEventListener('change',function(event){
             if(event.target.matches('select[name="cost_cache_threshold"]'))updateCacheThreshold(event.target.closest('.cost-row'));
@@ -2892,28 +2920,38 @@ def render_model_costs_page() -> str:
             }
         });
         body.addEventListener('click',function(event){
+            var clone=event.target.closest('.cost-clone');
+            if(clone){
+                var source=clone.closest('.cost-row'),group=source.classList.contains('cost-long-editor')?[source.previousElementSibling,source]:[source,source.nextElementSibling].filter(Boolean);
+                group.forEach(function(item){body.appendChild(item.cloneNode(true));});
+                var clonedFirst=body.lastElementChild.previousElementSibling;
+                updateCacheThreshold(clonedFirst);
+                duplicateModel();
+                return;
+            }
             var remove=event.target.closest('.cost-remove');
             if(!remove)return;
             var row=remove.closest('.cost-row'),group=row.classList.contains('cost-long-editor')?[row.previousElementSibling,row]:[row,row.nextElementSibling].filter(Boolean),rows=body.querySelectorAll('.cost-row');
-            if(rows.length>2){group.forEach(function(item){item.remove();});var remaining=body.querySelector('select[name="cost_cache_threshold"]');if(remaining)updateCacheThreshold(remaining.closest('.cost-row'));else body.closest('table').querySelector('.cache-write-1h-heading').hidden=true;return;}
+            if(rows.length>2){group.forEach(function(item){item.remove();});var remaining=body.querySelector('select[name="cost_cache_threshold"]');if(remaining)updateCacheThreshold(remaining.closest('.cost-row'));else body.closest('table').querySelector('.cache-write-1h-heading').hidden=true;duplicateModel();return;}
             group.forEach(function(item){item.querySelectorAll('input').forEach(function(input){input.value=input.name==='cost_vendor'?'Custom':'';});});
             var threshold=group[0].querySelector('select[name="cost_cache_threshold"]');if(threshold){threshold.value='false';updateCacheThreshold(group[0]);}
         });
     })();</script>"""
+    script = script.replace("__NEW_ROW_MARKUP__", new_row_markup)
     return (
         '<main class="detail settings-page"><style>'
         '.cost-table-wrap{max-height:55vh;overflow:auto;border:1px solid var(--line);border-radius:9px}'
         '.cost-table{width:100%;min-width:1180px;border-collapse:collapse;background:#101a2a}'
         '.cost-table th,.cost-table td{padding:8px;border-bottom:1px solid var(--line);text-align:left;font-size:11px}'
         '.cost-table th{position:sticky;top:0;background:#162338;color:#9bb1cc;font-size:9px;letter-spacing:.06em;text-transform:uppercase}'
-        '.cost-table input{width:100%;min-width:74px;box-sizing:border-box;border:1px solid #31435f;border-radius:6px;background:#0c1627;color:#dbe9ff;padding:7px}'
-        '.cost-table td:nth-child(1) input,.cost-table td:nth-child(2) input{min-width:130px}.cost-table td:last-child{width:36px}.cost-model-row td{border-bottom:0}.cost-tier-row td{border-bottom:1px solid var(--line)}.cost-tier-label{color:#9bb1cc;font-size:10px!important;font-weight:600;white-space:nowrap}'
+        '.cost-table input,.cost-table select[name="cost_cache_threshold"]{width:100%;min-width:74px;box-sizing:border-box;border:1px solid #31435f;border-radius:6px;background:#0c1627;color:#dbe9ff;padding:7px}.cost-table select[name="cost_cache_threshold"]{font:inherit;color-scheme:dark;cursor:pointer}.cost-table select[name="cost_cache_threshold"]:focus-visible{outline:2px solid #9ed1ff;outline-offset:2px}'
+        '.cost-table td:nth-child(1) input,.cost-table td:nth-child(2) input{min-width:130px}.cost-table td:last-child{width:78px}.cost-row-actions{display:flex;align-items:center;gap:6px}.cost-clone{display:grid;place-items:center;width:32px;height:32px;border:1px solid #315479;border-radius:8px;background:#172a43;color:#a9c9e9;font-size:20px;cursor:pointer}.cost-clone:hover{border-color:#6ca1d5;background:#24466c;color:#fff}.cost-clone:focus-visible{outline:2px solid #9ed1ff;outline-offset:2px}.cost-duplicate-warning{margin:0 0 12px;padding:10px 12px;border:1px solid #bd6078;border-radius:8px;background:#41202d;color:#ffe4e9;font-size:12px}.cost-table input.cost-duplicate{border-color:#e78299;box-shadow:0 0 0 2px rgba(231,130,153,.25)}.cost-model-row td{border-bottom:0}.cost-tier-row td{border-bottom:1px solid var(--line)}.cost-tier-label{color:#9bb1cc;font-size:10px!important;font-weight:600;white-space:nowrap}'
         '</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div>'
         '<h1>Model costs</h1><p class="settings-intro">Manage rates in USD per one million tokens. The bundled <code>model_costs.json</code> catalog is copied to <code>'
         + esc(pricing.mapping_config_path()) + '</code> the first time the app opens; later changes are stored only in the database.</p></div>'
         + '<div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>' + exit_action() + '</div></header>'
         + '<section class="settings-card"><div class="section-heading"><div><span class="section-kicker">COST CATALOG</span><h2>Model ID to Token Rates</h2></div><span class="muted">Blank cache or reasoning rates are treated as unavailable</span></div>'
-        + '<form method="post" action="/settings"><input type="hidden" name="settings_action" value="model-costs"><div class="cost-table-wrap"><table class="cost-table"><thead><tr><th>Vendor</th><th>Model</th><th>Context threshold</th><th>Cache threshold</th><th>Input / 1M</th><th>Cache read / 1M</th><th>Cache write 5m / 1M</th><th class="cache-write-1h-heading">Cache write 1h / 1M</th><th>Output / 1M</th><th>Reasoning / 1M</th><th></th></tr></thead><tbody id="cost-rows">'
+        + '<form method="post" action="/settings"><input type="hidden" name="settings_action" value="model-costs"><p id="cost-duplicate-warning" class="cost-duplicate-warning" role="alert" hidden></p><div class="cost-table-wrap"><table class="cost-table"><thead><tr><th>Vendor</th><th>Model</th><th>Context threshold</th><th>Cache threshold</th><th>Input / 1M</th><th>Cache read / 1M</th><th>Cache write 5m / 1M</th><th class="cache-write-1h-heading">Cache write 1h / 1M</th><th>Output / 1M</th><th>Reasoning / 1M</th><th></th></tr></thead><tbody id="cost-rows">'
         + rows + '</tbody></table></div><div class="settings-actions"><button type="button" class="settings-secondary" id="cost-add">Add model</button><button type="submit" class="settings-primary">Save costs</button></div></form>'
         + script + '</section></main>'
     )
@@ -2921,19 +2959,19 @@ def render_model_costs_page() -> str:
 
 def render_settings_page(action: str | None = None) -> str:
     """Render local application settings, including deployment mappings."""
-    mappings = pricing.load_model_mappings()
+    mappings = model_mapping.load_model_mappings()
     rows = "".join(
         f'<div class="mapping-row"><input name="deployment" value="{esc(deployment, quote=True)}" placeholder="Deployment name" required>'
         f'<span aria-hidden="true">→</span><input name="model" value="{esc(model, quote=True)}" placeholder="Pricing model ID" required>'
-        '<button type="button" class="mapping-remove" aria-label="Remove mapping">×</button></div>'
+        '<div class="mapping-row-actions"><button type="button" class="mapping-duplicate" title="Duplicate mapping" aria-label="Duplicate mapping"><span aria-hidden="true">⧉</span></button><button type="button" class="mapping-remove" aria-label="Remove mapping">×</button></div></div>'
         for deployment, model in mappings.items()
     )
     if not rows:
-        rows = '<div class="mapping-row"><input name="deployment" placeholder="Deployment name" required><span aria-hidden="true">→</span><input name="model" placeholder="Pricing model ID" required><button type="button" class="mapping-remove" aria-label="Remove mapping">×</button></div>'
+        rows = '<div class="mapping-row"><input name="deployment" placeholder="Deployment name" required><span aria-hidden="true">→</span><input name="model" placeholder="Pricing model ID" required><div class="mapping-row-actions"><button type="button" class="mapping-duplicate" title="Duplicate mapping" aria-label="Duplicate mapping"><span aria-hidden="true">⧉</span></button><button type="button" class="mapping-remove" aria-label="Remove mapping">×</button></div></div>'
     if action == "model-costs":
         detail = render_model_costs_page()
     elif action == "model-mappings":
-        detail = f'''<main class="detail settings-page"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div><h1>Model mappings</h1><p class="settings-intro">Map arbitrary deployment names to the model ID used for pricing. The mapping is saved locally in <code>{esc(pricing.mapping_config_path())}</code>.</p></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>{exit_action()}</div></header><section class="settings-card"><div class="section-heading"><div><span class="section-kicker">PRICING</span><h2>Deployment to model ID</h2></div><span class="muted">Exact deployment matches override automatic matching</span></div><form class="mapping-form" method="post" action="/settings"><div id="mapping-rows">{rows}</div><div class="settings-actions"><button type="button" class="settings-secondary" id="mapping-add">Add mapping</button><button type="submit" class="settings-primary">Save mappings</button></div><p class="settings-help">Example: <code>TEST-GS</code> → <code>gpt-5.6-luna</code>. Existing session data is unchanged; pricing is recalculated when sessions are scanned.</p></form></section></main>'''
+        detail = f'''<main class="detail settings-page"><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div><h1>Model mappings</h1><p class="settings-intro">Map arbitrary deployment names to the model ID used for pricing. The mapping is saved locally in <code>{esc(pricing.mapping_config_path())}</code>.</p></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>{exit_action()}</div></header><section class="settings-card"><div class="section-heading"><div><span class="section-kicker">PRICING</span><h2>Deployment to model ID</h2></div><span class="muted">Exact deployment matches override automatic matching</span></div><form class="mapping-form" method="post" action="/settings"><p id="mapping-duplicate-warning" class="mapping-duplicate-warning" role="alert" hidden></p><div id="mapping-rows">{rows}</div><div class="settings-actions"><button type="button" class="settings-secondary" id="mapping-add">Add mapping</button><button type="submit" class="settings-primary">Save mappings</button></div><p class="settings-help">Example: <code>TEST-GS</code> → <code>gpt-5.6-luna</code>. Existing session data is unchanged; pricing is recalculated when sessions are scanned.</p></form></section></main>'''
         detail = detail.replace("<span class=\"section-kicker\">PRICING</span>", "<span class=\"section-kicker\">MAPPING CATALOG</span>")
     elif action == "source-otel":
         otel = source_otel_config()
@@ -2952,7 +2990,7 @@ def render_settings_page(action: str | None = None) -> str:
         )
         host = esc(str(otel.get("host", "127.0.0.1")), quote=True)
         port = esc(str(otel.get("port", 4318)), quote=True)
-        detail = f'''<main class="detail settings-page"><style>.routing-form{{display:grid;gap:14px}}.routing-row{{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 0;border-bottom:1px solid var(--line)}}.routing-row span{{display:grid;gap:3px}}.routing-row small{{color:var(--muted);font:10px ui-monospace,monospace}}.routing-row select,.listener-grid input{{border:1px solid #31435f;border-radius:7px;background:#0c1627;color:#dbe9ff;padding:8px 10px}}.listener-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}.listener-grid label{{display:grid;gap:6px;color:#a9b9ce;font-size:11px}}.listener-grid .wide{{grid-column:1/-1}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div><h1>Source Routing</h1><p class="settings-intro">Choose where each provider is read from. OTEL routes receive OTLP/HTTP JSON traces on this computer, store them in <code>{esc(source_otel.content_database_path())}</code>, and show only that provider&apos;s received data.</p></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>{exit_action()}</div></header><section class="settings-card"><form class="routing-form" method="post" action="/settings"><input type="hidden" name="settings_action" value="source-routing"><div class="section-heading"><div><span class="section-kicker">PROVIDER ROUTES</span><h2>Session source by provider</h2></div></div>{route_rows}<div class="section-heading"><div><span class="section-kicker">OTEL SERVICE</span><h2>OTLP receiver</h2></div></div><div class="listener-grid"><label class="wide">Protocol<input name="protocol" value="OTLP/HTTP JSON" readonly></label><label>Listen host<input name="otel_host" value="{host}" required></label><label>Listen port<input name="otel_port" value="{port}" inputmode="numeric" required></label></div><p class="settings-help">Configure exporters to send JSON OTLP traces to <code>http://HOST:PORT/v1/traces</code>. Include <code>ai.session.provider</code> (copilot, codex, or claude) and optionally <code>ai.session.id</code>. This listener is enabled only when at least one provider uses OTEL.</p><div class="settings-actions"><button type="submit" class="settings-primary">Save source routing</button></div></form></section></main>'''
+        detail = f'''<main class="detail settings-page"><style>.routing-form{{display:grid;gap:14px}}.routing-row{{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:13px 0;border-bottom:1px solid var(--line)}}.routing-row span{{display:grid;gap:3px}}.routing-row small{{color:var(--muted);font:10px ui-monospace,monospace}}.routing-row select,.listener-grid input{{border:1px solid #31435f;border-radius:7px;background:#0c1627;color:#dbe9ff;padding:8px 10px}}.listener-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}.listener-grid label{{display:grid;gap:6px;color:#a9b9ce;font-size:11px}}.listener-grid .wide{{grid-column:1/-1}}</style><header class="detail-heading"><div class="heading-copy"><div class="eyebrow"><span></span>Application settings</div><h1>Source Routing</h1><p class="settings-intro">Choose where each provider is read from. OTEL routes receive OTLP/HTTP JSON traces on this computer, store them in <code>{esc(source_otel.content_database_path())}</code>, and show only that provider&apos;s received data.</p></div><div class="detail-actions"><a class="icon-button" href="/?view=settings" title="Back to settings" aria-label="Back to settings">←</a>{exit_action()}</div></header><section class="settings-card"><form class="routing-form" method="post" action="/settings"><input type="hidden" name="settings_action" value="source-routing"><div class="section-heading"><div><span class="section-kicker">PROVIDER ROUTES</span><h2>Session source by provider</h2></div></div>{route_rows}<div class="section-heading"><div><span class="section-kicker">OTEL SERVICE</span><h2>OTLP receiver</h2></div></div><div class="listener-grid"><label class="wide">Protocol<input name="protocol" value="OTLP/HTTP JSON" readonly></label><label>Listen host<input name="otel_host" value="{host}" required></label><label>Listen port<input name="otel_port" value="{port}" inputmode="numeric" required></label></div><p class="settings-help">Configure exporters to send JSON OTLP traces to <code>http://HOST:PORT/v1/traces</code>. Include <code>ai.session.provider</code> (github_copilot, openai_codex, or anthropic_claude) and optionally <code>ai.session.id</code>. This listener is enabled only when at least one provider uses OTEL.</p><div class="settings-actions"><button type="submit" class="settings-primary">Save source routing</button></div></form></section></main>'''
         detail = detail.replace("OTLP/HTTP JSON", "OTLP/HTTP (protobuf or JSON)").replace(
             "OTEL routes receive OTLP/HTTP (protobuf or JSON) traces",
             "OTEL routes receive OTLP/HTTP traces, logs, and metrics",
@@ -2967,12 +3005,12 @@ def render_settings_page(action: str | None = None) -> str:
             flags=re.DOTALL,
         )
     else:
-        detail = f'<main class="detail settings-page settings-empty"><header class="detail-heading"><div></div><div class="detail-actions"><a class="icon-button" href="/?provider=copilot" title="Back to sessions" aria-label="Back to sessions">←</a>{exit_action()}</div></header><div class="empty-hero"><span class="hero-icon">⚙</span><span class="section-kicker">APPLICATION SETTINGS</span><h1>Select an action</h1><p>Choose a settings action from the sidebar to manage the application.</p></div></main>'
+        detail = f'<main class="detail settings-page settings-empty"><header class="detail-heading"><div></div><div class="detail-actions"><a class="icon-button" href="/?provider=github_copilot" title="Back to sessions" aria-label="Back to sessions">←</a>{exit_action()}</div></header><div class="empty-hero"><span class="hero-icon">⚙</span><span class="section-kicker">APPLICATION SETTINGS</span><h1>Select an action</h1><p>Choose a settings action from the sidebar to manage the application.</p></div></main>'
     settings_actions = f'<div class="settings-sidebar"><div class="settings-sidebar-title">Settings</div><a class="settings-sidebar-link{" selected" if action == "model-costs" else ""}" href="/?view=settings&action=model-costs"><span aria-hidden="true">$</span><span>Model costs</span></a><a class="settings-sidebar-link{" selected" if action == "model-mappings" else ""}" href="/?view=settings&action=model-mappings"><span aria-hidden="true">↔</span><span>Model mappings</span></a><a class="settings-sidebar-link{" selected" if action == "source-routing" else ""}" href="/?view=settings&action=source-routing"><span aria-hidden="true">⇄</span><span>Source Routing</span></a><a class="settings-sidebar-link{" selected" if action == "source-otel" else ""}" href="/?view=settings&action=source-otel"><span aria-hidden="true">◉</span><span>Source OTEL</span></a></div>'
     return PAGE.replace("__APP_NAME__", esc(APP_NAME)).replace("__SIDEBAR_CLASS__", "").replace("__PROVIDER_MENU__", "").replace("__VIEW_TABS__", "").replace("__STATS_SIDEBAR__", "").replace("__SIDEBAR_CONTENT__", settings_actions).replace("__SESSION_ROWS__", "").replace("__SESSION_COUNT__", "0").replace("__DETAIL__", detail).replace("__REFRESH_URL__", "/?refresh=1").replace("__EMPTY_TOGGLE__", "").replace("__ROOT__", "").replace("__IMPORT_FORM__", "").replace("__SCAN_BOOTSTRAP__", "")
 
 
-def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "copilot", show_empty: bool = False, selected_raw: bool = False, view: str = "sessions", group: str = "today", selected_group: str | None = None, time_range: str = "all", import_error: str | None = None, session_offset: int = 0, sessions_override: list[dict] | None = None, statistics_override: list[tuple[str, dict]] | None = None, scan_bootstrap: str = "", settings_action: str | None = None, scan_phase: str = "high-level") -> str:
+def render(root: Path, selected: str | None, selected_turn: int | None = None, selected_metric: str | None = None, provider: str = "github_copilot", show_empty: bool = False, selected_raw: bool = False, view: str = "sessions", group: str = "today", selected_group: str | None = None, time_range: str = "all", import_error: str | None = None, session_offset: int = 0, sessions_override: list[dict] | None = None, statistics_override: list[tuple[str, dict]] | None = None, scan_bootstrap: str = "", settings_action: str | None = None, scan_phase: str = "high-level") -> str:
     if view == "settings":
         return render_settings_page(settings_action)
     sessions = (load_session_index(root, provider, show_empty)
@@ -3020,7 +3058,7 @@ def render(root: Path, selected: str | None, selected_turn: int | None = None, s
                 '<span class="turn-kind">Usage summary</span>' if turn.get("kind") == "usage_summary" else
                 ""
             )
-            turn_label = index if provider == "copilot" else turn.get("turn_index", index)
+            turn_label = index if provider == "github_copilot" else turn.get("turn_index", index)
             raw_url = esc("/?" + urlencode({"view": "operational", "provider": provider, "show_empty": int(show_empty), "session": chosen["id"], "turn": index, "raw": 1}), quote=True)
             invocation_markup = ""
             show_invocation_breakdown = bool(invocations) and (len(invocations) > 1 or tools_are_nested or any(
@@ -3275,13 +3313,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             deployments = form.get("deployment", [])
             models = form.get("model", [])
-            mappings = {
-                deployment.strip(): model.strip()
-                for deployment, model in zip(deployments, models)
-                if deployment.strip() and model.strip()
-            }
             try:
-                pricing.save_model_mappings(mappings)
+                mappings = model_mapping.validate_model_mapping_rows(zip(deployments, models))
+                model_mapping.save_model_mappings(mappings)
+            except ValueError as error:
+                LOGGER.warning("Unable to save model mappings: %s", error)
+                self.send_error(400, str(error))
+                return
             except OSError as error:
                 LOGGER.warning("Unable to save model mappings: %s", error)
                 self.send_error(500, "Unable to save model mappings")
@@ -3341,7 +3379,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         form = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
-        provider = form.get("provider", ["copilot"])[0]
+        provider = form.get("provider", ["github_copilot"])[0]
         session_id = form.get("session", [""])[0]
         show_empty = form.get("show_empty", ["0"])[0] in {"1", "true", "yes"}
         if provider not in PROVIDERS or not session_id:
@@ -3387,9 +3425,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed_url = urlparse(self.path)
         if parsed_url.path == "/api/scan":
             query = parse_qs(parsed_url.query)
-            provider = query.get("provider", ["copilot"])[0]
+            provider = query.get("provider", ["github_copilot"])[0]
             if provider not in PROVIDERS:
-                provider = "copilot"
+                provider = "github_copilot"
             manager = type(self).scan_manager
             if manager is None:
                 self.send_error(503, "Session scan is not available")
@@ -3463,9 +3501,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         query = parse_qs(parsed_url.query)
-        provider = query.get("provider", ["copilot"])[0]
+        provider = query.get("provider", ["github_copilot"])[0]
         if provider not in PROVIDERS:
-            provider = "copilot"
+            provider = "github_copilot"
         selected = query.get("session", [None])[0]
         turn_value = query.get("turn", [None])[0]
         selected_turn = int(turn_value) if turn_value and turn_value.isdigit() else None
@@ -3542,6 +3580,11 @@ def main() -> None:
     Handler.root = args.root.expanduser().resolve()
     if not Handler.root.is_dir():
         LOGGER.warning("Configured Copilot root does not exist: %s; continuing with other providers", Handler.root)
+    try:
+        with connect_config_database():
+            pass
+    except (OSError, sqlite3.Error):
+        LOGGER.exception("Unable to initialize the configuration database; continuing with defaults")
     pricing.load_model_costs()
     sync_otel_receiver()
     url = f"http://127.0.0.1:{args.port}"
@@ -3662,7 +3705,7 @@ PAGE = PAGE.replace('</body></html>', r'''<script>
     var area=document.querySelector('.sessions-area');
     if(!area) return;
     var params=new URLSearchParams(window.location.search);
-    var key='session-sidebar-scroll:'+ (params.get('provider') || 'copilot') + ':' + (params.get('show_empty') || '0');
+    var key='session-sidebar-scroll:'+ (params.get('provider') || 'github_copilot') + ':' + (params.get('show_empty') || '0');
     var saved=sessionStorage.getItem(key);
     if(saved !== null) area.scrollTop=Number(saved);
     function remember(){sessionStorage.setItem(key,String(area.scrollTop));}
@@ -3671,7 +3714,7 @@ PAGE = PAGE.replace('</body></html>', r'''<script>
         link.addEventListener('click',remember);
     });
 })();
-</script><script>(function(){var params=new URLSearchParams(window.location.search);var key='session-detail-scroll:'+ (params.get('provider') || 'copilot') + ':' + (params.get('session') || '');var detail=document.querySelector('.detail');var saved=sessionStorage.getItem(key);if(saved !== null){requestAnimationFrame(function(){try{var position=JSON.parse(saved);if(detail){detail.scrollTop=Number(position.detail || 0);}window.scrollTo(0,Number(position.window || 0));}catch(error){if(detail){detail.scrollTop=Number(saved);}}});}document.querySelectorAll('.metric.clickable,.show-raw').forEach(function(link){link.addEventListener('click',function(){var current=document.querySelector('.detail');sessionStorage.setItem(key,JSON.stringify({detail:current ? current.scrollTop : 0,window:window.scrollY}));});});})();</script><script>document.querySelectorAll('form[action="/delete"]').forEach(function(form){form.addEventListener('submit',function(event){if(!event.defaultPrevented){return;}var overlay=document.querySelector('.loading');if(overlay){overlay.remove();}document.body.classList.remove('is-loading');var button=form.querySelector('button');if(button){button.disabled=false;}});});</script></body></html>''')
+</script><script>(function(){var params=new URLSearchParams(window.location.search);var key='session-detail-scroll:'+ (params.get('provider') || 'github_copilot') + ':' + (params.get('session') || '');var detail=document.querySelector('.detail');var saved=sessionStorage.getItem(key);if(saved !== null){requestAnimationFrame(function(){try{var position=JSON.parse(saved);if(detail){detail.scrollTop=Number(position.detail || 0);}window.scrollTo(0,Number(position.window || 0));}catch(error){if(detail){detail.scrollTop=Number(saved);}}});}document.querySelectorAll('.metric.clickable,.show-raw').forEach(function(link){link.addEventListener('click',function(){var current=document.querySelector('.detail');sessionStorage.setItem(key,JSON.stringify({detail:current ? current.scrollTop : 0,window:window.scrollY}));});});})();</script><script>document.querySelectorAll('form[action="/delete"]').forEach(function(form){form.addEventListener('submit',function(event){if(!event.defaultPrevented){return;}var overlay=document.querySelector('.loading');if(overlay){overlay.remove();}document.body.classList.remove('is-loading');var button=form.querySelector('button');if(button){button.disabled=false;}});});</script></body></html>''')
 
 PAGE = r'''<!doctype html>
 <html lang="en">
@@ -3692,7 +3735,7 @@ PAGE = r'''<!doctype html>
 a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height:100vh}.mobile-bar{display:none}.sidebar{position:fixed;inset:0 auto 0 0;width:var(--sidebar);display:flex;flex-direction:column;background:rgba(12,16,25,.96);border-right:1px solid var(--line);z-index:20;backdrop-filter:blur(18px)}
 .sidebar-top{padding:24px 20px 16px}.brand-row{display:flex;align-items:center;gap:11px}.brand-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:linear-gradient(145deg,#8b94ff,#5666de);box-shadow:0 8px 24px rgba(104,117,242,.3);font-size:17px;font-weight:800}.brand{font-size:15px;font-weight:750;letter-spacing:-.01em}.brand-subtitle{margin-top:2px;color:var(--subtle);font-size:11px}.path{margin:15px 0 0;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:#090d15;color:#718198;font:10px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .import-inline{display:inline-flex;margin:0}.import-inline input[type=file]{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}.import-button,.session-export-button{display:inline-flex;align-items:center;justify-content:center;width:34px;height:28px;border:1px solid var(--line-strong);border-radius:7px;background:var(--surface-3);color:var(--text);padding:0;font-size:14px;cursor:pointer;text-decoration:none;white-space:nowrap}.session-export-button{height:34px}.import-button:hover,.session-export-button:hover{border-color:var(--accent);background:#202c4a}.empty-toggle svg,.import-button svg,.session-export-button svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.provider-menu{display:grid;gap:3px;margin-top:14px;padding:4px;border:1px solid var(--line);border-radius:11px;background:#090d15}.provider{display:flex;align-items:center;gap:10px;min-width:0;height:34px;padding:0 11px;border-radius:7px;color:#8291a6;text-decoration:none;font-size:11px;font-weight:600}.provider>span:last-child{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.provider-mark{width:8px;height:8px;flex:none;border-radius:50%;background:#68768a;transition:.2s}.provider[data-provider="copilot"] .provider-mark{background:#a995ff}.provider[data-provider="codex"] .provider-mark{background:#70d6b5}.provider[data-provider="claude"] .provider-mark{background:#e8a06c}.provider[data-provider="m365_copilot"] .provider-mark{background:#58a7ff}.provider[data-provider="antigravity"] .provider-mark{background:#4285f4}.provider:hover{background:var(--surface-3);color:#c7d0de}.provider.selected{background:#20283a;color:#f1f5fb;box-shadow:inset 0 0 0 1px #35425a}.provider.selected .provider-mark{transform:scale(1.18);box-shadow:0 0 0 3px rgba(124,140,255,.12)}
+.provider-menu{display:grid;gap:3px;margin-top:14px;padding:4px;border:1px solid var(--line);border-radius:11px;background:#090d15}.provider{display:flex;align-items:center;gap:10px;min-width:0;height:34px;padding:0 11px;border-radius:7px;color:#8291a6;text-decoration:none;font-size:11px;font-weight:600}.provider>span:last-child{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.provider-mark{width:8px;height:8px;flex:none;border-radius:50%;background:#68768a;transition:.2s}.provider[data-provider="github_copilot"] .provider-mark{background:#a995ff}.provider[data-provider="openai_codex"] .provider-mark{background:#70d6b5}.provider[data-provider="anthropic_claude"] .provider-mark{background:#e8a06c}.provider[data-provider="m365_copilot"] .provider-mark{background:#58a7ff}.provider[data-provider="google_antigravity"] .provider-mark{background:#4285f4}.provider:hover{background:var(--surface-3);color:#c7d0de}.provider.selected{background:#20283a;color:#f1f5fb;box-shadow:inset 0 0 0 1px #35425a}.provider.selected .provider-mark{transform:scale(1.18);box-shadow:0 0 0 3px rgba(124,140,255,.12)}
 .sessions-area{display:flex;flex:1;min-height:0;flex-direction:column}.sessions-heading{padding:12px 20px 10px}.heading-line{display:flex;align-items:center;justify-content:space-between}.count{color:#aab5c6;font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase}.count b{display:inline-grid;place-items:center;min-width:20px;height:20px;margin-left:6px;border-radius:6px;background:#1b2432;color:#cdd6e3;letter-spacing:0}.sessions-heading-actions{display:flex;gap:6px}.empty-toggle,.refresh-sessions{display:grid;place-items:center;height:28px;border:1px solid var(--line);border-radius:7px;background:var(--surface);color:var(--muted);text-decoration:none;font-size:10px}.empty-toggle{width:34px;padding:0;font-size:14px}.refresh-sessions{width:34px;font-size:15px}.empty-toggle:hover,.refresh-sessions:hover{border-color:var(--line-strong);background:var(--surface-3);color:var(--text)}
 .search-wrap{position:relative;margin-top:10px}.search-wrap svg{position:absolute;left:10px;top:9px;width:14px;color:#66758a}.session-search{width:100%;height:34px;padding:0 30px 0 31px;border:1px solid var(--line);border-radius:9px;outline:none;background:#090d15;color:var(--text);font-size:11px}.session-search::placeholder{color:#58677a}.session-search:focus{border-color:#5968bd;box-shadow:0 0 0 3px rgba(89,104,189,.12)}.search-key{position:absolute;right:8px;top:8px;color:#56657a;font:10px ui-monospace,monospace}
 .session-list{flex:1;min-height:0;overflow:auto;padding:0 10px 18px;scrollbar-width:thin;scrollbar-color:#344056 transparent}.empty-search{margin:24px 10px;padding:20px;border:1px dashed var(--line-strong);border-radius:10px;color:#6f7f95;text-align:center;font-size:11px}.session-row{position:relative;display:flex;align-items:center;margin:2px 0}.session{display:flex;align-items:flex-start;gap:10px;min-width:0;flex:1;padding:10px 34px 10px 10px;border:1px solid transparent;border-radius:11px;color:#b9c4d3;text-decoration:none}.session:hover{background:#131a26}.session.selected{border-color:#293750;background:linear-gradient(100deg,#182235,#131a27);color:#fff}.session-glyph{display:grid;place-items:center;width:27px;height:27px;flex:none;border:1px solid #29354a;border-radius:8px;background:#171f2e;color:#8396b2;font-size:10px;font-weight:800}.session.selected .session-glyph{border-color:#5362ad;background:#2a335b;color:#cdd3ff}.session-copy{min-width:0;flex:1}.session b{display:block;overflow:hidden;color:inherit;font-size:12px;font-weight:650;line-height:1.35;text-overflow:ellipsis;white-space:nowrap}.session small{display:block;overflow:hidden;margin-top:3px;color:#647389;font:9px/1.3 ui-monospace,monospace;text-overflow:ellipsis;white-space:nowrap}.session .session-meta{color:#73829a;font-family:inherit}.session-row form{position:absolute;right:8px;top:9px}.delete-session{display:grid;place-items:center;width:25px;height:25px;padding:0;border:0;border-radius:7px;background:transparent;color:#56657a;cursor:pointer;font-size:16px;opacity:0}.session-row:hover .delete-session,.delete-session:focus{opacity:1}.delete-session:hover{background:#331923;color:var(--danger)}
@@ -3741,7 +3784,7 @@ a,button,input{font:inherit}a{color:inherit}button{color:inherit}.app{min-height
         document.querySelectorAll('.session-row').forEach(function(row){var show=!query||row.textContent.toLowerCase().includes(query);row.hidden=!show;if(show)visible++;});
         var emptySearch=document.querySelector('.empty-search');if(emptySearch)emptySearch.hidden=visible!==0;
     });
-    var params=new URLSearchParams(location.search), scrollKey='session-list:'+ (params.get('provider')||'copilot')+':'+(params.get('show_empty')||'0');
+    var params=new URLSearchParams(location.search), scrollKey='session-list:'+ (params.get('provider')||'github_copilot')+':'+(params.get('show_empty')||'0');
     var list=document.querySelector('.session-list'), saved=sessionStorage.getItem(scrollKey);if(saved&&list)list.scrollTop=Number(saved);
     if(list)list.addEventListener('scroll',function(){sessionStorage.setItem(scrollKey,String(list.scrollTop))},{passive:true});
     var detailKey='session-detail:'+(params.get('session')||'');var position=sessionStorage.getItem(detailKey);if(position)requestAnimationFrame(function(){scrollTo(0,Number(position))});
@@ -3902,7 +3945,7 @@ PAGE = PAGE.replace("</body>", "__SCAN_BOOTSTRAP__</body>")
 PAGE = PAGE.replace(
     '</head>',
     '''<style>
-.sidebar-top .provider-menu:empty{display:none}.settings-intro{max-width:780px;color:var(--muted);font-size:12px;line-height:1.6}.settings-intro code,.settings-help code{color:#b9c8dc;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.settings-card{max-width:1500px;margin:38px auto 0;padding:20px;border:1px solid var(--line);border-radius:14px;background:rgba(14,19,29,.82);box-shadow:var(--shadow)}.mapping-row{display:grid;grid-template-columns:minmax(0,1fr) 24px minmax(0,1fr) 34px;align-items:center;gap:8px;margin:8px 0}.mapping-row input{width:100%;height:36px;padding:0 10px;border:1px solid var(--line-strong);border-radius:8px;background:#090d15;color:#f0f5fb;font-size:11px;outline:none}.mapping-row input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,140,255,.12)}.mapping-row>span{text-align:center;color:var(--muted)}.mapping-remove{display:grid;place-items:center;width:32px;height:32px;border:1px solid #633346;border-radius:8px;background:#291923;color:#f0a6b4;font-size:17px;cursor:pointer}.mapping-remove:hover{border-color:#bd6078;background:#41202d;color:#fff}.settings-actions{display:flex;gap:8px;margin-top:18px}.settings-actions button{height:34px;padding:0 13px;border-radius:8px;font-size:11px;font-weight:700;cursor:pointer}.settings-primary{border:1px solid #6876d3;background:#303866;color:#edf0ff}.settings-primary:hover{background:#424f91}.settings-secondary{border:1px solid var(--line-strong);background:var(--surface-3);color:#b9c6d9}.settings-secondary:hover{background:#252e51;color:#fff}.settings-help{margin:16px 0 0;color:#718198;font-size:10px;line-height:1.6}@media(max-width:620px){.settings-card{padding:14px}.mapping-row{grid-template-columns:minmax(0,1fr) 20px minmax(0,1fr) 30px;gap:4px}.mapping-row input{padding:0 7px;font-size:10px}}
+.sidebar-top .provider-menu:empty{display:none}.settings-intro{max-width:780px;color:var(--muted);font-size:12px;line-height:1.6}.settings-intro code,.settings-help code{color:#b9c8dc;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.settings-card{max-width:1500px;margin:38px auto 0;padding:20px;border:1px solid var(--line);border-radius:14px;background:rgba(14,19,29,.82);box-shadow:var(--shadow)}.mapping-row{display:grid;grid-template-columns:minmax(0,1fr) 24px minmax(0,1fr) 70px;align-items:center;gap:8px;margin:8px 0}.mapping-row-actions{display:flex;gap:6px;align-items:center}.mapping-row input{width:100%;height:36px;padding:0 10px;border:1px solid var(--line-strong);border-radius:8px;background:#090d15;color:#f0f5fb;font-size:11px;outline:none}.mapping-row input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,140,255,.12)}.mapping-row>span{text-align:center;color:var(--muted)}.mapping-remove{display:grid;place-items:center;width:32px;height:32px;border:1px solid #633346;border-radius:8px;background:#291923;color:#f0a6b4;font-size:17px;cursor:pointer}.mapping-remove:hover{border-color:#bd6078;background:#41202d;color:#fff}.mapping-duplicate{display:grid;place-items:center;width:32px;height:32px;border:1px solid #315479;border-radius:8px;background:#172a43;color:#a9c9e9;font-size:20px;cursor:pointer}.mapping-duplicate:hover{border-color:#6ca1d5;background:#24466c;color:#fff}.mapping-duplicate:focus-visible{outline:2px solid #9ed1ff;outline-offset:2px}.mapping-duplicate-warning{margin:0 0 12px;padding:10px 12px;border:1px solid #bd6078;border-radius:8px;background:#41202d;color:#ffe4e9;font-size:12px}.mapping-row input.mapping-duplicate-name{border-color:#e78299;box-shadow:0 0 0 2px rgba(231,130,153,.25)}.settings-actions{display:flex;gap:8px;margin-top:18px}.settings-actions button{height:34px;padding:0 13px;border-radius:8px;font-size:11px;font-weight:700;cursor:pointer}.settings-primary{border:1px solid #6876d3;background:#303866;color:#edf0ff}.settings-primary:hover{background:#424f91}.settings-secondary{border:1px solid var(--line-strong);background:var(--surface-3);color:#b9c6d9}.settings-secondary:hover{background:#252e51;color:#fff}.settings-help{margin:16px 0 0;color:#718198;font-size:10px;line-height:1.6}@media(max-width:620px){.settings-card{padding:14px}.mapping-row{grid-template-columns:minmax(0,1fr) 20px minmax(0,1fr) 70px;gap:4px}.mapping-row input{padding:0 7px;font-size:10px}}
 </style></head>''',
     1,
 )
@@ -3913,7 +3956,59 @@ PAGE = PAGE.replace(
 )
 PAGE = PAGE.replace(
     '</body>',
-    '''<script>(function(){var rows=document.getElementById('mapping-rows'),add=document.getElementById('mapping-add');if(!rows||!add)return;add.addEventListener('click',function(){var row=rows.querySelector('.mapping-row').cloneNode(true);row.querySelectorAll('input').forEach(function(input){input.value='';});rows.appendChild(row);});rows.addEventListener('click',function(event){var button=event.target.closest('.mapping-remove');if(!button)return;var all=rows.querySelectorAll('.mapping-row');if(all.length>1)button.closest('.mapping-row').remove();});})();</script></body>''',
+    '''<script>(function(){
+        var rows=document.getElementById('mapping-rows'),add=document.getElementById('mapping-add');
+        if(!rows||!add)return;
+        var form=rows.closest('form'),warning=form.querySelector('#mapping-duplicate-warning');
+        var duplicateDeployment=function(){
+            warning.hidden=true;
+            warning.textContent='';
+            var names=new Map();
+            for(var input of rows.querySelectorAll('input[name="deployment"]')){
+                input.classList.remove('mapping-duplicate-name');
+            }
+            for(var input of rows.querySelectorAll('input[name="deployment"]')){
+                var name=input.value.trim(),key=name.toLowerCase();
+                if(!name)continue;
+                if(names.has(key)){
+                    names.get(key).classList.add('mapping-duplicate-name');
+                    input.classList.add('mapping-duplicate-name');
+                    warning.textContent='Deployment "'+name+'" already exists. Rename or remove the duplicate before saving.';
+                    warning.hidden=false;
+                    return input;
+                }
+                names.set(key,input);
+            }
+            return null;
+        };
+        add.addEventListener('click',function(){
+            var row=rows.querySelector('.mapping-row').cloneNode(true);
+            row.querySelectorAll('input').forEach(function(input){input.value='';});
+            rows.appendChild(row);
+            duplicateDeployment();
+        });
+        rows.addEventListener('input',function(event){
+            if(event.target.matches('input[name="deployment"]'))duplicateDeployment();
+        });
+        rows.addEventListener('click',function(event){
+            var duplicate=event.target.closest('.mapping-duplicate');
+            if(duplicate){
+                var source=duplicate.closest('.mapping-row'),copy=source.cloneNode(true);
+                source.querySelectorAll('input').forEach(function(input,index){copy.querySelectorAll('input')[index].value=input.value;});
+                source.insertAdjacentElement('afterend',copy);
+                duplicateDeployment();
+                return;
+            }
+            var remove=event.target.closest('.mapping-remove');
+            if(!remove)return;
+            if(rows.querySelectorAll('.mapping-row').length>1)remove.closest('.mapping-row').remove();
+            duplicateDeployment();
+        });
+        form.addEventListener('submit',function(event){
+            var duplicate=duplicateDeployment();
+            if(duplicate){event.preventDefault();duplicate.focus();}
+        });
+    })();</script></body>''',
     1,
 )
 

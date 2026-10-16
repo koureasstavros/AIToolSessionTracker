@@ -1,5 +1,7 @@
 # xAI Cursor
 
+Provider ID for routing, URLs, and archive manifests: `xai_cursor`.
+
 ## Local storage
 
 Cursor agent transcripts are stored as JSONL files below:

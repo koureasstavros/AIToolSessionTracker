@@ -183,7 +183,7 @@ def index(root: Path) -> list[dict]:
     summaries: dict[str, dict] = {}
     parent_ids: dict[str, str] = {}
     for path in files:
-        entry = viewer.session_summary(path, "codex", "external")
+        entry = viewer.session_summary(path, "openai_codex", "external")
         entry["name"] = _clean_title(entry.get("name"), entry["id"])
         records = viewer.safe_json_lines(path)
         metadata = _subagent_metadata(records)
@@ -452,8 +452,8 @@ def export_source_files(summary: dict, archive: Path) -> Path:
         for child in summary.get("_children", [])
         if isinstance(child, dict) and isinstance(child.get("_source"), Path)
     )
-    return create_archive("codex", archive, files)
+    return create_archive("openai_codex", archive, files)
 
 
 def import_source_files(archive: Path, root: Path) -> list[Path]:
-    return inject_archive("codex", archive, display_root(root) / "imported")
+    return inject_archive("openai_codex", archive, display_root(root) / "imported")

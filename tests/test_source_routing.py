@@ -73,12 +73,12 @@ class SourceRoutingTests(unittest.TestCase):
             database_path = Path(directory) / "AI-Tool-Session-Tracker-config.db"
             source_routing.load_source_routing(PROVIDERS, database_path)
             with closing(sqlite3.connect(database_path)) as database:
-                database.execute("DELETE FROM source_routing WHERE provider = 'claude'")
+                database.execute("DELETE FROM source_routing WHERE provider = 'anthropic_claude'")
                 database.commit()
 
             routing = source_routing.load_source_routing(PROVIDERS, database_path)
 
-            self.assertEqual(routing["providers"]["claude"], "local")
+            self.assertEqual(routing["providers"]["anthropic_claude"], "local")
 
     def test_nested_context_is_not_part_of_user_request(self) -> None:
         text = (
@@ -109,11 +109,11 @@ class SourceRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "routing.json"
             routes = {provider: "local" for provider in PROVIDERS}
-            routes["claude"] = "otel"
+            routes["anthropic_claude"] = "otel"
 
             source_routing.save_source_routing(PROVIDERS, routes, path)
 
-            self.assertEqual(source_routing.load_source_routing(PROVIDERS, path)["providers"]["claude"], "otel")
+            self.assertEqual(source_routing.load_source_routing(PROVIDERS, path)["providers"]["anthropic_claude"], "otel")
             with closing(sqlite3.connect(path)) as connection:
                 stored = connection.execute("SELECT provider, source FROM source_routing").fetchall()
             self.assertNotIn("secret", repr(stored).lower())
@@ -127,7 +127,7 @@ class SourceRoutingTests(unittest.TestCase):
             path = Path(directory) / "routing.db"
             configuration = source_routing.load_source_routing(PROVIDERS, path)
 
-            self.assertEqual(configuration["provider_options"]["antigravity"], ["local"])
+            self.assertEqual(configuration["provider_options"]["google_antigravity"], ["local"])
             self.assertEqual(configuration["provider_options"]["xai_cursor"], ["local"])
             self.assertEqual(configuration["provider_options"]["cognition_devin"], ["local"])
             self.assertEqual(configuration["provider_options"]["m365_copilot"], ["local"])
@@ -151,7 +151,7 @@ class SourceRoutingTests(unittest.TestCase):
     def test_otlp_spans_are_persisted_and_read_as_provider_sessions(self) -> None:
         payload = {
             "resourceSpans": [{
-                "resource": {"attributes": [{"key": "ai.session.provider", "value": {"stringValue": "copilot"}}]},
+                "resource": {"attributes": [{"key": "ai.session.provider", "value": {"stringValue": "github_copilot"}}]},
                 "scopeSpans": [{"spans": [{
                     "traceId": "trace-1", "spanId": "span-1", "name": "chat", "startTimeUnixNano": "1000000000", "endTimeUnixNano": "2000000000",
                     "attributes": [
@@ -179,8 +179,8 @@ class SourceRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "otel.db"
             self.assertEqual(source_otel.ingest_otlp_json(payload, PROVIDERS, database), 1)
-            summary = source_otel.index("copilot", database)[0]
-            details = source_otel.details(summary, "copilot", database)
+            summary = source_otel.index("github_copilot", database)[0]
+            details = source_otel.details(summary, "github_copilot", database)
 
         self.assertEqual(summary["_route"], "otel")
         self.assertEqual(summary["name"], "Analyze the project metadata")
@@ -221,8 +221,8 @@ class SourceRoutingTests(unittest.TestCase):
             database = Path(directory) / "tracker.db"
             payload = source_otel.otlp_protobuf_to_json(request)
             self.assertEqual(source_otel.ingest_otlp_json(payload, PROVIDERS, database), 1)
-            summary = source_otel.index("copilot", database)[0]
-            details = source_otel.details(summary, "copilot", database)
+            summary = source_otel.index("github_copilot", database)[0]
+            details = source_otel.details(summary, "github_copilot", database)
 
         self.assertEqual(summary["id"], "copilot-session-1")
         self.assertEqual(details["model"], "gpt-5")
@@ -231,19 +231,19 @@ class SourceRoutingTests(unittest.TestCase):
 
     def test_otlp_route_uses_local_otel_database_not_adapter(self) -> None:
         configuration = {"providers": {provider: "local" for provider in PROVIDERS}, "otel": {}}
-        configuration["providers"]["copilot"] = "otel"
+        configuration["providers"]["github_copilot"] = "otel"
         with patch("session_token_viewer.source_routing_config", return_value=configuration), patch(
             "session_token_viewer.source_otel.index", return_value=[{"id": "otel-1", "_kind": "otel", "_route": "otel", "_has_data": True}]
         ) as index:
-            summaries = load_session_index(Path("."), "copilot")
+            summaries = load_session_index(Path("."), "github_copilot")
 
-        index.assert_called_once_with("copilot")
+        index.assert_called_once_with("github_copilot")
         self.assertEqual(summaries[0]["id"], "otel-1")
 
     def test_delete_removes_all_otel_spans_for_session(self) -> None:
         payload = {
             "resourceSpans": [{
-                "resource": {"attributes": [{"key": "ai.session.provider", "value": {"stringValue": "copilot"}}]},
+                "resource": {"attributes": [{"key": "ai.session.provider", "value": {"stringValue": "github_copilot"}}]},
                 "scopeSpans": [{"spans": [
                     {"traceId": "trace-1", "spanId": "span-1", "name": "chat", "startTimeUnixNano": "1", "endTimeUnixNano": "2", "attributes": [{"key": "ai.session.id", "value": {"stringValue": "session-1"}}, {"key": "gen_ai.input.messages", "value": {"stringValue": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"Delete me\"}]}]"}}]},
                     {"traceId": "trace-1", "spanId": "span-2", "name": "chat", "startTimeUnixNano": "2", "endTimeUnixNano": "3", "attributes": [{"key": "ai.session.id", "value": {"stringValue": "session-1"}}]},
@@ -253,9 +253,9 @@ class SourceRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "tracker.db"
             source_otel.ingest_otlp_json(payload, PROVIDERS, database)
-            summary = source_otel.index("copilot", database)[0]
-            self.assertTrue(source_otel.delete(summary, "copilot", database))
-            self.assertEqual(source_otel.index("copilot", database), [])
+            summary = source_otel.index("github_copilot", database)[0]
+            self.assertTrue(source_otel.delete(summary, "github_copilot", database))
+            self.assertEqual(source_otel.index("github_copilot", database), [])
 
     def test_tracker_database_uses_wal_for_otlp_and_viewer_access(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -265,7 +265,7 @@ class SourceRoutingTests(unittest.TestCase):
 
     def test_otlp_logs_and_metrics_are_persisted(self) -> None:
         resource = {"attributes": [
-            {"key": "ai.session.provider", "value": {"stringValue": "codex"}},
+            {"key": "ai.session.provider", "value": {"stringValue": "openai_codex"}},
             {"key": "ai.session.id", "value": {"stringValue": "session-1"}},
         ]}
         logs = {"resourceLogs": [{"resource": resource, "scopeLogs": [{"logRecords": [{
@@ -282,17 +282,17 @@ class SourceRoutingTests(unittest.TestCase):
             with closing(sqlite3.connect(database)) as connection:
                 log = connection.execute("SELECT provider, session_id, body FROM otel_logs").fetchone()
                 metric = connection.execute("SELECT provider, session_id, name FROM otel_metrics").fetchone()
-            summary = source_otel.index("codex", database)[0]
-            mapped_details = source_otel.details(summary, "codex", database)
+            summary = source_otel.index("openai_codex", database)[0]
+            mapped_details = source_otel.details(summary, "openai_codex", database)
 
-        self.assertEqual(log, ("codex", "session-1", "User prompt"))
-        self.assertEqual(metric, ("codex", "session-1", "gen_ai.client.token.usage"))
+        self.assertEqual(log, ("openai_codex", "session-1", "User prompt"))
+        self.assertEqual(metric, ("openai_codex", "session-1", "gen_ai.client.token.usage"))
         self.assertEqual(summary["name"], "User prompt")
         self.assertEqual(mapped_details["turns"][0]["user"], "User prompt")
 
     def test_infrastructure_only_spans_are_hidden_from_sidebar(self) -> None:
         payload = {"resourceSpans": [{
-            "resource": {"attributes": [{"key": "ai.session.provider", "value": {"stringValue": "codex"}}]},
+            "resource": {"attributes": [{"key": "ai.session.provider", "value": {"stringValue": "openai_codex"}}]},
             "scopeSpans": [{"spans": [{
                 "traceId": "trace-1", "spanId": "span-1", "name": "turn_context.build",
                 "startTimeUnixNano": "1", "endTimeUnixNano": "2",
@@ -302,12 +302,12 @@ class SourceRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "tracker.db"
             source_otel.ingest_otlp_json(payload, PROVIDERS, database)
-            self.assertEqual(source_otel.index("codex", database), [])
+            self.assertEqual(source_otel.index("openai_codex", database), [])
 
     def test_codex_title_generation_prompt_is_hidden(self) -> None:
         payload = {"resourceLogs": [{
             "resource": {"attributes": [
-                {"key": "ai.session.provider", "value": {"stringValue": "codex"}},
+                {"key": "ai.session.provider", "value": {"stringValue": "openai_codex"}},
                 {"key": "conversation.id", "value": {"stringValue": "title-session"}},
             ]},
             "scopeLogs": [{"logRecords": [{
@@ -320,7 +320,7 @@ class SourceRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "tracker.db"
             source_otel.ingest_otlp_logs_json(payload, PROVIDERS, database)
-            self.assertEqual(source_otel.index("codex", database), [])
+            self.assertEqual(source_otel.index("openai_codex", database), [])
 
     def test_agent_span_groups_nested_chat_spans_as_invocations(self) -> None:
         def attribute(key: str, value: str) -> dict:
@@ -339,7 +339,7 @@ class SourceRoutingTests(unittest.TestCase):
             attribute("gen_ai.output.messages", json.dumps([{"role": "assistant", "parts": [{"type": "tool_call", "id": "call-1", "name": "read_file", "arguments": "{}"}]}])),
         ]
         payload = {"resourceSpans": [{
-            "resource": {"attributes": [attribute("ai.session.provider", "copilot")]},
+            "resource": {"attributes": [attribute("ai.session.provider", "github_copilot")]},
             "scopeSpans": [{"spans": [
                 {"traceId": "trace-1", "spanId": "parent", "name": "invoke_agent Copilot", "startTimeUnixNano": "100", "endTimeUnixNano": "300", "attributes": parent_attributes},
                 {"traceId": "trace-1", "spanId": "child", "name": "chat model", "startTimeUnixNano": "120", "endTimeUnixNano": "200", "attributes": child_attributes},
@@ -348,7 +348,7 @@ class SourceRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "tracker.db"
             source_otel.ingest_otlp_json(payload, PROVIDERS, database)
-            details = source_otel.details(source_otel.index("copilot", database)[0], "copilot", database)
+            details = source_otel.details(source_otel.index("github_copilot", database)[0], "github_copilot", database)
 
         self.assertEqual(len(details["turns"]), 1)
         turn = details["turns"][0]
@@ -365,7 +365,7 @@ class SourceRoutingTests(unittest.TestCase):
 
         user_messages = json.dumps([{"role": "user", "parts": [{"type": "text", "content": "<context>Workspace details</context><userRequest>Continue work</userRequest>"}]}])
         payload = {"resourceSpans": [{
-            "resource": {"attributes": [attribute("ai.session.provider", "copilot")]},
+            "resource": {"attributes": [attribute("ai.session.provider", "github_copilot")]},
             "scopeSpans": [{"spans": [
                 {"traceId": "trace-1", "spanId": "one", "name": "chat", "startTimeUnixNano": "100", "endTimeUnixNano": "150", "attributes": [attribute("ai.session.id", "session-1"), attribute("gen_ai.input.messages", user_messages)]},
                 {"traceId": "trace-1", "spanId": "two", "name": "chat", "startTimeUnixNano": "160", "endTimeUnixNano": "200", "attributes": [attribute("ai.session.id", "session-1"), attribute("gen_ai.usage.output_tokens", "5")]},
@@ -374,7 +374,7 @@ class SourceRoutingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "tracker.db"
             source_otel.ingest_otlp_json(payload, PROVIDERS, database)
-            details = source_otel.details(source_otel.index("copilot", database)[0], "copilot", database)
+            details = source_otel.details(source_otel.index("github_copilot", database)[0], "github_copilot", database)
 
         self.assertEqual(len(details["turns"]), 1)
         self.assertEqual(details["turns"][0]["user"], "Continue work")
@@ -383,7 +383,7 @@ class SourceRoutingTests(unittest.TestCase):
 
     def test_chunked_otlp_http_request_is_ingested(self) -> None:
         payload = json.dumps({"resourceSpans": [{
-            "resource": {"attributes": [{"key": "ai.session.provider", "value": {"stringValue": "copilot"}}]},
+            "resource": {"attributes": [{"key": "ai.session.provider", "value": {"stringValue": "github_copilot"}}]},
             "scopeSpans": [{"spans": [{
                 "traceId": "chunked-trace", "spanId": "chunked-span", "name": "chat",
                 "startTimeUnixNano": "1000000000", "endTimeUnixNano": "2000000000",
@@ -406,7 +406,7 @@ class SourceRoutingTests(unittest.TestCase):
                         self.assertIn(b"200", client.recv(1024))
                 finally:
                     receiver.stop()
-            self.assertEqual(source_otel.index("copilot", database)[0]["id"], "chunked-trace")
+            self.assertEqual(source_otel.index("github_copilot", database)[0]["id"], "chunked-trace")
 
     def test_source_routing_and_otel_settings_are_separate(self) -> None:
         with patch("session_token_viewer.source_routing_config", return_value=source_routing.default_routing(PROVIDERS)):

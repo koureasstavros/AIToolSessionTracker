@@ -94,6 +94,67 @@ class CopilotInvocationGroupingTests(unittest.TestCase):
         self.assertEqual(turn["invocations"][0]["tools"][0]["result"], "# Project")
         self.assertEqual([invocation["tokens"]["outputTokens"] for invocation in turn["invocations"]], [10, 5])
 
+    def test_session_state_links_usage_records_to_assistant_api_calls(self) -> None:
+        records = [
+            {"type": "user.message", "data": {"interactionId": "turn-a", "content": "First"}},
+            {"type": "assistant.message", "data": {"interactionId": "turn-a", "apiCallId": "call-a", "content": "Part one"}},
+            {"type": "assistant.message", "data": {"interactionId": "turn-a", "apiCallId": "call-a", "content": "Part two"}},
+            {"type": "session.usage_record", "data": {"usage": {"apiCallId": "call-a", "inputTokens": 100, "cacheReadTokens": 10, "cacheWriteTokens": 20, "outputTokens": 7, "reasoningTokens": 3}}},
+            {"type": "session.usage_record", "data": {"usage": {"apiCallId": "call-a", "inputTokens": 100, "cacheReadTokens": 10, "cacheWriteTokens": 20, "outputTokens": 7, "reasoningTokens": 3}}},
+            {"type": "session.usage_record", "data": {"usage": {"apiCallId": "call-b", "inputTokens": 200, "cacheReadTokens": 0, "cacheWriteTokens": 0, "outputTokens": 0, "reasoningTokens": 0}}},
+            {"type": "user.message", "data": {"interactionId": "turn-b", "content": "Second"}},
+            {"type": "assistant.message", "data": {"interactionId": "turn-b", "apiCallId": "call-b", "content": "Done"}},
+            {"type": "user.message", "data": {"interactionId": "turn-c", "content": "Third"}},
+            {"type": "assistant.message", "data": {"interactionId": "turn-c", "apiCallId": "call-c", "content": "Done", "inputTokens": 9, "outputTokens": 5}},
+            {"type": "session.usage_record", "data": {"usage": {"apiCallId": "call-c", "inputTokens": 300, "cacheReadTokens": 1, "cacheWriteTokens": 2, "outputTokens": 5, "reasoningTokens": 4}}},
+            {"type": "user.message", "data": {"interactionId": "turn-d", "content": "No usage yet"}},
+            {"type": "assistant.message", "data": {"interactionId": "turn-d", "apiCallId": "call-d", "content": "Pending"}},
+            {"type": "session.usage_record", "data": {"usage": {"apiCallId": "unmatched", "inputTokens": 400, "cacheReadTokens": 5, "cacheWriteTokens": 6, "outputTokens": 40, "reasoningTokens": 7}}},
+            {"type": "session.shutdown", "data": {"modelMetrics": {"model": {"usage": {"inputTokens": 999, "cacheReadTokens": 3, "cacheWriteTokens": 4, "outputTokens": 99, "reasoningTokens": 11}}}}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "session-1"
+            folder.mkdir()
+            (folder / "events.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+            )
+            session = github_copilot_local_provider._read_session_state(folder)
+
+        expected = {
+            "inputTokens": [100, 200, 9, None],
+            "cacheReadTokens": [10, 0, 1, None],
+            "cacheWriteTokens": [20, 0, 2, None],
+            "outputTokens": [7, 0, 5, None],
+            "reasoningTokens": [3, 0, 4, None],
+        }
+        for key, values in expected.items():
+            self.assertEqual([turn["tokens"][key] for turn in session["turns"]], values)
+            self.assertEqual(session["turns"][0]["invocations"][0]["tokens"][key], values[0])
+            self.assertIsNone(session["turns"][0]["invocations"][1]["tokens"][key])
+        self.assertEqual(session["tokens"]["inputTokens"], 999)
+        self.assertEqual(session["tokens"]["outputTokens"], 99)
+        self.assertNotIn("estimated", session.get("tokenFlags", []))
+
+    def test_session_state_without_usage_records_keeps_estimated_turn_input(self) -> None:
+        records = [
+            {"type": "user.message", "data": {"interactionId": "turn-a", "content": "First"}},
+            {"type": "assistant.message", "data": {"interactionId": "turn-a", "outputTokens": 2}},
+            {"type": "user.message", "data": {"interactionId": "turn-b", "content": "Second"}},
+            {"type": "assistant.message", "data": {"interactionId": "turn-b", "outputTokens": 8}},
+            {"type": "session.shutdown", "data": {"modelMetrics": {"model": {"usage": {"inputTokens": 100, "reasoningTokens": 10}}}}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "session-1"
+            folder.mkdir()
+            (folder / "events.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+            )
+            session = github_copilot_local_provider._read_session_state(folder)
+
+        self.assertEqual([turn["tokens"]["inputTokens"] for turn in session["turns"]], [20, 80])
+        self.assertEqual([turn["tokens"]["reasoningTokens"] for turn in session["turns"]], [2, 8])
+        self.assertIn("estimated", session["tokenFlags"])
+
     def test_session_state_captures_reasoning_effort(self) -> None:
         records = [
             {"type": "session.start", "data": {"selectedModel": "gpt-test", "reasoningEffort": "high"}},

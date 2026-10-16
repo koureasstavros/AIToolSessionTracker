@@ -1,5 +1,7 @@
 # GitHub Copilot provider parsing
 
+Provider ID for routing, URLs, and archive manifests: `github_copilot`.
+
 ## Sources
 
 The provider scans:
@@ -74,7 +76,13 @@ GitHub Copilot uses source-specific turn handling:
 - **CLI / Desktop session-state:** events are grouped by `interactionId`, or by
   the linked `turnId`. Internal assistant turns become invocations, and
   tool start/completion events are attached to the assistant invocation that
-  initiated them.
+  initiated them. Matching `session.usage_record` entries supply input,
+  cache-read, cache-write, output, and reasoning tokens via `apiCallId`, once
+  per API call. Explicit assistant-message usage takes precedence; unmatched
+  records are not assigned to a turn. Session totals retain shutdown usage,
+  which can differ from the sum of matched per-call counts. When no matched
+  usage records exist, multi-turn input/cache/reasoning values still use the
+  previous estimated allocation.
 - **CLI / Desktop SQLite:** multiple assistant usage rows become invocations
   inside their logical user turn. Usage-only records can still become
   synthetic turns when no matching conversation content exists.
@@ -109,8 +117,9 @@ Supported normalized fields are:
 
 Input/output values come from request fields such as `promptTokens` and
 `completionTokens`, result metadata, database usage rows, and recognized usage
-aliases. Session totals are aggregated from turns. Cached input is subtracted
-from total input where the source reports both values.
+aliases. Session-state totals retain persisted shutdown usage when available;
+other sources can aggregate totals from turns. Cached input is subtracted from
+total input where the source reports both values.
 
 Invocation metrics are grouped as **User / Input** and **Assistant / Output**.
 For session-state plus SQLite sessions, database usage rows provide invocation

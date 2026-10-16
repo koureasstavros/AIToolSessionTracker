@@ -17,10 +17,10 @@ from src.providers import (
 class SourceArchiveTests(unittest.TestCase):
     def test_each_provider_round_trips_source_files(self) -> None:
         providers = (
-            ("codex", openai_codex_local_provider),
-            ("claude", anthropic_claude_local_provider),
+            ("openai_codex", openai_codex_local_provider),
+            ("anthropic_claude", anthropic_claude_local_provider),
             ("m365_copilot", m365_copilot_local_provider),
-            ("antigravity", google_antigravity_local_provider),
+            ("google_antigravity", google_antigravity_local_provider),
         )
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

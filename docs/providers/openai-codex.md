@@ -1,5 +1,7 @@
 # OpenAI Codex provider parsing
 
+Provider ID for routing, URLs, and archive manifests: `openai_codex`.
+
 ## Sources
 
 The provider scans:

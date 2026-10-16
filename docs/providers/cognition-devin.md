@@ -1,5 +1,7 @@
 # Cognition Devin
 
+Provider ID for routing, URLs, and archive manifests: `cognition_devin`.
+
 ## Local storage
 
 Devin CLI sessions are stored in a local SQLite database:

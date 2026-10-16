@@ -171,7 +171,7 @@ def index(root: Path | None = None) -> list[dict]:
             continue
         seen_ids.add(conv_id)
 
-        entry = viewer.session_summary(path, "antigravity", "external")
+        entry = viewer.session_summary(path, "google_antigravity", "external")
         entry["id"] = conv_id
 
         # Determine display name
@@ -543,9 +543,9 @@ def export_source_files(summary: dict, archive: Path) -> Path:
                 if item.is_file() and item.suffix.lower() in {".md", ".json", ".txt", ".png", ".jpg", ".webp"}:
                     files.append((item, "artifacts"))
 
-    return create_archive("antigravity", archive, files)
+    return create_archive("google_antigravity", archive, files)
 
 
 def import_source_files(archive: Path, root: Path) -> list[Path]:
     destination = display_root(root) / "imported"
-    return inject_archive("antigravity", archive, destination)
+    return inject_archive("google_antigravity", archive, destination)

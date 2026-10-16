@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-PROVIDER = "copilot"
+PROVIDER = "github_copilot"
 
 
 def is_internal_prompt(attributes: dict[str, object]) -> bool:
@@ -12,12 +12,10 @@ def is_internal_prompt(attributes: dict[str, object]) -> bool:
 
 
 def matches(attributes: dict[str, object]) -> bool:
-    value = str(
-        attributes.get("ai.session.provider")
-        or attributes.get("gen_ai.system")
-        or attributes.get("gen_ai.provider.name")
-        or ""
-    ).lower()
+    explicit_provider = attributes.get("ai.session.provider")
+    if explicit_provider is not None:
+        return str(explicit_provider).lower() == PROVIDER
+    value = str(attributes.get("gen_ai.system") or attributes.get("gen_ai.provider.name") or "").lower()
     return value in {"github", "github_copilot", "copilot"} or str(attributes.get("service.name") or "") == "copilot-chat"
 
 

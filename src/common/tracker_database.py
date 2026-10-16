@@ -6,6 +6,8 @@ import threading
 from contextlib import closing, contextmanager
 from pathlib import Path
 
+from src.migrations import run_config_migrations, run_content_migrations
+
 CONFIG_DATABASE_FILENAME = "AI-Tool-Session-Tracker-config.db"
 CONTENT_DATABASE_FILENAME = "AI-Tool-Session-Tracker-content.db"
 _DATABASE_LOCK = threading.RLock()
@@ -35,4 +37,20 @@ def connect_database(path: Path | None = None):
         if resolved_path not in _WAL_CONFIGURED:
             connection.execute("PRAGMA journal_mode = WAL")
             _WAL_CONFIGURED.add(resolved_path)
+        yield connection
+
+
+@contextmanager
+def connect_config_database(path: Path | None = None):
+    """Open configuration storage with its schemas and upgrades applied."""
+    with connect_database(path or config_database_path()) as connection, connection:
+        run_config_migrations(connection)
+        yield connection
+
+
+@contextmanager
+def connect_content_database(path: Path | None = None):
+    """Open content storage with its schemas and upgrades applied."""
+    with connect_database(path or content_database_path()) as connection, connection:
+        run_content_migrations(connection)
         yield connection

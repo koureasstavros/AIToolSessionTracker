@@ -1,5 +1,7 @@
 # Anthropic Claude Code provider parsing
 
+Provider ID for routing, URLs, and archive manifests: `anthropic_claude`.
+
 ## Sources
 
 The provider scans:

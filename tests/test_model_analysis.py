@@ -77,7 +77,7 @@ class ModelAnalysisTests(unittest.TestCase):
 
     def test_copilot_best_practices_force_one_based_turn_labels(self) -> None:
         session = {
-            "provider": "copilot",
+            "provider": "github_copilot",
             "model": "claude-sonnet-4-5",
             "turns": [
                 {"turn_index": 0, "timestamp": 1_000, "model": "claude-sonnet-4-5", "tokens": {"cacheReadTokens": 10}},

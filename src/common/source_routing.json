@@ -4,12 +4,12 @@
     "otel": "OTEL service"
   },
   "providers": {
-    "copilot": {"available": ["local", "otel"], "default": "local"},
-    "codex": {"available": ["local", "otel"], "default": "local"},
-    "claude": {"available": ["local", "otel"], "default": "local"},
+    "github_copilot": {"available": ["local", "otel"], "default": "local"},
+    "openai_codex": {"available": ["local", "otel"], "default": "local"},
+    "anthropic_claude": {"available": ["local", "otel"], "default": "local"},
     "xai_cursor": {"available": ["local"], "default": "local"},
     "cognition_devin": {"available": ["local"], "default": "local"},
-    "antigravity": {"available": ["local"], "default": "local"},
+    "google_antigravity": {"available": ["local"], "default": "local"},
     "m365_copilot": {"available": ["local"], "default": "local"}
   }
 }

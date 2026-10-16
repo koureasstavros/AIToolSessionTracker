@@ -4,6 +4,15 @@
 
 This changelog provides a concise record of the updates made to AI Tool Session Tracker, including new providers, features, documentation, improvements, and fixes. Entries are summarized from the repository commit history.
 
+### Version v0.0.42 — 2026-10-16
+
+- Added clone button functionality in models cost and model mapping views
+- Added duplicate model check handling in models cost and model mapping views
+- Fixed add button functionality in model cost view to not carry default values
+- Refactored database migration, connectivity handling and fixed naming conventions
+- Supported GitHub Copilot agent host format with all token categories and levels
+- Renamed the GitHub Copilot, OpenAI Codex, Anthropic Claude, and Google Antigravity provider IDs throughout routing, session metadata, OTEL storage, URLs, and new archives; old IDs are not migrated
+
 ### Version v0.0.41 — 2026-10-05
 
 - Added more pre-defined model names, info, costs into model costs page

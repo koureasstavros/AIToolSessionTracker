@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-PROVIDER = "codex"
+PROVIDER = "openai_codex"
 
 _USAGE_ATTRIBUTE_KEYS = (
     "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens",
@@ -18,13 +18,11 @@ def is_internal_prompt(attributes: dict[str, object]) -> bool:
 
 
 def matches(attributes: dict[str, object]) -> bool:
-    value = str(
-        attributes.get("ai.session.provider")
-        or attributes.get("gen_ai.system")
-        or attributes.get("gen_ai.provider.name")
-        or ""
-    ).lower()
-    return value in {"openai", "codex"} or "codex" in str(attributes.get("service.name") or "").lower()
+    explicit_provider = attributes.get("ai.session.provider")
+    if explicit_provider is not None:
+        return str(explicit_provider).lower() == PROVIDER
+    value = str(attributes.get("gen_ai.system") or attributes.get("gen_ai.provider.name") or "").lower()
+    return value in {"openai", "codex", "openai_codex"} or "codex" in str(attributes.get("service.name") or "").lower()
 
 
 def session_id(attributes: dict[str, object], trace_id: str) -> str:

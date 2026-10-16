@@ -16,9 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from src.common.tracker_database import config_database_path, connect_database, content_database_path
-from src.migrations import migration_config
-from src.migrations import migration_content
+from src.common.tracker_database import config_database_path, connect_config_database, connect_content_database, content_database_path
 from src.providers import anthropic_claude_otel_provider
 from src.providers import github_copilot_otel_provider
 from src.providers import openai_codex_otel_provider
@@ -73,8 +71,7 @@ def load_source_otel(path: Path | None = None) -> dict[str, object]:
     """Load the globally shared OTLP listener, seeding bundled settings once."""
     config_path = path or config_database_path()
     try:
-        with connect_database(config_path) as connection, connection:
-            migration_config.migration_source_otel_config_schema(connection)
+        with connect_config_database(config_path) as connection:
             row = connection.execute(
                 "SELECT protocol, host, port FROM source_otel WHERE id = 1"
             ).fetchone()
@@ -108,8 +105,7 @@ def save_source_otel(protocol: object, host: object, port: object, path: Path | 
     if validated_port is None:
         raise ValueError("OTLP listener port must be between 1 and 65535")
     config_path = path or config_database_path()
-    with connect_database(config_path) as connection, connection:
-        migration_config.migration_source_otel_config_schema(connection)
+    with connect_config_database(config_path) as connection:
         connection.execute(
             "INSERT OR REPLACE INTO source_otel (id, protocol, host, port) VALUES (1, ?, ?, ?)",
             (OTEL_HTTP, host.strip(), validated_port),
@@ -374,8 +370,7 @@ def ingest_otlp_json(payload: object, known_providers: object, path: Path | None
                 rows.append((provider, session_id, trace_id, span_id, str(span.get("name") or "AI operation"), int(span.get("startTimeUnixNano") or 0), int(span.get("endTimeUnixNano") or 0), json.dumps(attributes), json.dumps(span)))
     if not rows:
         return 0
-    with connect_database(path or content_database_path()) as connection, connection:
-        migration_content.migration_source_otel_content_schema(connection)
+    with connect_content_database(path or content_database_path()) as connection:
         connection.executemany("INSERT OR REPLACE INTO otel_spans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
     return len(rows)
 
@@ -421,8 +416,7 @@ def ingest_otlp_logs_json(payload: object, known_providers: object, path: Path |
                      _body_text(record.get("body")), json.dumps(attributes), json.dumps(record)))
     if not rows:
         return 0
-    with connect_database(path or content_database_path()) as connection, connection:
-        migration_content.migration_source_otel_content_schema(connection)
+    with connect_content_database(path or content_database_path()) as connection:
         connection.executemany(
             "INSERT INTO otel_logs (provider, session_id, trace_id, span_id, timestamp_ns, severity, body, attributes_json, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
@@ -453,8 +447,7 @@ def ingest_otlp_metrics_json(payload: object, known_providers: object, path: Pat
                          json.dumps(attributes), json.dumps({"metric": metric, "point": point})))
     if not rows:
         return 0
-    with connect_database(path or content_database_path()) as connection, connection:
-        migration_content.migration_source_otel_content_schema(connection)
+    with connect_content_database(path or content_database_path()) as connection:
         connection.executemany(
             "INSERT INTO otel_metrics (provider, session_id, name, timestamp_ns, attributes_json, raw_json) VALUES (?, ?, ?, ?, ?, ?)",
             rows,
@@ -465,8 +458,7 @@ def ingest_otlp_metrics_json(payload: object, known_providers: object, path: Pat
 def index(provider: str, path: Path | None = None) -> list[dict]:
     """Return OTEL-backed session summaries in the native viewer shape."""
     try:
-        with connect_database(path or content_database_path()) as connection:
-            migration_content.migration_source_otel_content_schema(connection)
+        with connect_content_database(path or content_database_path()) as connection:
             rows = connection.execute("SELECT session_id, MAX(end_ns), COUNT(*) FROM otel_spans WHERE provider = ? GROUP BY session_id", (provider,)).fetchall()
             attribute_rows = connection.execute(
                 "SELECT session_id, attributes_json FROM otel_spans WHERE provider = ? ORDER BY start_ns", (provider,)
@@ -515,8 +507,7 @@ def delete(summary: dict, provider: str, path: Path | None = None) -> bool:
     session_id = str(summary.get("id") or "")
     if not session_id:
         return False
-    with connect_database(path or content_database_path()) as connection, connection:
-        migration_content.migration_source_otel_content_schema(connection)
+    with connect_content_database(path or content_database_path()) as connection:
         deleted = connection.execute(
             "DELETE FROM otel_spans WHERE provider = ? AND session_id = ?", (provider, session_id)
         ).rowcount
@@ -560,8 +551,7 @@ def details(summary: dict, provider: str, path: Path | None = None) -> dict:
     session_id = str(summary.get("id") or "")
     adapter = _provider_adapter(provider)
     try:
-        with connect_database(path or content_database_path()) as connection:
-            migration_content.migration_source_otel_content_schema(connection)
+        with connect_content_database(path or content_database_path()) as connection:
             log_rows = connection.execute("SELECT session_id, trace_id, timestamp_ns, attributes_json, raw_json FROM otel_logs WHERE provider = ?", (provider,)).fetchall()
             related_trace_ids = set()
             for stored_session_id, trace_id, _timestamp_ns, attributes_json, _raw_json in log_rows:

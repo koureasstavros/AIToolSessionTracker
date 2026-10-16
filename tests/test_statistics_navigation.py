@@ -21,11 +21,11 @@ class StatisticsNavigationTests(unittest.TestCase):
             def details(self, summary):
                 return summary
 
-        with patch("session_token_viewer.PROVIDER_ADAPTERS", {"copilot": Adapter()}), patch(
+        with patch("session_token_viewer.PROVIDER_ADAPTERS", {"github_copilot": Adapter()}), patch(
             "session_token_viewer.source_mode", return_value="local"
         ):
-            page = load_session_index(Path("."), "copilot", limit=1, offset=0)
-            older = load_session_index(Path("."), "copilot", limit=1, offset=1)
+            page = load_session_index(Path("."), "github_copilot", limit=1, offset=0)
+            older = load_session_index(Path("."), "github_copilot", limit=1, offset=1)
 
         self.assertEqual([item["id"] for item in page], ["new"])
         self.assertEqual([item["id"] for item in older], ["middle"])
@@ -33,17 +33,17 @@ class StatisticsNavigationTests(unittest.TestCase):
     def test_timeline_targets_statistics_navigation_and_provider(self) -> None:
         markup = render_timeline_svg(
             {"2026-09-09": {"tokens": 120.0, "cost": 0.5}},
-            provider="claude",
+            provider="anthropic_claude",
         )
 
         self.assertIn('class="stats-navigation"', markup)
-        self.assertIn("provider=claude", markup)
+        self.assertIn("provider=anthropic_claude", markup)
         self.assertIn("view=statistics", markup)
 
     def test_timeline_keeps_cost_axis_inside_svg_viewbox(self) -> None:
         markup = render_timeline_svg(
             {"2026-09-09": {"tokens": 120.0, "cost": 0.5}},
-            provider="claude",
+            provider="anthropic_claude",
         )
 
         self.assertIn('x="956"', markup)
@@ -86,7 +86,7 @@ class StatisticsNavigationTests(unittest.TestCase):
         with patch("session_token_viewer.load_session_index", side_effect=AssertionError("synchronous scan")), patch(
             "session_token_viewer.render_statistics", side_effect=AssertionError("synchronous statistics")
         ):
-            markup = render(Path("."), None, provider="copilot", view="statistics", sessions_override=[], statistics_override=[], scan_bootstrap="poll")
+            markup = render(Path("."), None, provider="github_copilot", view="statistics", sessions_override=[], statistics_override=[], scan_bootstrap="poll")
 
         self.assertIn("AI Tool Session Tracker", markup)
         self.assertNotIn("synchronous scan", markup)
@@ -95,7 +95,7 @@ class StatisticsNavigationTests(unittest.TestCase):
         markup = render(
             Path("."),
             None,
-            provider="copilot",
+            provider="github_copilot",
             view="statistics",
             sessions_override=[],
             statistics_override=[],
@@ -109,7 +109,7 @@ class StatisticsNavigationTests(unittest.TestCase):
         markup = render(
             Path("."),
             None,
-            provider="copilot",
+            provider="github_copilot",
             view="statistics",
             sessions_override=[],
             statistics_override=[],
@@ -122,7 +122,7 @@ class StatisticsNavigationTests(unittest.TestCase):
         markup = render(
             Path("."),
             None,
-            provider="copilot",
+            provider="github_copilot",
             sessions_override=[],
             statistics_override=[],
             scan_bootstrap="poll",
@@ -136,7 +136,7 @@ class StatisticsNavigationTests(unittest.TestCase):
         markup = render(
             Path("."),
             None,
-            provider="copilot",
+            provider="github_copilot",
             view="operational",
             sessions_override=[],
             statistics_override=[],
@@ -150,9 +150,9 @@ class StatisticsNavigationTests(unittest.TestCase):
         markup = render(
             Path("."),
             None,
-            provider="copilot",
+            provider="github_copilot",
             view="operational",
-            sessions_override=[{"id": "new", "name": "new", "updated": 1_700_000_000, "provider": "copilot"}],
+            sessions_override=[{"id": "new", "name": "new", "updated": 1_700_000_000, "provider": "github_copilot"}],
             statistics_override=[],
             scan_bootstrap="poll",
         )
@@ -177,7 +177,7 @@ class StatisticsNavigationTests(unittest.TestCase):
         markup = render(
             Path("."),
             None,
-            provider="copilot",
+            provider="github_copilot",
             sessions_override=[],
             statistics_override=[],
             scan_bootstrap="poll",
@@ -203,7 +203,7 @@ class StatisticsNavigationTests(unittest.TestCase):
                 detail_calls.append(summary["id"])
                 return summary
 
-        adapters = {provider: Adapter() for provider in ("copilot", "codex", "claude", "antigravity", "m365_copilot")}
+        adapters = {provider: Adapter() for provider in ("github_copilot", "openai_codex", "anthropic_claude", "google_antigravity", "m365_copilot")}
         manager = BackgroundScanManager(Path("."))
         with patch("session_token_viewer.PROVIDER_ADAPTERS", adapters), patch(
             "session_token_viewer.source_mode", return_value="local"
@@ -211,7 +211,7 @@ class StatisticsNavigationTests(unittest.TestCase):
             manager.start()
             manager._thread.join(timeout=2)
 
-        sessions, statuses = manager.snapshot("copilot")
+        sessions, statuses = manager.snapshot("github_copilot")
         self.assertEqual({item["id"] for item in sessions}, {"first", "second"})
         self.assertEqual(len(seen), 5)
         self.assertEqual(detail_calls, [])
@@ -230,7 +230,7 @@ class StatisticsNavigationTests(unittest.TestCase):
             def details(self, summary):
                 raise AssertionError(f"details loaded during scan: {summary['id']}")
 
-        adapters = {provider: Adapter() for provider in ("copilot", "codex", "claude", "antigravity", "m365_copilot")}
+        adapters = {provider: Adapter() for provider in ("github_copilot", "openai_codex", "anthropic_claude", "google_antigravity", "m365_copilot")}
         manager = BackgroundScanManager(Path("."))
         with patch("session_token_viewer.PROVIDER_ADAPTERS", adapters), patch(
             "session_token_viewer.source_mode", return_value="local"
@@ -238,18 +238,18 @@ class StatisticsNavigationTests(unittest.TestCase):
             manager.start()
             manager._thread.join(timeout=2)
 
-        self.assertEqual([item["id"] for item in manager.snapshot("copilot")[0]], ["known"])
+        self.assertEqual([item["id"] for item in manager.snapshot("github_copilot")[0]], ["known"])
         self.assertEqual(
-            {item["id"] for item in manager.snapshot("copilot", show_empty=True)[0]},
+            {item["id"] for item in manager.snapshot("github_copilot", show_empty=True)[0]},
             {"known", "unknown"},
         )
 
     def test_statistics_details_load_one_session_at_a_time(self) -> None:
         manager = BackgroundScanManager(Path("."))
-        first = {"id": "first", "provider": "copilot", "_has_data": True, "_source": Path("first")}
-        second = {"id": "second", "provider": "copilot", "_has_data": True, "_source": Path("second")}
-        manager._sessions["copilot"] = [first, second]
-        manager._statistics_sessions["copilot"] = [("copilot", first), ("copilot", second)]
+        first = {"id": "first", "provider": "github_copilot", "_has_data": True, "_source": Path("first")}
+        second = {"id": "second", "provider": "github_copilot", "_has_data": True, "_source": Path("second")}
+        manager._sessions["github_copilot"] = [first, second]
+        manager._statistics_sessions["github_copilot"] = [("github_copilot", first), ("github_copilot", second)]
 
         with patch("session_token_viewer.load_session_details", side_effect=[{"id": "first"}, {"id": "second"}]) as load:
             self.assertTrue(manager.load_next_statistics_detail())
@@ -272,7 +272,7 @@ class StatisticsNavigationTests(unittest.TestCase):
         from session_token_viewer import statistics_group_key
 
         self.assertEqual(
-            statistics_group_key({"reasoningEffort": "high"}, "effort", "copilot", {}),
+            statistics_group_key({"reasoningEffort": "high"}, "effort", "github_copilot", {}),
             "high",
         )
         markup = render(Path("."), None, view="statistics", group="effort", statistics_override=[])
@@ -311,42 +311,42 @@ class StatisticsNavigationTests(unittest.TestCase):
         manager = BackgroundScanManager(Path("."))
         deleted = {"id": "deleted", "name": "deleted", "updated": 2}
         kept = {"id": "kept", "name": "kept", "updated": 1}
-        manager._sessions["copilot"] = [deleted, kept]
-        manager._all_sessions["copilot"] = [deleted, kept]
-        manager._statistics_sessions["copilot"] = [("copilot", deleted), ("copilot", kept)]
+        manager._sessions["github_copilot"] = [deleted, kept]
+        manager._all_sessions["github_copilot"] = [deleted, kept]
+        manager._statistics_sessions["github_copilot"] = [("github_copilot", deleted), ("github_copilot", kept)]
 
-        manager.remove_session("copilot", "deleted")
+        manager.remove_session("github_copilot", "deleted")
 
-        visible, _ = manager.snapshot("copilot")
-        all_sessions, _ = manager.snapshot("copilot", show_empty=True)
+        visible, _ = manager.snapshot("github_copilot")
+        all_sessions, _ = manager.snapshot("github_copilot", show_empty=True)
         self.assertEqual([item["id"] for item in visible], ["kept"])
         self.assertEqual([item["id"] for item in all_sessions], ["kept"])
         self.assertEqual([item[1]["id"] for item in manager.all_sessions(True)], ["kept"])
 
     def test_scan_manager_deletes_from_fresh_summary_and_cache(self) -> None:
         manager = BackgroundScanManager(Path("."))
-        cached = {"id": "session-1", "provider": "copilot"}
-        fresh = {"id": "session-1", "provider": "copilot", "_source": Path("fresh")}
-        manager._sessions["copilot"] = [cached]
-        manager._all_sessions["copilot"] = [cached]
+        cached = {"id": "session-1", "provider": "github_copilot"}
+        fresh = {"id": "session-1", "provider": "github_copilot", "_source": Path("fresh")}
+        manager._sessions["github_copilot"] = [cached]
+        manager._all_sessions["github_copilot"] = [cached]
 
         with patch("session_token_viewer.load_session_index", return_value=[fresh]), patch(
             "session_token_viewer.delete_session"
         ) as delete:
-            deleted = manager.delete_provider_session("copilot", "session-1")
+            deleted = manager.delete_provider_session("github_copilot", "session-1")
 
         self.assertTrue(deleted)
         delete.assert_called_once_with(fresh)
-        self.assertEqual(manager.snapshot("copilot")[0], [])
+        self.assertEqual(manager.snapshot("github_copilot")[0], [])
 
     def test_scan_manager_retries_transient_delete_failure(self) -> None:
         manager = BackgroundScanManager(Path("."))
-        summary = {"id": "session-1", "provider": "copilot", "_source": Path("source")}
+        summary = {"id": "session-1", "provider": "github_copilot", "_source": Path("source")}
 
         with patch("session_token_viewer.load_session_index", return_value=[summary]), patch(
             "session_token_viewer.delete_session", side_effect=[PermissionError("locked"), None]
         ) as delete, patch("session_token_viewer.time.sleep") as sleep:
-            deleted = manager.delete_provider_session("copilot", "session-1")
+            deleted = manager.delete_provider_session("github_copilot", "session-1")
 
         self.assertTrue(deleted)
         self.assertEqual(delete.call_count, 2)

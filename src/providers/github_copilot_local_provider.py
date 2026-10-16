@@ -98,9 +98,28 @@ def _read_session_state(folder: Path) -> dict:
     turns: dict[str, dict] = {}
     turn_interactions: dict[str, str] = {}
     output_total = 0
+    usage_by_call: dict[str, dict[str, int]] = {}
+    message_fields_by_call: dict[str, set[str]] = {}
+    used_usage_records = False
     internal_context: list[tuple[str, str]] = []
     subagent_info: dict[str, dict] = {}
     for record in records:
+        if record.get("type") == "session.usage_record":
+            data = record.get("data") if isinstance(record.get("data"), dict) else {}
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+            api_call_id = usage.get("apiCallId")
+            if isinstance(api_call_id, str) and api_call_id.strip():
+                recorded = usage_by_call.setdefault(api_call_id.strip(), {})
+                for key in viewer.TOKEN_KEYS:
+                    value = viewer.number(usage.get(key))
+                    if value is not None and value >= 0:
+                        recorded[key] = value
+        elif record.get("type") == "assistant.message":
+            data = record.get("data") if isinstance(record.get("data"), dict) else {}
+            api_call_id = data.get("apiCallId")
+            if isinstance(api_call_id, str) and api_call_id.strip():
+                fields = message_fields_by_call.setdefault(api_call_id.strip(), set())
+                fields.update(key for key in viewer.TOKEN_KEYS if viewer.number(data.get(key)) is not None)
         if record.get("type") == "system.message":
             data = record.get("data") if isinstance(record.get("data"), dict) else {}
             content = data.get("content")
@@ -135,6 +154,7 @@ def _read_session_state(folder: Path) -> dict:
             })
         return invocations[index - 1]
 
+    consumed_usage_calls: set[str] = set()
     for event in records:
         data = event.get("data") or {}
         if not isinstance(data, dict):
@@ -192,6 +212,21 @@ def _read_session_state(folder: Path) -> dict:
             value = viewer.number(data.get("outputTokens"))
             if value is not None:
                 output_total += value
+            api_call_id = data.get("apiCallId")
+            if isinstance(api_call_id, str) and api_call_id.strip():
+                api_call_id = api_call_id.strip()
+                if api_call_id not in consumed_usage_calls:
+                    recorded = usage_by_call.get(api_call_id, {})
+                    if recorded:
+                        used_usage_records = True
+                        fallback = {
+                            key: value for key, value in recorded.items()
+                            if key not in message_fields_by_call.get(api_call_id, set())
+                        }
+                        viewer.add_token_usage(turn["tokens"], fallback)
+                        viewer.add_token_usage(invocation["tokens"], fallback)
+                        output_total += fallback.get("outputTokens", 0)
+                    consumed_usage_calls.add(api_call_id)
         elif event_type == "tool.execution_start":
             invocation_index = max(turn.get("_event_invocation_count", 0), 1)
             invocation = get_invocation(turn, invocation_index)
@@ -252,13 +287,16 @@ def _read_session_state(folder: Path) -> dict:
             child_turn["_parent_tool_call_id"] = tool_call_id
             claimed_turns.add(str(child_turn.get("id")))
     session["_subagent_info"] = subagent_info
-    if output_total:
+    if used_usage_records:
+        if session["tokens"]["outputTokens"] is None:
+            session["tokens"]["outputTokens"] = output_total
+    elif output_total:
         session["tokens"]["outputTokens"] = output_total
-    if len(session["turns"]) == 1:
+    if len(session["turns"]) == 1 and not used_usage_records:
         for key in viewer.TOKEN_KEYS:
             if session["turns"][0]["tokens"][key] is None:
                 session["turns"][0]["tokens"][key] = session["tokens"][key]
-    elif session["turns"]:
+    elif session["turns"] and not used_usage_records:
         session.setdefault("tokenFlags", []).append("estimated")
         weights = [max(turn["tokens"]["outputTokens"] or 0, 1) for turn in session["turns"]]
         total_weight = sum(weights)
@@ -739,7 +777,7 @@ def index(root: Path) -> list[dict]:
         try:
             editing_states = list(scan_root.rglob("chatEditingSessions/*/state.json"))
             for state_path in editing_states:
-                entry = viewer.session_summary(state_path, "copilot", "copilot-editing-session")
+                entry = viewer.session_summary(state_path, "github_copilot", "copilot-editing-session")
                 entry["id"] = state_path.parent.name
                 entry["name"] = state_path.parent.name
                 entry["_source"] = state_path.parent
@@ -755,10 +793,10 @@ def index(root: Path) -> list[dict]:
             for path in chat_paths:
                 if viewer.is_subagent_path(path):
                     continue
-                entry = viewer.session_summary(path, "copilot", "copilot-chat")
+                entry = viewer.session_summary(path, "github_copilot", "copilot-chat")
                 entry["name"] = _clean_title(entry.get("name"), entry["id"])
                 entry["_children"] = [
-                    viewer.session_summary(child, "copilot", "copilot-chat")
+                    viewer.session_summary(child, "github_copilot", "copilot-chat")
                     for child in viewer.related_subagent_paths(path, chat_paths)
                 ]
                 entries.append(entry)
@@ -771,7 +809,7 @@ def index(root: Path) -> list[dict]:
                 )
             for path in candidates:
                 if path.is_dir() and path.name != "__pycache__" and (path / "events.jsonl").exists():
-                    entry = viewer.session_summary(path, "copilot", "copilot-session-state")
+                    entry = viewer.session_summary(path, "github_copilot", "copilot-session-state")
                     entry["_has_data"] = _session_state_has_data(path)
                     surface = _surface_from_session_state(path)
                     if surface:
@@ -1168,11 +1206,11 @@ def export_source_files(summary: dict, archive: Path) -> Path:
             richness = 0
         candidates.append((richness, source.get("_kind") == "copilot-chat", path, source))
     if not candidates:
-        return create_archive("copilot", archive, [])
+        return create_archive("github_copilot", archive, [])
     _, is_chat, path, _ = max(candidates, key=lambda item: (item[0], item[1]))
     target = "chatSessions" if is_chat else "."
     return create_archive(
-        "copilot",
+        "github_copilot",
         archive,
         [(path, target)],
         exclude_names={"session.db", "session-store.db"},
@@ -1181,4 +1219,4 @@ def export_source_files(summary: dict, archive: Path) -> Path:
 
 def import_source_files(archive: Path, root: Path) -> list[Path]:
     """Inject Copilot files into the supplied workspace-storage root."""
-    return inject_archive("copilot", archive, root / "imported")
+    return inject_archive("github_copilot", archive, root / "imported")

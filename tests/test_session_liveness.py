@@ -75,7 +75,7 @@ class SessionLivenessTests(unittest.TestCase):
                 "updated": updated,
                 "live": True,
             },
-            "copilot",
+            "github_copilot",
             False,
         )
         self.assertIn('class="live-badge"', row)
@@ -96,7 +96,7 @@ class SessionLivenessTests(unittest.TestCase):
                 "updated": 0,
                 "live": False,
             },
-            "copilot",
+            "github_copilot",
             False,
         )
         self.assertNotIn('class="live-badge"', row)

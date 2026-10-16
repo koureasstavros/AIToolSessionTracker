@@ -1,5 +1,7 @@
 # Google Antigravity provider parsing
 
+Provider ID for routing, URLs, and archive manifests: `google_antigravity`.
+
 ## Sources
 
 The provider scans:

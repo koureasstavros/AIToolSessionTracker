@@ -24,7 +24,7 @@ class TokenWarningTests(unittest.TestCase):
 
     def test_antigravity_marks_session_turn_and_invocation_estimated(self) -> None:
         session = normalize_session_data({
-            "provider": "antigravity",
+            "provider": "google_antigravity",
             "id": "session",
             "tokenFlags": ["estimated"],
             "tokens": {key: None for key in ("inputTokens", "cacheReadTokens", "cacheWriteTokens", "outputTokens", "reasoningTokens")},
@@ -38,7 +38,7 @@ class TokenWarningTests(unittest.TestCase):
 
     def test_copilot_flags_missing_categories_and_multi_turn_allocation(self) -> None:
         session = normalize_session_data({
-            "provider": "copilot",
+            "provider": "github_copilot",
             "id": "session",
             "tokenFlags": ["estimated"],
             "tokens": {"inputTokens": 10, "outputTokens": 20},
@@ -58,7 +58,7 @@ class TokenWarningTests(unittest.TestCase):
             "reasoningTokens": 5,
         }
         session = normalize_session_data({
-            "provider": "copilot",
+            "provider": "github_copilot",
             "id": "session",
             "tokens": tokens,
             "turns": [{"tokens": tokens, "invocations": [{"tokens": tokens}]}],
@@ -77,12 +77,12 @@ class TokenWarningTests(unittest.TestCase):
             "outputTokens": 12,
             "reasoningTokens": 0,
         }
-        session = normalize_session_data({"provider": "copilot", "id": "session", "tokens": tokens})
+        session = normalize_session_data({"provider": "github_copilot", "id": "session", "tokens": tokens})
 
         self.assertEqual(session["tokenFlags"], [])
 
     def test_missing_token_object_is_uncategorized(self) -> None:
-        session = normalize_session_data({"provider": "copilot", "id": "session"})
+        session = normalize_session_data({"provider": "github_copilot", "id": "session"})
 
         self.assertEqual(set(session["tokenFlags"]), {"uncategorizedInput", "uncategorizedOutput"})
 
@@ -113,7 +113,7 @@ class TokenWarningTests(unittest.TestCase):
 
     def test_claude_warns_when_one_hour_cache_ttl_has_expired(self) -> None:
         session = {
-            "provider": "claude",
+            "provider": "anthropic_claude",
             "model": "claude-sonnet-4-5",
             "turns": [
                 {
@@ -137,7 +137,7 @@ class TokenWarningTests(unittest.TestCase):
 
     def test_claude_does_not_warn_before_one_hour_cache_ttl(self) -> None:
         session = {
-            "provider": "claude",
+            "provider": "anthropic_claude",
             "model": "claude-sonnet-4-5",
             "turns": [
                 {
@@ -161,7 +161,7 @@ class TokenWarningTests(unittest.TestCase):
 
     def test_api_cache_ttl_data_warns_after_one_hour_for_github_route(self) -> None:
         session = {
-            "provider": "copilot",
+            "provider": "github_copilot",
             "model": "provider-model-123",
             "turns": [
                 {

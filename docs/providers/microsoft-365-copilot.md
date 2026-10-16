@@ -1,5 +1,7 @@
 # Microsoft 365 Copilot provider parsing
 
+Provider ID for routing, URLs, and archive manifests: `m365_copilot`.
+
 ## Sources
 
 The provider reads local JSON and JSONL transcript exports from:

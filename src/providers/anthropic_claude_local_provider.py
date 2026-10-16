@@ -243,7 +243,7 @@ def _children_for(parent: Path, files: list[Path]) -> list[Path]:
 
 def _summary_with_children(path: Path, files: list[Path]) -> dict:
     """Build a summary tree while preserving each agent's own transcript."""
-    summary = _viewer().session_summary(path, "claude", "external")
+    summary = _viewer().session_summary(path, "anthropic_claude", "external")
     metadata_path = path.with_suffix(".meta.json")
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -266,7 +266,7 @@ def index(root: Path) -> list[dict]:
     for path in files:
         if _is_subagent(path):
             continue
-        entry = viewer.session_summary(path, "claude", "external")
+        entry = viewer.session_summary(path, "anthropic_claude", "external")
         children = _children_for(path, files)
         entry["_children"] = [_summary_with_children(child, files) for child in children]
         entries.append(entry)
@@ -645,9 +645,9 @@ def export_source_files(summary: dict, archive: Path) -> Path:
         source = child.get("_source") if isinstance(child, dict) else None
         if isinstance(source, Path):
             files.append((source, "subagents"))
-    return create_archive("claude", archive, files)
+    return create_archive("anthropic_claude", archive, files)
 
 
 def import_source_files(archive: Path, root: Path) -> list[Path]:
     destination = Path.home() / ".claude" / "projects" / "imported"
-    return inject_archive("claude", archive, destination)
+    return inject_archive("anthropic_claude", archive, destination)

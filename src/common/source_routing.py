@@ -5,8 +5,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from src.common.tracker_database import config_database_path, connect_database
-from src.migrations import migration_config
+from src.common.tracker_database import config_database_path, connect_config_database
 
 ROUTING_FILENAME = "source_routing.json"
 _BUNDLED_ROUTING = json.loads((Path(__file__).with_name(ROUTING_FILENAME)).read_text(encoding="utf-8"))
@@ -76,8 +75,7 @@ def load_source_routing(providers: object, path: Path | None = None) -> dict[str
     result = default_routing(providers)
     config_path = path or routing_config_path()
     try:
-        with connect_database(config_path) as connection, connection:
-            migration_config.migration_source_routing_schema(connection)
+        with connect_config_database(config_path) as connection:
             _seed_initial_routing(connection, result)
             rows = connection.execute("SELECT provider, source FROM source_routing").fetchall()
     except (OSError, sqlite3.Error, ValueError):
@@ -114,8 +112,7 @@ def save_source_routing(
             raise ValueError(f"Invalid source route for {provider}")
         result["providers"][provider] = route
     config_path = path or routing_config_path()
-    with connect_database(config_path) as connection, connection:
-        migration_config.migration_source_routing_schema(connection)
+    with connect_config_database(config_path) as connection:
         connection.execute("DELETE FROM source_routing")
         connection.executemany(
             "INSERT INTO source_routing (provider, source) VALUES (?, ?)",
